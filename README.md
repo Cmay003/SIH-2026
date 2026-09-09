@@ -1,6 +1,6 @@
 # SANJEEVANI
 
-## IOT And AI-Powered Real-Time Environmental Disaster Detection and Response System
+## IOT And AI-Powered Real Time Environmental Disaster Detection and Response System
 
 SANJEEVANI is an AI-powered environmental hazard monitoring and emergency response platform designed to detect disasters such as floods and gas leaks in real time.
 
