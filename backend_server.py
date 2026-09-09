@@ -7,6 +7,7 @@ import sqlite3
 import os
 import joblib
 import requests
+import statistics
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -254,7 +255,9 @@ def save_reading(enriched: dict, result: dict, timestamp: str):
 # physically mounted at a different height, change this one number.
 #
 # >>> If you can measure your actual mounting height, update this. <<<
-ULTRASONIC_MOUNT_HEIGHT_M = 0.40
+ULTRASONIC_MOUNT_HEIGHT_M = (
+    0.0234  # measured: sensor sits only 2.34cm above empty baseline
+)
 
 # Set this to True ONLY after you've flashed updated firmware that does
 # the distance -> water-level inversion itself (see the .ino code you
@@ -291,6 +294,24 @@ def convert_ultrasonic_distance_to_water_level_m(
 
     water_level_m = ULTRASONIC_MOUNT_HEIGHT_M - raw_value_m
     return max(0.0, min(ULTRASONIC_MOUNT_HEIGHT_M, water_level_m))
+
+
+WATER_LEVEL_SMOOTHING_WINDOW = (
+    5  # readings; at a 5s send interval, ~20-25s of smoothing
+)
+
+
+def smooth_water_level(history: deque, current_value: float) -> float:
+    """Median-smooths the water level over the last few readings, so a
+    single noisy/spiked HC-SR04 reading can't alone trigger a false
+    MEDIUM/HIGH. A sustained real change still comes through within a
+    few readings - only an isolated one-off spike gets outvoted by the
+    surrounding normal readings around it."""
+    recent = [
+        r["river_level_m"] for r in list(history)[-(WATER_LEVEL_SMOOTHING_WINDOW - 1) :]
+    ]
+    recent.append(current_value)
+    return statistics.median(recent)
 
 
 class RawReading(BaseModel):
@@ -352,9 +373,19 @@ def derive_features(raw: RawReading) -> dict:
     # current firmware) into an actual water-level value. See
     # convert_ultrasonic_distance_to_water_level_m() above for the full
     # explanation - this MUST run before the raw value is used anywhere.
-    water_level_m = convert_ultrasonic_distance_to_water_level_m(
+    converted_value = convert_ultrasonic_distance_to_water_level_m(
         raw.river_level_m, history[-1]["river_level_m"] if history else None
     )
+
+    # Median-smooth over the last few readings. A single noisy HC-SR04
+    # reading (e.g. a momentary multipath reflection reading ~0cm when
+    # nothing is actually there) would otherwise be enough, on its own,
+    # to trigger a false MEDIUM/HIGH under the sensitive test thresholds -
+    # confirmed from a real reading that briefly implied 0cm before
+    # returning to its normal ~10cm baseline a few seconds later. The
+    # median outvotes a one-off spike while still responding to a real,
+    # SUSTAINED change within a few readings.
+    water_level_m = smooth_water_level(history, converted_value)
 
     if history:
         prev = history[-1]

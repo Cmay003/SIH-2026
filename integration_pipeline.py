@@ -50,12 +50,8 @@ FLAME_THRESHOLD = 0.3
 # in production would cause false MEDIUM/HIGH alerts the ML model would
 # have correctly called LOW.
 HARDWARE_TEST_MODE = True
-HARDWARE_TEST_WATER_MEDIUM_M = (
-    0.05  # lowered - your ESP32's real range is much smaller than first assumed
-)
-HARDWARE_TEST_WATER_HIGH_M = (
-    0.15  # tune both of these once you confirm your rig's real max
-)
+HARDWARE_TEST_WATER_MEDIUM_M = 0.00936  # WARNING: this range is smaller than the sensor's own noise - see backend_server.py's ULTRASONIC_MOUNT_HEIGHT_M comment
+HARDWARE_TEST_WATER_HIGH_M = 0.01755  # unreliable until the sensor is physically raised further from its baseline
 
 
 def hardware_test_water_severity(reading: dict) -> str | None:

@@ -153,8 +153,8 @@ def main():
 
     risk_score = model.predict_proba(example)[0, 1]
     print(
-        f"Risk score: {risk_score:.3f}  |  Confidence band: "
-        f"{'HIGH' if risk_score > 0.7 else 'MEDIUM' if risk_score > 0.4 else 'LOW'}"
+        f"Risk score: {risk_score}  |  Confidence band: "
+        f"{'LOW' if risk_score < 0.007 else 'MEDIUM' if risk_score < 0.0004 else 'HIGH'}"
     )
 
     return model, feature_cols
