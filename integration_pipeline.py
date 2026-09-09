@@ -126,12 +126,6 @@ def compute_flood_risk(reading: dict, flood_model, feature_cols) -> float:
         "curve_number": reading["curve_number"],
         "rainfall_24h_mm": reading["rainfall_24h_mm"],
         "rainfall_intensity_mm_hr": reading["rainfall_intensity_mm_hr"],
-        # .get(...) with a fallback: older callers (demo_readings, any code
-        # written before the weather API was added) won't have this key,
-        # and even the live backend can return None here if the weather
-        # API was unreachable and there's no cached value yet. Either way,
-        # falling back to 0.0 means "no forecast signal available" rather
-        # than crashing the whole risk computation.
         "forecast_rainfall_6h_mm": reading.get("forecast_rainfall_6h_mm") or 0.0,
         "runoff_mm": runoff_mm,
         "river_level_m": reading["river_level_m"],
@@ -177,11 +171,7 @@ def process_reading(
     severity = severity_band(risk_score)
     severity_source = "ml_model"
 
-    # Apply the hardware bench-test override ONLY for flood-type hazards -
-    # never overrides the gas-leak path, which already has its own
-    # correctly-scaled threshold above. Only escalates, never downgrades:
-    # if the ML model somehow already says HIGH, a MEDIUM-level override
-    # doesn't quietly water that down.
+    
     if hazard_type == "flood":
         override_severity = hardware_test_water_severity(reading)
         severity_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
@@ -207,7 +197,7 @@ def process_reading(
         location=reading["location"],
         collection=rag_collection,
         embedder=rag_embedder,
-        use_llm=False,  # flip to True once ANTHROPIC_API_KEY is set
+        use_llm=False,  
     )
     return {
         "status": "alert_dispatched",

@@ -39,8 +39,8 @@ NODE_REGISTRY = {
         "location": "Sector 4, Riverside",
         "land_use": "urban_low",
         "curve_number": 78,
-        "latitude": 29.3919,
-        "longitude": 79.4542,
+        "latitude": 29.374496,
+        "longitude": 79.530083,
         "upstream_node": None,
     },
     "NODE-07": {
@@ -267,7 +267,7 @@ ULTRASONIC_MOUNT_HEIGHT_M = (
 # the value uninverted (False when firmware already inverted it) or
 # double-invert it back to nonsense (True when firmware still sends raw
 # distance) - only ONE side should ever do this conversion.
-FIRMWARE_SENDS_CORRECTED_WATER_LEVEL = False
+FIRMWARE_SENDS_CORRECTED_WATER_LEVEL = True
 
 
 def convert_ultrasonic_distance_to_water_level_m(
