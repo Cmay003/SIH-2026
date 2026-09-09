@@ -1,0 +1,4 @@
+river_level_m,temp_c,humidity_pct,gas_ppm,flame_reading,is_anomaly
+1.8,27.2,61,405,0.01,0
+1.9,27.5,60,410,0.02,0
+9.4,27.1,59,400,0.01,1

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SANJEEVNI - Officer Map</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  html, body { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+  #map { height: 100%; width: 100%; }
+  #panel {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: white; padding: 12px 16px; border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3); width: 260px;
+  }
+  #panel h2 { margin: 0 0 8px 0; font-size: 18px; }
+  #panel .count { font-weight: bold; color: #e63946; }
+  .legend { font-size: 13px; margin-top: 8px; line-height: 1.6; }
+  .legend span { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; }
+  .sos-popup a { display: block; margin-top: 6px; color: #1a73e8; font-weight: bold; }
+  .sos-popup button {
+    margin-top: 8px; background: #4caf50; color: white; border: none;
+    padding: 6px 10px; border-radius: 6px; cursor: pointer;
+  }
+
+  /* Large, tappable SOS pin emoji with a pulsing ring behind it */
+  .sos-marker { background: none; border: none; }
+  .sos-pin-wrap {
+    position: relative; width: 44px; height: 54px;
+    display: flex; align-items: flex-end; justify-content: center;
+    cursor: pointer;
+  }
+  .sos-pulse {
+    position: absolute; bottom: 6px; width: 40px; height: 40px;
+    background: rgba(217, 4, 41, 0.35); border-radius: 50%;
+    animation: sosPulse 1.6s infinite;
+  }
+  .sos-pin {
+    position: relative; z-index: 2;
+    font-size: 32px; line-height: 1;
+    filter: drop-shadow(0 2px 3px rgba(0,0,0,0.5));
+  }
+  @keyframes sosPulse {
+    0%   { transform: scale(0.5); opacity: 1; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+
+  /* Warning icon marker at the center of each shaded hazard zone,
+     so a hazard is clickable even without hovering the exact circle edge. */
+  .hazard-marker { background: none; border: none; }
+  .hazard-icon-wrap {
+    width: 30px; height: 30px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+    border: 2px solid white; cursor: pointer;
+  }
+
+  /* Brief highlight ring drawn around a hazard when opened via a deep link
+     from the dashboard's "Active Hazards" list. */
+  .focus-ring { animation: focusFade 3s ease-out forwards; }
+  @keyframes focusFade {
+    0%   { stroke-opacity: 1; }
+    100% { stroke-opacity: 0; }
+  }
+
+  .all-clear-banner {
+    margin-top: 8px; background: #e8f5e9; color: #1b5e20;
+    font-weight: bold; padding: 8px 10px; border-radius: 6px; font-size: 14px;
+  }
+  .resolve-all-btn {
+    margin-top: 8px; width: 100%; background: #d90429; color: white;
+    border: none; padding: 8px 10px; border-radius: 6px; font-weight: bold;
+    cursor: pointer; font-size: 13px;
+  }
+  .resolve-all-btn:hover { background: #b8021f; }
+  .resolve-all-btn:disabled { background: #9aa1ab; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <h2>🚨 SANJEEVNI - Officer View</h2>
+  <div id="sosCountRow">Open SOS requests: <span class="count" id="sosCount">0</span></div>
+  <div id="allClearBanner" class="all-clear-banner" style="display:none">✅ All SOS requests resolved</div>
+  <button id="resolveAllBtn" class="resolve-all-btn" style="display:none">Resolve All</button>
+  <div class="legend">
+    <div><span style="background:orange"></span>MEDIUM hazard zone</div>
+    <div><span style="background:red"></span>HIGH / CRITICAL hazard zone</div>
+    <div><span style="background:#d90429"></span>Person needing help (SOS)</div>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+  const map = L.map("map").setView([29.3919, 79.4542], 12);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  let hazardLayer = L.layerGroup().addTo(map);
+  let sosLayer = L.layerGroup().addTo(map);
+
+  // Read ?focus=NODE_ID from a link clicked on the dashboard's hazard list,
+  // so we can fly straight to it once its data loads.
+  const urlParams = new URLSearchParams(window.location.search);
+  const focusNodeId = urlParams.get("focus");
+  let hasFocused = false;
+
+  function severityColor(sev) {
+    if (sev === "HIGH" || sev === "CRITICAL") return "red";
+    if (sev === "MEDIUM") return "orange";
+    return "yellow";
+  }
+
+  function sosIcon() {
+    return L.divIcon({
+      className: "sos-marker",
+      html: `<div class="sos-pin-wrap"><div class="sos-pulse"></div><div class="sos-pin">📍</div></div>`,
+      iconSize: [44, 54],
+      iconAnchor: [22, 54],
+    });
+  }
+
+  function hazardIcon(severity) {
+    return L.divIcon({
+      className: "hazard-marker",
+      html: `<div class="hazard-icon-wrap" style="background:${severityColor(severity)}">⚠️</div>`,
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+    });
+  }
+
+  async function loadHazardZones() {
+    try {
+      const res = await fetch("/api/hazard-zones");
+      const data = await res.json();
+      hazardLayer.clearLayers();
+
+      let focusTarget = null;
+
+      data.zones.forEach((z) => {
+        const circle = L.circle([z.latitude, z.longitude], {
+          radius: z.radius_m,
+          color: severityColor(z.severity),
+          fillColor: severityColor(z.severity),
+          fillOpacity: 0.3,
+        }).addTo(hazardLayer);
+
+        const popupHtml = `<strong>${z.node_id}</strong><br>${z.hazard_type} - ${z.severity}<br>Risk score: ${Number(z.risk_score).toFixed(2)}`;
+        circle.bindPopup(popupHtml);
+
+        // A marker at the zone center makes it easy to click even before
+        // zoomed in, and gives a single tap target instead of hunting for
+        // the circle's edge.
+        const marker = L.marker([z.latitude, z.longitude], { icon: hazardIcon(z.severity) })
+          .bindPopup(popupHtml)
+          .addTo(hazardLayer);
+
+        if (focusNodeId && z.node_id === focusNodeId) {
+          focusTarget = { circle, marker, z };
+        }
+      });
+
+      if (focusTarget && !hasFocused) {
+        hasFocused = true;
+        map.flyTo([focusTarget.z.latitude, focusTarget.z.longitude], 15, { duration: 1.2 });
+        setTimeout(() => focusTarget.marker.openPopup(), 1300);
+
+        // Temporary bright highlight ring around the focused zone
+        const highlight = L.circle([focusTarget.z.latitude, focusTarget.z.longitude], {
+          radius: focusTarget.z.radius_m + 150,
+          color: "#1a73e8",
+          weight: 4,
+          fill: false,
+          className: "focus-ring",
+        }).addTo(map);
+        setTimeout(() => map.removeLayer(highlight), 3000);
+      }
+    } catch (e) {
+      console.log("hazard-zones error", e);
+    }
+  }
+
+  async function resolveSos(id) {
+    await fetch(`/api/sos/${id}/resolve`, { method: "POST" });
+    loadSos();
+  }
+  window.resolveSos = resolveSos;
+
+  async function resolveAllSos() {
+    if (!confirm("Mark ALL open SOS requests as resolved? This cannot be undone.")) return;
+    resolveAllBtn.disabled = true;
+    try {
+      await fetch("/api/sos/resolve-all", { method: "POST" });
+    } finally {
+      resolveAllBtn.disabled = false;
+      loadSos();
+    }
+  }
+  const resolveAllBtn = document.getElementById("resolveAllBtn");
+  resolveAllBtn.addEventListener("click", resolveAllSos);
+  const sosCountRowEl = document.getElementById("sosCountRow");
+  const allClearBannerEl = document.getElementById("allClearBanner");
+
+  async function loadSos() {
+    try {
+      const res = await fetch("/api/sos");
+      const data = await res.json();
+      document.getElementById("sosCount").innerText = data.count;
+
+      // When everything is resolved, show a clear positive confirmation
+      // instead of leaving the officer looking at a bare "0" - and hide
+      // "Resolve All" since there's nothing left to resolve.
+      if (data.count === 0) {
+        sosCountRowEl.style.display = "none";
+        allClearBannerEl.style.display = "block";
+        resolveAllBtn.style.display = "none";
+      } else {
+        sosCountRowEl.style.display = "block";
+        allClearBannerEl.style.display = "none";
+        resolveAllBtn.style.display = "block";
+      }
+
+      sosLayer.clearLayers();
+      data.data.forEach((s) => {
+        const marker = L.marker([s.latitude, s.longitude], { icon: sosIcon() });
+
+        const time = new Date(s.timestamp).toLocaleTimeString();
+        marker.bindPopup(`
+          <div class="sos-popup">
+            <strong>SOS #${s.id}</strong> - ${time}<br>
+            ${s.note ? s.note + "<br>" : ""}
+            Nearest hospital: <strong>${s.nearest_hospital}</strong> (${s.hospital_distance_km} km)
+            <a href="${s.responder_route_url}" target="_blank">Route to this person</a>
+            <a href="${s.hospital_route_url}" target="_blank">Route from person to hospital</a>
+            <button onclick="resolveSos(${s.id})">Mark Resolved</button>
+          </div>
+        `);
+        marker.addTo(sosLayer);
+      });
+    } catch (e) {
+      console.log("sos error", e);
+    }
+  }
+
+  loadHazardZones();
+  loadSos();
+  setInterval(loadHazardZones, 5000);
+  setInterval(loadSos, 5000);
+</script>
+
+</body>
+</html>

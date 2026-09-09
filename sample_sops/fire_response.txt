@@ -1,0 +1,12 @@
+FOREST FIRE RESPONSE SOP
+
+LOW severity: Continue monitoring temperature and smoke sensors. No action
+required.
+
+MEDIUM severity: Alert local forest department and fire watch teams.
+Restrict access to the affected forest zone. Prepare firebreak equipment.
+
+HIGH severity: Dispatch fire response teams immediately. Evacuate any
+settlements within 2 km of the detected hotspot. Coordinate with State
+Forest Department and local fire services. Avoid the affected area until
+declared safe.

@@ -1,0 +1,14 @@
+FLOOD RESPONSE SOP
+
+LOW severity (risk score below 0.4): Continue routine monitoring. No public
+alert required. Log reading for trend analysis.
+
+MEDIUM severity (0.4 to 0.7): Notify local disaster management authority.
+Advise residents in low-lying areas near the riverbank to move valuables to
+higher ground and monitor further updates. Keep drainage channels clear.
+
+HIGH severity (above 0.7): Issue immediate evacuation advisory for
+low-lying and riverside zones. Authorities should open designated relief
+shelters and coordinate with NDRF/SDRF teams. Residents should move to
+higher ground immediately and avoid crossing flooded roads or bridges.
+Emergency contact: District Disaster Management Cell.

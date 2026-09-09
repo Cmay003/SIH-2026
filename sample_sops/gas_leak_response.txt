@@ -1,0 +1,11 @@
+GAS LEAK RESPONSE SOP
+
+LOW severity: Log reading, continue monitoring.
+
+MEDIUM severity: Alert facility safety officer. Ventilate the affected
+area. Restrict ignition sources nearby.
+
+HIGH severity: Evacuate the affected industrial zone and surrounding
+150-meter radius immediately. Shut off gas supply at the nearest valve if
+safe to do so. Contact local fire and emergency services. Do not use
+electrical switches or open flames in the area.

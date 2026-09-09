@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SANJEEVNI</title>
+    <style>
+        :root {
+            --green-dark: #1b5e20;
+            --green: #2e7d32;
+            --green-mid: #43a047;
+            --green-light: #e8f5e9;
+            --green-lighter: #f1f8f2;
+            --page-bg: #ffffff;
+            --text-dark: #1b1b1b;
+            --text-muted: #5f6b60;
+        }
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: var(--page-bg); color: var(--text-dark); }
+
+        header.topbar {
+            background: linear-gradient(135deg, var(--green-dark), var(--green));
+            color: white;
+            padding: 22px 20px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        .brand-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
+        .brand-row h1 { margin: 0; font-size: 30px; letter-spacing: 0.5px; }
+        .status { margin-top: 10px; color: white; font-weight: bold; opacity: 0.95; }
+        .status.error { color: #ffe1e1; }
+
+        main { padding: 20px; max-width: 1280px; margin: 0 auto; }
+
+        .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(27,94,32,0.08); border: 1px solid var(--green-light); }
+        .card h3 { margin-top: 0; color: var(--text-muted); }
+        .value { font-size: 28px; font-weight: bold; color: var(--green-dark); }
+        table { width: 100%; margin-top: 25px; background: white; border-collapse: collapse; box-shadow: 0 2px 8px rgba(27,94,32,0.08); }
+        th, td { padding: 12px; border-bottom: 1px solid var(--green-light); text-align: left; }
+        th { background: var(--green-dark); color: white; }
+        .LOW { color: var(--green); font-weight: bold; }
+        .MEDIUM { color: orange; font-weight: bold; }
+        .HIGH, .CRITICAL { color: red; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+        .hospital-card { background: var(--green-light); padding: 15px 20px; border-radius: 10px; margin-top: 20px; border: 1px solid var(--green-mid); }
+        .hospital-card a { color: var(--green-dark); font-weight: bold; }
+
+        h2 { color: var(--green-dark); }
+
+        /* ---- Critical hazard callout - the single highest-risk hazard ---- */
+        .critical-section { margin-top: 15px; }
+        .critical-hazard-box {
+            background: white; border-radius: 12px; padding: 20px 24px;
+            box-shadow: 0 3px 14px rgba(220,38,38,0.18);
+            border: 2px solid #dc2626; display: flex; justify-content: space-between;
+            align-items: center; gap: 20px; flex-wrap: wrap;
+        }
+        .critical-hazard-box .ch-left h4 { margin: 0 0 6px; font-size: 20px; color: #b91c1c; }
+        .critical-hazard-box .loc { color: var(--text-muted); font-size: 14px; margin-bottom: 6px; }
+        .critical-hazard-box .eta { font-size: 13px; color: #333; background: #fef2f2; padding: 8px 10px; border-radius: 6px; display: inline-block; }
+        .critical-hazard-box .ch-score { font-size: 36px; font-weight: 800; color: #b91c1c; text-align: center; }
+        .critical-hazard-box .ch-score .lbl { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; display: block; margin-top: 2px; }
+        .critical-hazard-box a { text-decoration: none; }
+        .no-critical { background: var(--green-light); border: 1px solid var(--green-mid); border-radius: 12px; padding: 18px 22px; color: var(--green-dark); font-weight: bold; }
+
+        .hazards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; margin-top: 15px; }
+        .hazard-card {
+            background: white; border-radius: 10px; padding: 16px 18px;
+            box-shadow: 0 2px 8px rgba(27,94,32,0.08); border-left: 6px solid #ccc;
+        }
+        .hazard-card.MEDIUM { border-left-color: orange; }
+        .hazard-card.HIGH, .hazard-card.CRITICAL { border-left-color: red; }
+        .hazard-card h4 { margin: 0 0 6px 0; }
+        .hazard-card .loc { color: var(--text-muted); font-size: 14px; margin-bottom: 8px; }
+        .hazard-card .score-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .hazard-card .score { font-size: 22px; font-weight: bold; }
+        .hazard-card .eta { font-size: 13px; color: #333; background: var(--green-lighter); padding: 8px 10px; border-radius: 6px; }
+        .no-hazards { color: #888; font-style: italic; }
+        .hazard-card-link { text-decoration: none; color: inherit; display: block; }
+        .hazard-card-link .hazard-card { cursor: pointer; transition: box-shadow 0.15s, transform 0.15s; }
+        .hazard-card-link:hover .hazard-card { box-shadow: 0 4px 14px rgba(27,94,32,0.2); transform: translateY(-2px); }
+        .hazard-card .click-hint { margin-top: 8px; font-size: 12px; color: var(--green-dark); font-weight: bold; }
+
+        @media(max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand-row">
+            <svg width="42" height="42" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path d="M24 4 L42 11 V22 C42 33 34.5 41 24 44 C13.5 41 6 33 6 22 V11 Z"
+                      fill="white" opacity="0.95"/>
+                <path d="M24 6.3 L39.7 12.3 V22 C39.7 31.7 33.2 38.7 24 41.6 C14.8 38.7 8.3 31.7 8.3 22 V12.3 Z"
+                      fill="none" stroke="#1b5e20" stroke-width="1.5" opacity="0.5"/>
+                <path d="M11 24 H18 L21 17 L26 31 L29 24 H37"
+                      fill="none" stroke="#1b5e20" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <h1>SANJEEVNI</h1>
+        </div>
+        <div class="status" id="connectionStatus">Connecting to backend...</div>
+    </header>
+
+    <main>
+    <div class="cards">
+        <div class="card"><h3>Device</h3><div class="value" id="device">--</div></div>
+        <div class="card"><h3>Hazard</h3><div class="value" id="hazard">--</div></div>
+        <div class="card"><h3>Water Level</h3><div class="value" id="water">--</div></div>
+        <div class="card"><h3>Risk</h3><div class="value" id="risk">--</div></div>
+        <div class="card"><h3>Risk Score</h3><div class="value" id="score">--</div></div>
+        <div class="card"><h3>Temperature</h3><div class="value" id="temperature">--</div></div>
+        <div class="card"><h3>Humidity</h3><div class="value" id="humidity">--</div></div>
+        <div class="card"><h3>Data Received</h3><div class="value" id="count">0</div></div>
+    </div>
+
+    <div class="hospital-card" id="hospitalCard" style="display:none;">
+        Nearest hospital to <span id="hospNode">--</span>:
+        <strong id="hospName">--</strong> (<span id="hospDist">--</span> km) —
+        <a id="hospLink" href="#" target="_blank">Get directions</a>
+    </div>
+
+    <h2>Critical Hazard</h2>
+    <div id="criticalHazardSection" class="critical-section"></div>
+
+    <h2>All Active Hazards</h2>
+    <div id="hazardList" class="hazards"></div>
+
+    <h2>Latest Sensor Readings</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th><th>Device</th><th>Hazard</th><th>Water Level</th>
+                <th>Temperature</th><th>Humidity</th><th>Risk</th><th>Score</th><th>Time</th>
+            </tr>
+        </thead>
+        <tbody id="sensorTable"></tbody>
+    </table>
+    </main>
+
+
+    <script>
+        let lastDevice = null;
+
+        async function loadHazards() {
+            try {
+                const res = await fetch("/api/hazards");
+                const result = await res.json();
+                const container = document.getElementById("hazardList");
+                const criticalContainer = document.getElementById("criticalHazardSection");
+
+                if (result.count === 0) {
+                    container.innerHTML = '<div class="no-hazards">No active hazards - all nodes normal.</div>';
+                    criticalContainer.innerHTML = '<div class="no-critical">✅ No critical hazard right now - all nodes within safe range.</div>';
+                    return;
+                }
+
+                // /api/hazards is already sorted by risk_score DESC (see
+                // server.js selectActiveHazards), so hazards[0] is the
+                // single highest-risk hazard system-wide.
+                const top = result.hazards[0];
+                criticalContainer.innerHTML = `
+                    <a href="officer.html?focus=${encodeURIComponent(top.node_id)}" target="_blank">
+                        <div class="critical-hazard-box">
+                            <div class="ch-left">
+                                <h4>🚨 ${top.label}: ${top.hazard_type.toUpperCase()}</h4>
+                                <div class="loc">📍 ${top.location} (${top.node_id})</div>
+                                <div class="eta">⏱ ${top.prediction_text}</div>
+                            </div>
+                            <div class="ch-score">${(top.risk_score * 100).toFixed(0)}%
+                                <span class="lbl">Risk Score</span>
+                            </div>
+                        </div>
+                    </a>
+                `;
+
+                container.innerHTML = result.hazards.map(h => `
+                    <a href="officer.html?focus=${encodeURIComponent(h.node_id)}" target="_blank" class="hazard-card-link">
+                        <div class="hazard-card ${h.severity}">
+                            <h4>${h.label}: ${h.hazard_type.toUpperCase()}</h4>
+                            <div class="loc">📍 ${h.location} (${h.node_id})</div>
+                            <div class="score-row">
+                                <span>Risk Score</span>
+                                <span class="score">${(h.risk_score * 100).toFixed(0)}%</span>
+                            </div>
+                            <div class="eta">⏱ ${h.prediction_text}</div>
+                            <div class="click-hint">📌 Click to view on map</div>
+                        </div>
+                    </a>
+                `).join("");
+            } catch (e) {
+                console.log("hazards error", e);
+            }
+        }
+
+        async function loadRoute(deviceId) {
+            if (!deviceId || deviceId === lastDevice) return;
+            lastDevice = deviceId;
+            try {
+                const res = await fetch(`/api/route/${deviceId}`);
+                const route = await res.json();
+                if (route.error) return;
+                document.getElementById("hospitalCard").style.display = "block";
+                document.getElementById("hospNode").innerText = deviceId;
+                document.getElementById("hospName").innerText = route.hospital;
+                document.getElementById("hospDist").innerText = route.distance_km;
+                document.getElementById("hospLink").href = route.maps_url;
+            } catch (e) {
+                console.log("route error", e);
+            }
+        }
+
+        async function loadData() {
+            try {
+                const response = await fetch("/api/sensors");
+                const result = await response.json();
+                if (!result.success) throw new Error("Backend returned an error");
+
+                document.getElementById("connectionStatus").innerText = "🟢 Backend connected";
+                document.getElementById("connectionStatus").className = "status";
+                document.getElementById("count").innerText = result.count;
+
+                if (result.data.length === 0) return;
+
+                const latest = result.data[0];
+                document.getElementById("device").innerText = latest.device_id;
+                document.getElementById("hazard").innerText = (latest.hazard || "--").toUpperCase();
+                document.getElementById("water").innerText = latest.water_level ?? "--";
+                document.getElementById("risk").innerText = latest.risk;
+                document.getElementById("score").innerText = latest.risk_score;
+                document.getElementById("temperature").innerText = latest.temperature ?? "--";
+                document.getElementById("humidity").innerText = latest.humidity ?? "--";
+
+                if (latest.risk === "HIGH" || latest.risk === "CRITICAL") {
+                    loadRoute(latest.device_id);
+                }
+
+                const table = document.getElementById("sensorTable");
+                table.innerHTML = "";
+                result.data.forEach(sensor => {
+                    const row = document.createElement("tr");
+                    const time = new Date(sensor.timestamp).toLocaleTimeString();
+                    row.innerHTML = `
+                        <td>${sensor.id}</td>
+                        <td>${sensor.device_id}</td>
+                        <td>${sensor.hazard}</td>
+                        <td>${sensor.water_level ?? "--"}</td>
+                        <td>${sensor.temperature ?? "--"} °C</td>
+                        <td>${sensor.humidity ?? "--"} %</td>
+                        <td class="${sensor.risk}">${sensor.risk}</td>
+                        <td>${sensor.risk_score}</td>
+                        <td>${time}</td>
+                    `;
+                    table.appendChild(row);
+                });
+            } catch (error) {
+                document.getElementById("connectionStatus").innerText = "🔴 Backend not connected";
+                document.getElementById("connectionStatus").className = "status error";
+                console.log(error);
+            }
+        }
+
+        loadData();
+        loadHazards();
+        setInterval(loadData, 2000);
+        setInterval(loadHazards, 5000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SANJEEVNI - User Portal</title>
+    <style>
+      :root {
+        --blue: #1d4ed8;
+        --blue-dark: #1e3a8a;
+        --page-bg: #f3f4f6;
+        --card-bg: #ffffff;
+        --box-bg: #eef1f6;
+        --text-dark: #111827;
+        --text-muted: #6b7280;
+        --ring-track: #e3e8f0;
+        --green: #15803d;
+        --orange: #c2410c;
+        --red: #dc2626;
+        --red-halo: #fbdada;
+        --grey-btn: #9aa1ab;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+        background: var(--page-bg);
+        color: var(--text-dark);
+      }
+
+      header.topbar {
+        background: var(--blue);
+        color: white;
+        text-align: center;
+        padding: 26px 20px 20px;
+      }
+      header.topbar h1 {
+        margin: 0;
+        font-size: 30px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+      }
+      header.topbar .portal-label {
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 3px;
+        margin-top: 6px;
+      }
+      header.topbar .conn-status {
+        font-size: 13.5px;
+        color: rgba(255, 255, 255, 0.9);
+        margin-top: 10px;
+      }
+
+      main {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 24px 20px 60px;
+      }
+
+      .card {
+        background: var(--card-bg);
+        border-radius: 14px;
+        box-shadow:
+          0 1px 3px rgba(16, 24, 40, 0.08),
+          0 1px 2px rgba(16, 24, 40, 0.04);
+        padding: 24px 26px;
+      }
+
+      .muted {
+        color: var(--text-muted);
+        font-size: 14px;
+        margin: 6px 0 0;
+      }
+
+      /* ---- Locate card ---- */
+      .locate-card {
+        margin-bottom: 18px;
+      }
+      .hospital-card {
+        margin-bottom: 18px;
+      }
+      .locate-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 20px;
+        flex-wrap: wrap;
+      }
+      .locate-head h2 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .btn-primary {
+        background: var(--blue);
+        color: white;
+        border: none;
+        font-size: 14.5px;
+        font-weight: 700;
+        padding: 12px 20px;
+        border-radius: 8px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .btn-primary:hover {
+        background: var(--blue-dark);
+      }
+      .btn-primary:disabled {
+        background: var(--grey-btn);
+        cursor: not-allowed;
+      }
+
+      .locate-status {
+        margin-top: 18px;
+        background: var(--box-bg);
+        border-radius: 10px;
+        padding: 14px 16px;
+        font-size: 14px;
+        color: #374151;
+      }
+
+      /* ---- Row of two cards ---- */
+      .grid-row {
+        display: flex;
+        gap: 18px;
+        align-items: stretch;
+        flex-wrap: wrap;
+      }
+      .safety-card {
+        flex: 2 1 480px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+      }
+      .sos-card {
+        flex: 1 1 300px;
+        text-align: center;
+      }
+
+      .eyebrow {
+        font-size: 12.5px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: var(--text-muted);
+      }
+      .risk-label {
+        font-size: 34px;
+        font-weight: 800;
+        margin: 6px 0 8px;
+        color: var(--green);
+      }
+      .risk-label.MEDIUM {
+        color: var(--orange);
+      }
+      .risk-label.HIGH,
+      .risk-label.CRITICAL {
+        color: var(--red);
+      }
+
+      .sos-card h2 {
+        margin: 0;
+        font-size: 19px;
+        font-weight: 700;
+      }
+      .sos-card .muted {
+        max-width: 300px;
+        margin-left: auto;
+        margin-right: auto;
+      }
+
+      .sos-wrap {
+        margin-top: 20px;
+        display: flex;
+        justify-content: center;
+      }
+      .sos-btn {
+        width: 130px;
+        height: 130px;
+        border-radius: 50%;
+        border: none;
+        background: var(--red);
+        color: white;
+        font-size: 20px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        cursor: pointer;
+        box-shadow: 0 0 0 14px var(--red-halo);
+      }
+      .sos-btn:disabled {
+        background: var(--grey-btn);
+        box-shadow: none;
+        cursor: not-allowed;
+      }
+      .sos-hint {
+        margin-top: 14px;
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      /* ---- Note + send status + result ---- */
+      .note-card {
+        margin-top: 18px;
+      }
+      .note-card textarea {
+        width: 100%;
+        resize: vertical;
+        min-height: 70px;
+        border: 1px solid #d7dbe3;
+        border-radius: 10px;
+        padding: 12px 14px;
+        font-size: 14px;
+        font-family: inherit;
+      }
+      .send-status {
+        margin-top: 10px;
+        font-size: 14px;
+        min-height: 20px;
+      }
+      .send-status.error {
+        color: var(--red);
+      }
+      .send-status.ok {
+        color: var(--green);
+      }
+
+      .result-card {
+        margin-top: 18px;
+      }
+      .result-card h3 {
+        margin: 0 0 8px;
+        color: var(--green);
+        font-size: 18px;
+      }
+      .result-card p {
+        margin: 4px 0;
+        font-size: 14px;
+      }
+      .result-card a.btn-primary {
+        display: inline-block;
+        margin-top: 10px;
+        text-decoration: none;
+      }
+
+      @media (max-width: 640px) {
+        .locate-head {
+          flex-direction: column;
+        }
+        .safety-card {
+          flex-direction: column;
+          text-align: center;
+        }
+      }
+
+      /* ---- SOS confirmation popup ---- */
+      .sos-modal-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(17, 24, 39, 0.55);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+      }
+      .sos-modal-box {
+        background: white;
+        border-radius: 14px;
+        padding: 32px 36px;
+        text-align: center;
+        max-width: 320px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      }
+      .sos-modal-box p {
+        margin: 16px 0 0;
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text-dark);
+      }
+      .sos-modal-spinner {
+        width: 40px;
+        height: 40px;
+        margin: 0 auto;
+        border: 4px solid var(--ring-track);
+        border-top-color: var(--red);
+        border-radius: 50%;
+        animation: sosSpin 0.8s linear infinite;
+      }
+      @keyframes sosSpin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>SANJEEVNI</h1>
+      <div class="portal-label">USER PORTAL</div>
+      <div class="conn-status" id="connStatus">
+        Connecting to SANJEEVNI server...
+      </div>
+    </header>
+
+    <main>
+      <section class="card locate-card">
+        <div class="locate-head">
+          <div>
+            <h2>Check Your Safety Area</h2>
+            <p class="muted">
+              Allow location access to find nearby safe locations and active
+              danger zones.
+            </p>
+          </div>
+          <button id="locateBtn" class="btn-primary">Get My Location</button>
+        </div>
+        <div class="locate-status" id="locateStatus">
+          Detecting your location automatically...
+        </div>
+      </section>
+
+      <section class="grid-row">
+        <div class="card safety-card">
+          <div>
+            <div class="eyebrow">Current area safety</div>
+            <div class="risk-label LOW" id="riskLabel">LOW RISK</div>
+            <p class="muted" id="riskDesc">
+              SANJEEVNI is monitoring environmental conditions in your area.
+            </p>
+          </div>
+        </div>
+
+        <div class="card sos-card">
+          <h2>Need Emergency Help?</h2>
+          <p class="muted">
+            If you are in immediate danger, send your location to the SANJEEVNI
+            emergency response system.
+          </p>
+          <div class="sos-wrap">
+            <button id="sosBtn" class="sos-btn" disabled>SOS</button>
+          </div>
+          <div class="sos-hint" id="sosHint">
+            SOS unlocks automatically when high risk is detected nearby.
+          </div>
+        </div>
+      </section>
+
+      <section class="card hospital-card" id="hospitalCard">
+        <h2 style="margin: 0 0 4px; font-size: 19px; font-weight: 700">
+          Nearest Hospital &amp; Route
+        </h2>
+        <p class="muted" id="hospitalStatus" style="margin-top: 6px">
+          Waiting for your location to look up the nearest hospital...
+        </p>
+        <div class="hosp-details" id="hospDetails" style="display: none">
+          <p style="margin: 10px 0 4px; font-size: 15px">
+            <strong id="nearestHospName">--</strong>
+          </p>
+          <p class="muted" style="margin: 0 0 12px">
+            <span id="nearestHospDist">--</span> km away (driving route)
+          </p>
+          <a
+            id="nearestHospLink"
+            href="#"
+            target="_blank"
+            class="btn-primary"
+            style="display: inline-block; text-decoration: none"
+            >Directions to hospital</a
+          >
+        </div>
+      </section>
+
+      <section class="card note-card">
+        <p class="muted" style="margin-top: 0">
+          Optional: describe your situation
+        </p>
+        <textarea
+          id="note"
+          placeholder="e.g. trapped by flood water, number of people"
+        ></textarea>
+        <div class="send-status" id="status"></div>
+      </section>
+
+      <section class="card result-card" id="result" style="display: none">
+        <h3>Help is on the way</h3>
+        <p>Nearest hospital: <strong id="hospName">--</strong></p>
+        <p>Distance: <span id="hospDist">--</span> km</p>
+        <a id="hospLink" href="#" target="_blank" class="btn-primary"
+          >Directions to hospital</a
+        >
+      </section>
+    </main>
+
+    <div class="sos-modal-backdrop" id="sosModal" style="display: none">
+      <div class="sos-modal-box">
+        <div class="sos-modal-spinner"></div>
+        <p id="sosModalText">Confirming your current location...</p>
+      </div>
+    </div>
+
+    <script>
+      const connStatusEl = document.getElementById("connStatus");
+      const locateBtn = document.getElementById("locateBtn");
+      const locateStatusEl = document.getElementById("locateStatus");
+      const riskLabelEl = document.getElementById("riskLabel");
+      const riskDescEl = document.getElementById("riskDesc");
+      const sosBtn = document.getElementById("sosBtn");
+      const sosHintEl = document.getElementById("sosHint");
+      const noteEl = document.getElementById("note");
+      const statusEl = document.getElementById("status");
+      const resultEl = document.getElementById("result");
+      const hospitalStatusEl = document.getElementById("hospitalStatus");
+      const hospDetailsEl = document.getElementById("hospDetails");
+      const nearestHospNameEl = document.getElementById("nearestHospName");
+      const nearestHospDistEl = document.getElementById("nearestHospDist");
+      const nearestHospLinkEl = document.getElementById("nearestHospLink");
+      const sosModalEl = document.getElementById("sosModal");
+      const sosModalTextEl = document.getElementById("sosModalText");
+
+      let userCoords = null; // { latitude, longitude } once detected
+      let zones = []; // from /api/hazard-zones
+      let areaSeverity = "LOW"; // LOW | MEDIUM | HIGH | CRITICAL
+      let areaScore = 0;
+
+      // One SOS per device until an officer resolves it. Persisted in
+      // localStorage so it survives refreshes - a fast refresh + click
+      // should never let the SAME device queue a second SOS.
+      function getDeviceId() {
+        let id = localStorage.getItem("sanjeevni_device_id");
+        if (!id) {
+          id =
+            "dev-" +
+            Date.now().toString(36) +
+            "-" +
+            Math.random().toString(36).slice(2, 10);
+          localStorage.setItem("sanjeevni_device_id", id);
+        }
+        return id;
+      }
+      const deviceId = getDeviceId();
+      let deviceSosActive = false; // true once we know THIS device has an unresolved SOS
+
+      const descByLevel = {
+        LOW: "SANJEEVNI is monitoring environmental conditions in your area.",
+        MEDIUM:
+          "A moderate hazard has been detected near your location. Stay alert.",
+        HIGH: "A serious hazard has been detected near your location. Follow local safety guidance.",
+        CRITICAL:
+          "A critical hazard has been detected near your location. Move to safety immediately.",
+      };
+
+      function haversineMeters(lat1, lon1, lat2, lon2) {
+        const R = 6371000;
+        const toRad = (d) => (d * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1);
+        const dLon = toRad(lon2 - lon1);
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(lat1)) *
+            Math.cos(toRad(lat2)) *
+            Math.sin(dLon / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      }
+
+      const severityRank = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 };
+
+      async function checkConnection() {
+        try {
+          const res = await fetch("/api/sensors");
+          const data = await res.json();
+          if (!data.success) throw new Error("bad response");
+          connStatusEl.innerText = "Connected to SANJEEVNI server.";
+        } catch (e) {
+          connStatusEl.innerText = "Unable to connect to SANJEEVNI server.";
+        }
+      }
+
+      async function refreshHazards() {
+        try {
+          const res = await fetch("/api/hazards");
+          const data = await res.json();
+          // Kept for potential future use (e.g. a general "hazards exist
+          // somewhere" banner), but deliberately NOT used to unlock SOS -
+          // see updateSosGate(). Unlocking SOS from a network-wide signal
+          // before the user's OWN location is confirmed was the root
+          // cause of SOS being sendable before location was actually
+          // checked against a real hazard zone.
+        } catch (e) {
+          console.log("hazards error", e);
+        }
+      }
+
+      async function refreshZones() {
+        try {
+          const res = await fetch("/api/hazard-zones");
+          const data = await res.json();
+          zones = data.zones || [];
+          if (userCoords) evaluateArea();
+        } catch (e) {
+          console.log("hazard-zones error", e);
+        }
+      }
+
+      // Looks up the nearest hospital + driving route for the user's own
+      // location and shows it proactively to everyone who opens the
+      // portal - not just people who have already pressed SOS.
+      async function refreshNearestHospital() {
+        if (!userCoords) return;
+        try {
+          const res = await fetch(
+            `/api/nearest-hospital?latitude=${userCoords.latitude}&longitude=${userCoords.longitude}`,
+          );
+          if (!res.ok) throw new Error("lookup failed");
+          const data = await res.json();
+          nearestHospNameEl.innerText = data.hospital;
+          nearestHospDistEl.innerText = data.distance_km;
+          nearestHospLinkEl.href = data.maps_url;
+          hospitalStatusEl.style.display = "none";
+          hospDetailsEl.style.display = "block";
+        } catch (e) {
+          hospitalStatusEl.style.display = "block";
+          hospDetailsEl.style.display = "none";
+          hospitalStatusEl.innerText =
+            "Could not look up the nearest hospital right now.";
+          console.log("nearest-hospital error", e);
+        }
+      }
+
+      function evaluateArea() {
+        if (!userCoords) return;
+
+        let best = null;
+        zones.forEach((z) => {
+          const dist = haversineMeters(
+            userCoords.latitude,
+            userCoords.longitude,
+            z.latitude,
+            z.longitude,
+          );
+          if (dist <= z.radius_m) {
+            if (
+              !best ||
+              severityRank[z.severity] > severityRank[best.severity]
+            ) {
+              best = z;
+            }
+          }
+        });
+
+        areaSeverity = best ? best.severity : "LOW";
+        areaScore = best ? Math.round(Number(best.risk_score) * 100) : 0;
+
+        riskLabelEl.className = `risk-label ${areaSeverity}`;
+        riskLabelEl.innerText = `${areaSeverity} RISK`;
+        riskDescEl.innerText = descByLevel[areaSeverity] || descByLevel.LOW;
+
+        updateSosGate();
+      }
+
+      function updateSosGate() {
+        if (sosBtn.dataset.sending === "true") return; // don't fight an in-flight send
+
+        // If this device already has an unresolved SOS, the button stays
+        // locked no matter what the risk level is - see checkDeviceSos().
+        if (deviceSosActive) {
+          sosBtn.disabled = true;
+          sosHintEl.innerText =
+            "Your SOS is already active. Responders have been notified - waiting for it to be resolved.";
+          return;
+        }
+
+        // ROOT-CAUSE FIX: SOS only ever unlocks once the user's OWN
+        // location has been confirmed AND evaluated against real hazard
+        // zones. There is no "assume high risk network-wide" fallback
+        // before location is known - that was what let the button unlock
+        // (and be clickable) before anyone had actually checked whether
+        // THIS user's location was in a hazard zone at all.
+        if (!userCoords) {
+          sosBtn.disabled = true;
+          sosHintEl.innerText =
+            "Detecting your location - SOS unlocks once your area's risk is confirmed.";
+          return;
+        }
+
+        const isHigh = areaSeverity === "HIGH" || areaSeverity === "CRITICAL";
+        sosBtn.disabled = !isHigh;
+        sosHintEl.innerText = isHigh
+          ? "High risk detected nearby. Tap SOS to alert responders."
+          : "SOS unlocks automatically when high risk is detected nearby.";
+      }
+
+      function requestLocation({ silent } = {}) {
+        if (!navigator.geolocation) {
+          locateStatusEl.innerText =
+            "Location is not supported on this device or browser.";
+          return;
+        }
+        locateBtn.disabled = true;
+        locateStatusEl.innerText = silent
+          ? "Detecting your location automatically..."
+          : "Getting your location...";
+
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            userCoords = {
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+            };
+            locateStatusEl.innerText = `Location detected (${userCoords.latitude.toFixed(4)}, ${userCoords.longitude.toFixed(4)}).`;
+            locateBtn.disabled = false;
+            evaluateArea();
+            refreshNearestHospital();
+          },
+          (err) => {
+            locateStatusEl.innerText = silent
+              ? "Location access needed to check your area and find the nearest hospital. Tap \u201cGet My Location\u201d to allow it."
+              : `Could not get location: ${err.message}. Please enable location access and try again.`;
+            locateBtn.disabled = false;
+          },
+          { enableHighAccuracy: true, timeout: 15000 },
+        );
+      }
+
+      locateBtn.addEventListener("click", () => requestLocation());
+
+      // Checks whether THIS device already has an unresolved SOS -
+      // called on page load (so a refresh restores the locked state
+      // instead of allowing a second SOS) and polled periodically so the
+      // button unlocks again automatically once an officer resolves it.
+      async function checkDeviceSos() {
+        try {
+          const res = await fetch(`/api/sos/device/${encodeURIComponent(deviceId)}`);
+          const data = await res.json();
+          const wasActive = deviceSosActive;
+          deviceSosActive = !!data.active;
+
+          if (deviceSosActive) {
+            statusEl.className = "send-status ok";
+            statusEl.innerText = "Your SOS is active. Responders have been notified.";
+            document.getElementById("hospName").innerText = data.hospital;
+            document.getElementById("hospDist").innerText = data.distance_km;
+            document.getElementById("hospLink").href = data.maps_url;
+            resultEl.style.display = "block";
+          } else if (wasActive && !deviceSosActive) {
+            // Just got resolved since the last check
+            statusEl.className = "send-status ok";
+            statusEl.innerText =
+              "Your previous SOS was marked resolved. You can send a new one if you still need help.";
+          }
+          updateSosGate();
+        } catch (e) {
+          console.log("device-sos check error", e);
+        }
+      }
+
+      function showSosModal(text) {
+        sosModalTextEl.innerText = text;
+        sosModalEl.style.display = "flex";
+      }
+      function hideSosModal() {
+        sosModalEl.style.display = "none";
+      }
+
+      sosBtn.addEventListener("click", () => {
+        if (sosBtn.disabled || deviceSosActive) return;
+
+        // Lock the button immediately so a double-click (or a click that
+        // races with an in-flight auto-refresh) can never fire twice.
+        sosBtn.disabled = true;
+        sosBtn.dataset.sending = "true";
+        statusEl.className = "send-status";
+        statusEl.innerText = "";
+
+        // Per your requirement: never send on a possibly-stale location.
+        // Always re-fetch a FRESH position right now, behind a visible
+        // popup, before actually sending - even if we already had
+        // userCoords from page load (the user may have moved since).
+        showSosModal("Confirming your current location...");
+
+        if (!navigator.geolocation) {
+          hideSosModal();
+          statusEl.className = "send-status error";
+          statusEl.innerText = "Location is not supported on this device/browser.";
+          delete sosBtn.dataset.sending;
+          updateSosGate();
+          return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            const coords = {
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+            };
+            userCoords = coords; // keep the rest of the UI in sync too
+            showSosModal("Sending SOS...");
+
+            fetch("/api/sos", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                latitude: coords.latitude,
+                longitude: coords.longitude,
+                note: noteEl.value,
+                device_id: deviceId,
+              }),
+            })
+              .then(async (res) => {
+                const data = await res.json();
+                hideSosModal();
+
+                if (res.status === 409 && data.status === "already_active") {
+                  // Race: another tab/request from this same device beat
+                  // us to it. Treat it the same as an active SOS, not an error.
+                  deviceSosActive = true;
+                  statusEl.className = "send-status ok";
+                  statusEl.innerText =
+                    "Your SOS is already active. Responders have been notified.";
+                  document.getElementById("hospName").innerText = data.hospital;
+                  document.getElementById("hospDist").innerText = data.distance_km;
+                  document.getElementById("hospLink").href = data.maps_url;
+                  resultEl.style.display = "block";
+                  delete sosBtn.dataset.sending;
+                  updateSosGate();
+                  return;
+                }
+
+                if (!res.ok) throw new Error(data.error || "Failed to send SOS");
+
+                deviceSosActive = true;
+                statusEl.className = "send-status ok";
+                statusEl.innerText = "SOS sent. Responders have been notified.";
+                document.getElementById("hospName").innerText = data.hospital;
+                document.getElementById("hospDist").innerText = data.distance_km;
+                document.getElementById("hospLink").href = data.maps_url;
+                resultEl.style.display = "block";
+                delete sosBtn.dataset.sending;
+                updateSosGate(); // stays locked - deviceSosActive is now true
+              })
+              .catch((err) => {
+                hideSosModal();
+                statusEl.className = "send-status error";
+                statusEl.innerText = `${err.message}. Please call your local emergency number.`;
+                delete sosBtn.dataset.sending;
+                updateSosGate();
+              });
+          },
+          (err) => {
+            hideSosModal();
+            statusEl.className = "send-status error";
+            statusEl.innerText = `Could not confirm your location: ${err.message}. Please enable location access and try again.`;
+            delete sosBtn.dataset.sending;
+            updateSosGate();
+          },
+          { enableHighAccuracy: true, timeout: 15000 },
+        );
+      });
+
+      checkConnection();
+      refreshHazards();
+      refreshZones();
+      requestLocation({ silent: true }); // auto-detect on page open, no click required
+      checkDeviceSos(); // restore "already active" state on refresh
+      setInterval(checkConnection, 5000);
+      setInterval(refreshHazards, 3000);
+      setInterval(refreshZones, 5000);
+      setInterval(checkDeviceSos, 5000); // detect officer resolving it, unlock automatically
+    </script>
+  </body>
+</html>

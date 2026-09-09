@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+scikit-learn
+pandas
+numpy
+matplotlib
+chromadb
+sentence-transformers
+anthropic
+joblib
+requests
