@@ -7,12 +7,15 @@ in the same folder.
 
 import numpy as np
 import pandas as pd
+import shap
 from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
 from flood_risk_model import generate_synthetic_data, scs_cn_runoff
 from anomaly_detection import generate_sensor_stream
+from hazard_classification import classify_all_hazards
 from rag_alert_pipeline import (
     build_knowledge_base,
     generate_alert_message,
@@ -59,8 +62,15 @@ def hardware_test_water_severity(reading: dict) -> str | None:
     reading alone - bypassing the ML model's absolute-scale expectation.
     Only meaningful while HARDWARE_TEST_MODE is True; returns None (no
     override) otherwise, so process_reading() falls back to the normal
-    ML-computed severity untouched."""
-    if not HARDWARE_TEST_MODE:
+    ML-computed severity untouched.
+
+    Also skipped entirely for simulated readings (reading["simulated"]) -
+    this override's thresholds are calibrated to one specific physical
+    ultrasonic sensor's tiny real-world range. A simulator sending
+    realistic river-scale values (1.5-4m) would blow straight through
+    HARDWARE_TEST_WATER_HIGH_M every time otherwise, always forcing HIGH
+    regardless of the actual scenario being tested."""
+    if not HARDWARE_TEST_MODE or reading.get("simulated"):
         return None
     level = reading.get("river_level_m")
     if level is None:
@@ -73,10 +83,30 @@ def hardware_test_water_severity(reading: dict) -> str | None:
 
 
 def is_hazard_signature(reading: dict) -> bool:
-    return (
+    """A raw, unambiguous physical signal strong enough to bypass the
+    anomaly filter, even though it's statistically rare (which is
+    exactly what an anomaly detector would otherwise flag it as).
+
+    BUG FOUND VIA END-TO-END TESTING, FIXED HERE: originally only
+    checked gas/flame. A genuine 46C extreme-heat reading was getting
+    silently suppressed as a "sensor fault" by the anomaly detector,
+    because temp_c/tilt/PM2.5/water-quality were never included here -
+    the anomaly detector (trained only on what counts as "normal" for
+    its original 5 features) had no way to know a real heat wave,
+    landslide, pollution spike, or water contamination event isn't just
+    a broken sensor. Now reuses the SAME thresholds the classifiers
+    themselves use (via classify_all_hazards), so a genuine MEDIUM+ on
+    ANY hazard type always bypasses suppression - not just gas/flame."""
+    if (
         reading["gas_ppm"] > GAS_LEAK_THRESHOLD_PPM
         or reading["flame_reading"] > FLAME_THRESHOLD
-    )
+    ):
+        return True
+
+    for result in classify_all_hazards(reading).values():
+        if result["severity"] in ("MEDIUM", "HIGH", "CRITICAL"):
+            return True
+    return False
 
 
 def train_flood_model():
@@ -88,11 +118,31 @@ def train_flood_model():
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-    model = HistGradientBoostingClassifier(
+    # UPGRADE: calibrated probabilities - see the matching comment in
+    # train_models.py for the full explanation. Kept consistent here
+    # since this is the fallback path used when no saved model exists.
+    base_model = HistGradientBoostingClassifier(
         max_iter=200, learning_rate=0.08, max_depth=4, random_state=42
     )
+    model = CalibratedClassifierCV(base_model, method="sigmoid", cv=5)
     model.fit(X_train, y_train)
     return model, feature_cols
+
+
+def get_base_tree_model(flood_model):
+    """Extracts the underlying (uncalibrated) tree model for SHAP
+    explanation purposes. Calibration (CalibratedClassifierCV) wraps the
+    tree model and doesn't change WHICH features drove a decision, only
+    the final probability's real-world meaning - so explaining via the
+    base tree is a standard, defensible approach, not a workaround.
+
+    Falls back to treating flood_model as the tree model directly, for
+    backward compatibility with any older saved .joblib model trained
+    before calibration was added (a plain HistGradientBoostingClassifier
+    has no .calibrated_classifiers_ attribute)."""
+    if hasattr(flood_model, "calibrated_classifiers_"):
+        return flood_model.calibrated_classifiers_[0].estimator
+    return flood_model
 
 
 def train_anomaly_detector():
@@ -117,12 +167,14 @@ def check_anomaly(reading: dict, anomaly_model, anomaly_scaler) -> tuple[bool, f
     return pred == -1, score
 
 
-def compute_flood_risk(reading: dict, flood_model, feature_cols) -> float:
+def _build_flood_feature_row(reading: dict) -> dict:
+    """Shared feature-row construction, used by both compute_flood_risk()
+    and explain_flood_risk() so they can never drift out of sync with
+    each other."""
     runoff_mm = scs_cn_runoff(
         np.array([reading["rainfall_24h_mm"]]), np.array([reading["curve_number"]])
     )[0]
-
-    row = {
+    return {
         "curve_number": reading["curve_number"],
         "rainfall_24h_mm": reading["rainfall_24h_mm"],
         "rainfall_intensity_mm_hr": reading["rainfall_intensity_mm_hr"],
@@ -136,8 +188,90 @@ def compute_flood_risk(reading: dict, flood_model, feature_cols) -> float:
         "land_use_urban_high": 1 if reading["land_use"] == "urban_high" else 0,
         "land_use_urban_low": 1 if reading["land_use"] == "urban_low" else 0,
     }
+
+
+def compute_flood_risk(reading: dict, flood_model, feature_cols) -> float:
+    row = _build_flood_feature_row(reading)
     X = pd.DataFrame([row])[feature_cols]
     return flood_model.predict_proba(X)[0, 1]
+
+
+# UPGRADE: SHAP explainability. shap.TreeExplainer computes, for a SINGLE
+# prediction, how much each feature pushed the risk score up or down from
+# the model's average baseline output - not just "which features matter
+# in general" (that's what permutation_importance already gave you), but
+# "why did THIS SPECIFIC reading score HIGH". This is what actually
+# answers a judge's "why did the AI flag this one?" question.
+_shap_explainer_cache = {}
+
+
+def explain_flood_risk(
+    reading: dict, flood_model, feature_cols, top_n: int = 3
+) -> list[dict]:
+    """Returns the top_n features that most influenced THIS reading's
+    risk score, each as {"feature": name, "value": raw_value,
+    "impact": +/-float, "direction": "increased"/"decreased"}.
+
+    Never raises - if SHAP computation fails for any reason (unexpected
+    model type, version mismatch, etc.), returns an empty list so a
+    missing explanation never blocks an actual alert from being sent."""
+    try:
+        base_tree_model = get_base_tree_model(flood_model)
+        model_id = id(base_tree_model)
+        if model_id not in _shap_explainer_cache:
+            _shap_explainer_cache[model_id] = shap.TreeExplainer(base_tree_model)
+        explainer = _shap_explainer_cache[model_id]
+
+        row = _build_flood_feature_row(reading)
+        X = pd.DataFrame([row])[feature_cols]
+
+        shap_values = explainer(X)
+        # Binary classifier - take the "flood" class's contributions
+        values = shap_values.values[0]
+        if values.ndim > 1:
+            values = values[:, 1]
+
+        contributions = sorted(
+            zip(feature_cols, values, X.iloc[0].tolist()),
+            key=lambda t: abs(t[1]),
+            reverse=True,
+        )[:top_n]
+
+        return [
+            {
+                "feature": name,
+                "value": round(float(val), 4),
+                "impact": round(float(impact), 4),
+                "direction": "increased" if impact > 0 else "decreased",
+            }
+            for name, impact, val in contributions
+        ]
+    except Exception as e:
+        print(f"[SHAP] explanation failed, continuing without it: {e}")
+        return []
+
+
+UPSTREAM_BOOST_MAX = 0.15  # max +15% relative closing of the gap to 1.0
+
+
+def apply_spatial_correlation_boost(risk_score: float, reading: dict) -> float:
+    """UPGRADE: cross-node spatial correlation. If this node's configured
+    upstream node is ALSO currently rising, that's real independent
+    corroborating evidence - water flows downhill, so a rising upstream
+    node is a leading indicator for this one, not just noise. Only ever
+    boosts (a calm upstream node is not evidence of safety - it just
+    means no boost applies), and is capped so it can tip a borderline
+    MEDIUM into HIGH but can't manufacture a HIGH out of a genuinely calm
+    reading on its own."""
+    upstream_rate = reading.get("upstream_rate_m_per_hr") or 0.0
+    if upstream_rate <= 0:
+        return risk_score
+    # Normalize against a 0.5 m/hr upstream rise as "fully triggering" -
+    # matches the same rate-of-rise scale already used elsewhere (see
+    # backend_server.py's FLOOD_CRITICAL_LEVEL_M / ETA projection).
+    boost_strength = min(1.0, upstream_rate / 0.5)
+    boosted = risk_score + (1 - risk_score) * UPSTREAM_BOOST_MAX * boost_strength
+    return min(1.0, boosted)
 
 
 def process_reading(
@@ -161,26 +295,62 @@ def process_reading(
             "severity": "N/A",
         }
 
+    # UPGRADE: full multi-hazard classification. Every candidate hazard
+    # is scored independently (see hazard_classification.py for fire,
+    # extreme heat, landslide, air pollution, water quality) - the most
+    # severe one becomes this reading's primary hazard_type (for
+    # backward compatibility with the DB schema/dashboard/CAP format,
+    # which all expect one hazard per reading), while EVERY classifier's
+    # result is preserved in "hazard_scores" for full transparency.
+    candidates = {}
+    severity_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
     if reading["gas_ppm"] > GAS_LEAK_THRESHOLD_PPM:
-        hazard_type = "gas leak"
-        risk_score = min(1.0, (reading["gas_ppm"] - 400) / 600)
-    else:
-        hazard_type = "flood"
-        risk_score = compute_flood_risk(reading, flood_model, flood_feature_cols)
+        gas_risk = min(1.0, (reading["gas_ppm"] - 400) / 600)
+        candidates["gas leak"] = {
+            "risk_score": gas_risk,
+            "severity": severity_band(gas_risk),
+            "severity_source": "ml_model",
+        }
 
-    severity = severity_band(risk_score)
-    severity_source = "ml_model"
+    flood_risk = compute_flood_risk(reading, flood_model, flood_feature_cols)
+    flood_risk = apply_spatial_correlation_boost(flood_risk, reading)
+    flood_severity = severity_band(flood_risk)
+    flood_severity_source = "ml_model"
+    override_severity = hardware_test_water_severity(reading)
+    if (
+        override_severity
+        and severity_rank[override_severity] > severity_rank[flood_severity]
+    ):
+        flood_severity = override_severity
+        flood_severity_source = "hardware_test_threshold"
+    candidates["flood"] = {
+        "risk_score": flood_risk,
+        "severity": flood_severity,
+        "severity_source": flood_severity_source,
+    }
+    flood_explanation = explain_flood_risk(reading, flood_model, flood_feature_cols)
 
-    
-    if hazard_type == "flood":
-        override_severity = hardware_test_water_severity(reading)
-        severity_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
-        if (
-            override_severity
-            and severity_rank[override_severity] > severity_rank[severity]
-        ):
-            severity = override_severity
-            severity_source = "hardware_test_threshold"
+    for hazard_type, result in classify_all_hazards(reading).items():
+        candidates[hazard_type] = {
+            "risk_score": result["risk_score"],
+            "severity": result["severity"],
+            "severity_source": "threshold_classifier",
+        }
+
+    # Pick the most severe candidate as primary - ties broken by risk_score
+    hazard_type = max(
+        candidates,
+        key=lambda k: (
+            severity_rank[candidates[k]["severity"]],
+            candidates[k]["risk_score"],
+        ),
+    )
+    winner = candidates[hazard_type]
+    risk_score = winner["risk_score"]
+    severity = winner["severity"]
+    severity_source = winner["severity_source"]
+    explanation = flood_explanation if hazard_type == "flood" else []
 
     if severity == "LOW":
         return {
@@ -189,6 +359,8 @@ def process_reading(
             "risk_score": float(risk_score),
             "severity": severity,
             "severity_source": severity_source,
+            "explanation": explanation,
+            "hazard_scores": candidates,
         }
 
     message = generate_alert_message(
@@ -197,7 +369,7 @@ def process_reading(
         location=reading["location"],
         collection=rag_collection,
         embedder=rag_embedder,
-        use_llm=False,  
+        use_llm=False,  # flip to True once ANTHROPIC_API_KEY is set
     )
     return {
         "status": "alert_dispatched",
@@ -206,6 +378,8 @@ def process_reading(
         "risk_score": float(risk_score),
         "severity": severity,
         "message": message,
+        "explanation": explanation,
+        "hazard_scores": candidates,
     }
 
 

@@ -33,5 +33,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
-
+.env
 *.log

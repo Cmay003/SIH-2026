@@ -16,9 +16,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import classification_report, roc_auc_score, brier_score_loss
 
 from flood_risk_model import generate_synthetic_data, scs_cn_runoff
 from anomaly_detection import generate_sensor_stream
@@ -70,8 +71,24 @@ def train_flood_model():
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y if y.nunique() > 1 else None
     )
-    model = HistGradientBoostingClassifier(
+
+    # UPGRADE: calibrated probabilities (CalibratedClassifierCV). Raw
+    # gradient-boosting outputs are a SCORE, not a true probability - a
+    # model can say "0.9" for a class it's only actually right about 60%
+    # of the time. Calibration (Platt/sigmoid scaling here, via internal
+    # cross-validation) adjusts the output so a 0.7 risk score actually
+    # corresponds to roughly 70% real-world frequency of that outcome in
+    # the training distribution. sigmoid (not isotonic) is used because
+    # our dataset sizes (hundreds-thousands of rows) are on the smaller
+    # side where isotonic calibration tends to overfit.
+    base_model = HistGradientBoostingClassifier(
         max_iter=200, learning_rate=0.08, max_depth=4, random_state=42
+    )
+    calibration_cv = (
+        min(5, y_train.value_counts().min()) if y_train.nunique() > 1 else 2
+    )
+    model = CalibratedClassifierCV(
+        base_model, method="sigmoid", cv=max(2, calibration_cv)
     )
     model.fit(X_train, y_train)
 
@@ -83,6 +100,13 @@ def train_flood_model():
             )
         )
         print(f"ROC-AUC: {roc_auc_score(y_test, y_proba):.3f}")
+        # Brier score - lower is better-calibrated (0 = perfect). This is
+        # the metric calibration is actually optimizing for, distinct
+        # from ROC-AUC (which only cares about ranking, not the actual
+        # probability values being meaningful).
+        print(
+            f"Brier score (calibration quality, lower=better): {brier_score_loss(y_test, y_proba):.4f}"
+        )
 
     joblib.dump(model, os.path.join(MODELS_DIR, "flood_model.joblib"))
     joblib.dump(feature_cols, os.path.join(MODELS_DIR, "flood_feature_cols.joblib"))

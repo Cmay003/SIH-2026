@@ -37,7 +37,7 @@
         .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(27,94,32,0.08); border: 1px solid var(--green-light); }
         .card h3 { margin-top: 0; color: var(--text-muted); }
         .value { font-size: 28px; font-weight: bold; color: var(--green-dark); }
-        table { width: 100%; margin-top: 25px; background: white; border-collapse: collapse; box-shadow: 0 2px 8px rgba(27,94,32,0.08); }
+        table { width: 100%; min-width: 700px; margin-top: 25px; background: white; border-collapse: collapse; box-shadow: 0 2px 8px rgba(27,94,32,0.08); }
         th, td { padding: 12px; border-bottom: 1px solid var(--green-light); text-align: left; }
         th { background: var(--green-dark); color: white; }
         .LOW { color: var(--green); font-weight: bold; }
@@ -127,6 +127,7 @@
     <div id="hazardList" class="hazards"></div>
 
     <h2>Latest Sensor Readings</h2>
+    <div style="overflow-x: auto; -webkit-overflow-scrolling: touch;">
     <table>
         <thead>
             <tr>
@@ -136,11 +137,26 @@
         </thead>
         <tbody id="sensorTable"></tbody>
     </table>
+    </div>
     </main>
 
 
     <script>
         let lastDevice = null;
+
+        // UPGRADE: same hazard-type icon mapping as officer.html, so a
+        // citizen sees the same visual language an officer does -
+        // previously every hazard type showed as plain uppercase text
+        // with no icon at all, no visual distinction between a flood
+        // and a landslide.
+        const HAZARD_ICONS = {
+            "flood": "🌊", "gas leak": "☣️", "fire": "🔥",
+            "extreme heat": "🌡️", "landslide": "⛰️",
+            "air pollution": "😷", "water quality degradation": "💧",
+        };
+        function hazardIconFor(hazardType) {
+            return HAZARD_ICONS[hazardType] || "⚠️";
+        }
 
         async function loadHazards() {
             try {
@@ -163,7 +179,7 @@
                     <a href="officer.html?focus=${encodeURIComponent(top.node_id)}" target="_blank">
                         <div class="critical-hazard-box">
                             <div class="ch-left">
-                                <h4>🚨 ${top.label}: ${top.hazard_type.toUpperCase()}</h4>
+                                <h4>${hazardIconFor(top.hazard_type)} ${top.label}: ${top.hazard_type.toUpperCase()}</h4>
                                 <div class="loc">📍 ${top.location} (${top.node_id})</div>
                                 <div class="eta">⏱ ${top.prediction_text}</div>
                             </div>
@@ -177,7 +193,7 @@
                 container.innerHTML = result.hazards.map(h => `
                     <a href="officer.html?focus=${encodeURIComponent(h.node_id)}" target="_blank" class="hazard-card-link">
                         <div class="hazard-card ${h.severity}">
-                            <h4>${h.label}: ${h.hazard_type.toUpperCase()}</h4>
+                            <h4>${hazardIconFor(h.hazard_type)} ${h.label}: ${h.hazard_type.toUpperCase()}</h4>
                             <div class="loc">📍 ${h.location} (${h.node_id})</div>
                             <div class="score-row">
                                 <span>Risk Score</span>

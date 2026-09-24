@@ -37,12 +37,29 @@
         color: white;
         text-align: center;
         padding: 26px 20px 20px;
+        position: relative;
       }
       header.topbar h1 {
         margin: 0;
         font-size: 30px;
         font-weight: 800;
         letter-spacing: 0.5px;
+      }
+      .lang-toggle {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        background: rgba(255, 255, 255, 0.15);
+        color: white;
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        border-radius: 6px;
+        padding: 6px 14px;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .lang-toggle:hover {
+        background: rgba(255, 255, 255, 0.25);
       }
       header.topbar .portal-label {
         font-size: 13px;
@@ -165,6 +182,31 @@
         color: var(--red);
       }
 
+      .score-ring {
+        flex: 0 0 auto;
+        width: 112px;
+        height: 112px;
+        border-radius: 50%;
+        border: 8px solid var(--ring-track);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+      }
+      .score-value {
+        font-size: 26px;
+        font-weight: 800;
+        color: var(--text-dark);
+      }
+      .score-label {
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        margin-top: 2px;
+      }
+
       .sos-card h2 {
         margin: 0;
         font-size: 19px;
@@ -259,7 +301,9 @@
         }
       }
 
-      /* ---- SOS confirmation popup ---- */
+      /* ---- SOS confirmation popup - shown while we re-fetch a fresh
+         location right before actually sending, so a send can never go
+         out without a just-confirmed position ---- */
       .sos-modal-backdrop {
         position: fixed;
         inset: 0;
@@ -301,9 +345,10 @@
   </head>
   <body>
     <header class="topbar">
+      <button id="langToggle" class="lang-toggle" type="button">हिंदी</button>
       <h1>SANJEEVNI</h1>
-      <div class="portal-label">USER PORTAL</div>
-      <div class="conn-status" id="connStatus">
+      <div class="portal-label" data-i18n="portalLabel">USER PORTAL</div>
+      <div class="conn-status" id="connStatus" data-i18n="connecting">
         Connecting to SANJEEVNI server...
       </div>
     </header>
@@ -312,13 +357,13 @@
       <section class="card locate-card">
         <div class="locate-head">
           <div>
-            <h2>Check Your Safety Area</h2>
+            <h2 data-i18n="checkSafety">Check Your Safety Area</h2>
             <p class="muted">
               Allow location access to find nearby safe locations and active
               danger zones.
             </p>
           </div>
-          <button id="locateBtn" class="btn-primary">Get My Location</button>
+          <button id="locateBtn" class="btn-primary" data-i18n="getLocation">Get My Location</button>
         </div>
         <div class="locate-status" id="locateStatus">
           Detecting your location automatically...
@@ -328,22 +373,26 @@
       <section class="grid-row">
         <div class="card safety-card">
           <div>
-            <div class="eyebrow">Current area safety</div>
+            <div class="eyebrow" data-i18n="areaSafety">Current area safety</div>
             <div class="risk-label LOW" id="riskLabel">LOW RISK</div>
             <p class="muted" id="riskDesc">
               SANJEEVNI is monitoring environmental conditions in your area.
             </p>
           </div>
+          <div class="score-ring">
+            <div class="score-value" id="scoreValue">0</div>
+            <div class="score-label" data-i18n="riskScoreLabel">Risk score</div>
+          </div>
         </div>
 
         <div class="card sos-card">
-          <h2>Need Emergency Help?</h2>
+          <h2 data-i18n="needHelp">Need Emergency Help?</h2>
           <p class="muted">
             If you are in immediate danger, send your location to the SANJEEVNI
             emergency response system.
           </p>
           <div class="sos-wrap">
-            <button id="sosBtn" class="sos-btn" disabled>SOS</button>
+            <button id="sosBtn" class="sos-btn" disabled data-i18n="sosButton">SOS</button>
           </div>
           <div class="sos-hint" id="sosHint">
             SOS unlocks automatically when high risk is detected nearby.
@@ -380,10 +429,18 @@
         <p class="muted" style="margin-top: 0">
           Optional: describe your situation
         </p>
-        <textarea
-          id="note"
-          placeholder="e.g. trapped by flood water, number of people"
-        ></textarea>
+        <div style="position: relative">
+          <textarea
+            id="note"
+            placeholder="e.g. trapped by flood water, number of people"
+          ></textarea>
+          <button
+            id="voiceBtn"
+            type="button"
+            title="Speak your situation instead of typing"
+            style="position: absolute; right: 8px; bottom: 8px; border: none; background: var(--blue, #1d4ed8); color: white; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; font-size: 16px"
+          >🎤</button>
+        </div>
         <div class="send-status" id="status"></div>
       </section>
 
@@ -405,11 +462,110 @@
     </div>
 
     <script>
+      // --- UPGRADE: multi-language support (Hindi) -------------------
+      const translations = {
+        en: {
+          portalLabel: "USER PORTAL",
+          connecting: "Connecting to SANJEEVNI server...",
+          checkSafety: "Check Your Safety Area",
+          getLocation: "Get My Location",
+          areaSafety: "Current area safety",
+          needHelp: "Need Emergency Help?",
+          sosButton: "SOS",
+          riskScoreLabel: "Risk score",
+          sosHintLocked: "SOS unlocks automatically when high risk is detected nearby.",
+          sosHintUnlocked: "High risk detected nearby. Tap SOS to alert responders.",
+          sosHintActive: "Your SOS is already active. Responders have been notified - waiting for it to be resolved.",
+        },
+        hi: {
+          portalLabel: "नागरिक पोर्टल",
+          connecting: "सांजीवनी सर्वर से जुड़ रहे हैं...",
+          checkSafety: "अपने क्षेत्र की सुरक्षा जांचें",
+          getLocation: "मेरा स्थान प्राप्त करें",
+          areaSafety: "वर्तमान क्षेत्र सुरक्षा",
+          needHelp: "आपातकालीन सहायता चाहिए?",
+          sosButton: "एसओएस",
+          riskScoreLabel: "जोखिम स्कोर",
+          sosHintLocked: "आस-पास खतरा होने पर एसओएस अपने आप सक्रिय हो जाएगा।",
+          sosHintUnlocked: "आस-पास उच्च जोखिम पाया गया। मदद के लिए एसओएस दबाएं।",
+          sosHintActive: "आपका एसओएस पहले से सक्रिय है। सहायता दल को सूचित कर दिया गया है - समाधान की प्रतीक्षा है।",
+        },
+      };
+      let currentLang = localStorage.getItem("sanjeevni_lang") || "en";
+
+      function applyTranslations() {
+        const dict = translations[currentLang];
+        document.querySelectorAll("[data-i18n]").forEach((el) => {
+          const key = el.getAttribute("data-i18n");
+          if (dict[key]) el.textContent = dict[key];
+        });
+        document.getElementById("langToggle").textContent =
+          currentLang === "en" ? "हिंदी" : "English";
+      }
+
+      document.getElementById("langToggle").addEventListener("click", () => {
+        currentLang = currentLang === "en" ? "hi" : "en";
+        localStorage.setItem("sanjeevni_lang", currentLang);
+        applyTranslations();
+        updateSosGate(); // refresh the currently-shown SOS hint in the new language
+      });
+
+      applyTranslations();
+
+      // --- UPGRADE: voice-based SOS (speech-to-text fallback) ---------
+      // Uses the browser's built-in SpeechRecognition API - free, no
+      // external service. Support varies by browser: works well in
+      // Chrome/Edge; Safari/Firefox support is limited or absent, so
+      // this degrades gracefully (button hides) rather than erroring.
+      const voiceBtn = document.getElementById("voiceBtn");
+      const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+      if (!SpeechRecognitionAPI) {
+        voiceBtn.style.display = "none";
+        console.log("Voice input not supported in this browser - falling back to typing only.");
+      } else {
+        const recognition = new SpeechRecognitionAPI();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+
+        let isListening = false;
+        voiceBtn.addEventListener("click", () => {
+          recognition.lang = currentLang === "hi" ? "hi-IN" : "en-IN";
+          if (isListening) {
+            recognition.stop();
+            return;
+          }
+          try {
+            recognition.start();
+            isListening = true;
+            voiceBtn.textContent = "⏹";
+            voiceBtn.style.background = "#d90429";
+          } catch (e) {
+            console.log("Speech recognition failed to start:", e);
+          }
+        });
+
+        recognition.addEventListener("result", (event) => {
+          const transcript = event.results[0][0].transcript;
+          const noteEl2 = document.getElementById("note");
+          noteEl2.value = noteEl2.value ? `${noteEl2.value} ${transcript}` : transcript;
+        });
+
+        const resetVoiceBtn = () => {
+          isListening = false;
+          voiceBtn.textContent = "🎤";
+          voiceBtn.style.background = "";
+        };
+        recognition.addEventListener("end", resetVoiceBtn);
+        recognition.addEventListener("error", resetVoiceBtn);
+      }
+
       const connStatusEl = document.getElementById("connStatus");
       const locateBtn = document.getElementById("locateBtn");
       const locateStatusEl = document.getElementById("locateStatus");
       const riskLabelEl = document.getElementById("riskLabel");
       const riskDescEl = document.getElementById("riskDesc");
+      const scoreValueEl = document.getElementById("scoreValue");
       const sosBtn = document.getElementById("sosBtn");
       const sosHintEl = document.getElementById("sosHint");
       const noteEl = document.getElementById("note");
@@ -559,6 +715,7 @@
         riskLabelEl.className = `risk-label ${areaSeverity}`;
         riskLabelEl.innerText = `${areaSeverity} RISK`;
         riskDescEl.innerText = descByLevel[areaSeverity] || descByLevel.LOW;
+        scoreValueEl.innerText = areaScore;
 
         updateSosGate();
       }
@@ -570,8 +727,7 @@
         // locked no matter what the risk level is - see checkDeviceSos().
         if (deviceSosActive) {
           sosBtn.disabled = true;
-          sosHintEl.innerText =
-            "Your SOS is already active. Responders have been notified - waiting for it to be resolved.";
+          sosHintEl.innerText = translations[currentLang].sosHintActive;
           return;
         }
 
@@ -591,8 +747,8 @@
         const isHigh = areaSeverity === "HIGH" || areaSeverity === "CRITICAL";
         sosBtn.disabled = !isHigh;
         sosHintEl.innerText = isHigh
-          ? "High risk detected nearby. Tap SOS to alert responders."
-          : "SOS unlocks automatically when high risk is detected nearby.";
+          ? translations[currentLang].sosHintUnlocked
+          : translations[currentLang].sosHintLocked;
       }
 
       function requestLocation({ silent } = {}) {

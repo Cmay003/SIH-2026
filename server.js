@@ -1,3 +1,9 @@
+// Loads OFFICER_API_KEY (and any other future secrets) from a .env file
+// in this folder, if one exists - falls back silently to whatever's
+// already in the real environment if .env is missing, so this doesn't
+// break anyone who's still setting the variable manually.
+require("dotenv").config();
+
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -6,11 +12,84 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" })); // raised for base64 photo uploads (citizen hazard reports)
 app.use(cors());
 app.use(express.static(__dirname));
 
+// --- UPGRADE: authentication on officer dashboard + SOS API ------------
+// Simple API-key auth (X-API-Key header) for OFFICER-facing actions -
+// viewing all SOS locations, resolving them. Citizen-facing endpoints
+// (submitting an SOS, viewing hazards, ESP32 ingestion) stay open, since
+// those need to work for anonymous citizens and unauthenticated field
+// hardware by design.
+//
+// SECURITY NOTE: never hardcode a real secret. This falls back to a
+// clearly-labeled DEMO key ONLY so the existing demo flow doesn't break
+// if you haven't set OFFICER_API_KEY yet - replace it before any real
+// deployment. Set a real one via: export OFFICER_API_KEY="your-real-key"
+const OFFICER_API_KEY =
+  process.env.OFFICER_API_KEY || "sanjeevni-demo-key-CHANGE-ME";
+if (!process.env.OFFICER_API_KEY) {
+  console.warn(
+    "\n[SECURITY WARNING] OFFICER_API_KEY is not set - using an insecure " +
+      "default demo key. Set a real one via environment variable before " +
+      'any real deployment: export OFFICER_API_KEY="your-real-key"\n',
+  );
+}
+
+function requireOfficerAuth(req, res, next) {
+  const providedKey = req.headers["x-api-key"];
+  if (providedKey !== OFFICER_API_KEY) {
+    return res
+      .status(401)
+      .json({ error: "Unauthorized - valid X-API-Key header required" });
+  }
+  next();
+}
+
 const db = new DatabaseSync(path.join(__dirname, "sanjeevni.db"));
+
+// --- UPGRADE: redundant database (lightweight backup routine) ----------
+// Full geographic/multi-host redundancy needs real infrastructure (a
+// second server, cloud storage) beyond what application code alone can
+// provide - that's a hosting decision, not a code problem. What THIS
+// does, for real: periodically copies the live SQLite file to a
+// backups/ folder with a timestamped name, and prunes old ones so disk
+// usage doesn't grow unbounded. Protects against DB corruption or an
+// accidental delete - not a datacenter outage.
+const BACKUPS_DIR = path.join(__dirname, "backups");
+const BACKUP_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
+const BACKUP_RETENTION_COUNT = 10;
+const DB_FILE_PATH = path.join(__dirname, "sanjeevni.db");
+
+if (!fs.existsSync(BACKUPS_DIR)) {
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+}
+
+function backupDatabase() {
+  if (!fs.existsSync(DB_FILE_PATH)) {
+    console.log("[backup] sanjeevni.db does not exist yet - skipping backup");
+    return null;
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = path.join(BACKUPS_DIR, `sanjeevni_backup_${timestamp}.db`);
+  fs.copyFileSync(DB_FILE_PATH, backupPath);
+
+  // Prune old backups beyond the retention count, oldest first
+  const existingBackups = fs
+    .readdirSync(BACKUPS_DIR)
+    .filter((f) => f.startsWith("sanjeevni_backup_"))
+    .sort();
+  while (existingBackups.length > BACKUP_RETENTION_COUNT) {
+    const oldest = existingBackups.shift();
+    fs.unlinkSync(path.join(BACKUPS_DIR, oldest));
+  }
+  console.log(`[backup] Database backed up to ${backupPath}`);
+  return backupPath;
+}
+
+setInterval(backupDatabase, BACKUP_INTERVAL_MS);
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS sensor_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,6 +182,38 @@ const selectAllSos = db.prepare(
 const updateSosStatus = db.prepare(
   "UPDATE sos_requests SET status=? WHERE id=?",
 );
+
+// --- UPGRADE: crowdsourced hazard reports from citizens (with photo) ---
+// Fills gaps between fixed sensor nodes and doubles as labeled training
+// data once officers review/confirm reports.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS citizen_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    latitude REAL,
+    longitude REAL,
+    description TEXT,
+    photo_path TEXT,
+    reviewed INTEGER DEFAULT 0,
+    confirmed_hazard TEXT,
+    timestamp TEXT
+  )
+`);
+const insertCitizenReport = db.prepare(
+  `INSERT INTO citizen_reports (latitude, longitude, description, photo_path, timestamp)
+   VALUES (?, ?, ?, ?, ?)`,
+);
+const selectCitizenReports = db.prepare(
+  "SELECT * FROM citizen_reports ORDER BY id DESC LIMIT ?",
+);
+const updateCitizenReportReview = db.prepare(
+  "UPDATE citizen_reports SET reviewed=1, confirmed_hazard=? WHERE id=?",
+);
+
+const CITIZEN_UPLOADS_DIR = path.join(__dirname, "citizen_uploads");
+if (!fs.existsSync(CITIZEN_UPLOADS_DIR)) {
+  fs.mkdirSync(CITIZEN_UPLOADS_DIR, { recursive: true });
+}
+app.use("/citizen_uploads", express.static(CITIZEN_UPLOADS_DIR));
 
 const NODE_INFO = {
   "NODE-04": {
@@ -310,6 +421,62 @@ app.get("/api/nearest-hospital", (req, res) => {
 
 // 5. Citizen presses SOS -> stored, and they immediately get the route to
 // the nearest hospital back in the response.
+// Shared SOS-creation logic, used by BOTH the citizen portal's POST
+// /api/sos AND the new WhatsApp webhook below - one source of truth
+// for "what happens when someone reports an SOS", regardless of which
+// channel it came in through.
+function createSosRequest(deviceId, latitude, longitude, note) {
+  const existing = selectOpenSosByDevice.get(deviceId);
+  if (existing) {
+    const { hospital, distance_km } = nearestHospital(
+      existing.latitude,
+      existing.longitude,
+    );
+    return {
+      httpStatus: 409,
+      body: {
+        status: "already_active",
+        error:
+          "This device already has an active SOS request awaiting response.",
+        sos_id: existing.id,
+        hospital: hospital.name,
+        distance_km,
+        maps_url: mapsLink(
+          existing.latitude,
+          existing.longitude,
+          hospital.latitude,
+          hospital.longitude,
+        ),
+      },
+    };
+  }
+
+  const timestamp = new Date().toISOString();
+  const result = insertSos.run(
+    deviceId,
+    latitude,
+    longitude,
+    note || null,
+    timestamp,
+  );
+  const { hospital, distance_km } = nearestHospital(latitude, longitude);
+  return {
+    httpStatus: 201,
+    body: {
+      status: "received",
+      sos_id: result.lastInsertRowid,
+      hospital: hospital.name,
+      distance_km,
+      maps_url: mapsLink(
+        latitude,
+        longitude,
+        hospital.latitude,
+        hospital.longitude,
+      ),
+    },
+  };
+}
+
 app.post("/api/sos", (req, res) => {
   const { latitude, longitude, note, device_id } = req.body;
   if (latitude == null || longitude == null) {
@@ -320,54 +487,13 @@ app.post("/api/sos", (req, res) => {
   if (!device_id) {
     return res.status(400).json({ error: "device_id is required" });
   }
-
-  // One open SOS per device - if this device already has an unresolved
-  // SOS, don't create a second one. Return the existing one instead so
-  // the citizen portal can show "your SOS is already active" rather than
-  // a generic error.
-  const existing = selectOpenSosByDevice.get(device_id);
-  if (existing) {
-    const { hospital, distance_km } = nearestHospital(
-      existing.latitude,
-      existing.longitude,
-    );
-    return res.status(409).json({
-      status: "already_active",
-      error: "This device already has an active SOS request awaiting response.",
-      sos_id: existing.id,
-      hospital: hospital.name,
-      distance_km,
-      maps_url: mapsLink(
-        existing.latitude,
-        existing.longitude,
-        hospital.latitude,
-        hospital.longitude,
-      ),
-    });
-  }
-
-  const timestamp = new Date().toISOString();
-  const result = insertSos.run(
+  const { httpStatus, body } = createSosRequest(
     device_id,
     latitude,
     longitude,
-    note || null,
-    timestamp,
+    note,
   );
-
-  const { hospital, distance_km } = nearestHospital(latitude, longitude);
-  res.status(201).json({
-    status: "received",
-    sos_id: result.lastInsertRowid,
-    hospital: hospital.name,
-    distance_km,
-    maps_url: mapsLink(
-      latitude,
-      longitude,
-      hospital.latitude,
-      hospital.longitude,
-    ),
-  });
+  res.status(httpStatus).json(body);
 });
 
 // 5b. Lookup whether a given device currently has an open (unresolved)
@@ -399,7 +525,22 @@ app.get("/api/sos/device/:device_id", (req, res) => {
 
 // 6. Officer dashboard feed - open SOS requests, each enriched with the
 // route from the responder base to the person, and the person's nearest hospital.
-app.get("/api/sos", (req, res) => {
+// UPGRADE: SLA / escalation timers - flags an open SOS that's been
+// waiting too long without resolution, so it doesn't silently sit there.
+const SLA_MINUTES = 15;
+
+function computeEscalation(status, timestamp) {
+  if (status !== "open") {
+    return { escalated: false, minutes_open: 0 };
+  }
+  const minutesOpen = (Date.now() - new Date(timestamp).getTime()) / 60000;
+  return {
+    escalated: minutesOpen > SLA_MINUTES,
+    minutes_open: Math.round(minutesOpen),
+  };
+}
+
+app.get("/api/sos", requireOfficerAuth, (req, res) => {
   const rows =
     req.query.status === "all"
       ? selectAllSos.all(parseInt(req.query.limit || "200", 10))
@@ -407,6 +548,10 @@ app.get("/api/sos", (req, res) => {
 
   const data = rows.map((r) => {
     const { hospital, distance_km } = nearestHospital(r.latitude, r.longitude);
+    const { escalated, minutes_open } = computeEscalation(
+      r.status,
+      r.timestamp,
+    );
     return {
       id: r.id,
       latitude: r.latitude,
@@ -414,6 +559,8 @@ app.get("/api/sos", (req, res) => {
       note: r.note,
       status: r.status,
       timestamp: r.timestamp,
+      escalated,
+      minutes_open,
       nearest_hospital: hospital.name,
       hospital_distance_km: distance_km,
       hospital_route_url: mapsLink(
@@ -431,11 +578,16 @@ app.get("/api/sos", (req, res) => {
     };
   });
 
-  res.json({ success: true, count: data.length, data });
+  res.json({
+    success: true,
+    count: data.length,
+    escalated_count: data.filter((d) => d.escalated).length,
+    data,
+  });
 });
 
 // 7. Officer marks an SOS as handled
-app.post("/api/sos/:id/resolve", (req, res) => {
+app.post("/api/sos/:id/resolve", requireOfficerAuth, (req, res) => {
   updateSosStatus.run("resolved", req.params.id);
   res.json({ status: "ok" });
 });
@@ -443,7 +595,7 @@ app.post("/api/sos/:id/resolve", (req, res) => {
 // 7b. Bulk-resolve every currently open SOS at once - for when an officer
 // has finished handling everything and wants to clear the board in one
 // action, rather than clicking "Resolve" on each one individually.
-app.post("/api/sos/resolve-all", (req, res) => {
+app.post("/api/sos/resolve-all", requireOfficerAuth, (req, res) => {
   const openOnes = selectOpenSos.all();
   for (const sos of openOnes) {
     updateSosStatus.run("resolved", sos.id);
@@ -494,6 +646,279 @@ app.get("/api/hazards", (req, res) => {
   }));
 
   res.json({ success: true, count: hazards.length, hazards });
+});
+
+// --- UPGRADE: crowdsourced hazard reports (citizen-submitted, with photo) ---
+// Public endpoint - any citizen can submit, no auth (same philosophy as
+// SOS submission: reporting a hazard should never be gated behind a login).
+app.post("/api/citizen-reports", (req, res) => {
+  const { latitude, longitude, description, photo_base64 } = req.body;
+  if (latitude == null || longitude == null) {
+    return res
+      .status(400)
+      .json({ error: "latitude and longitude are required" });
+  }
+
+  let photoPath = null;
+  if (photo_base64) {
+    try {
+      // Accepts a data URL ("data:image/jpeg;base64,...") or raw base64
+      const matches = photo_base64.match(/^data:image\/(\w+);base64,(.+)$/);
+      const ext = matches ? matches[1] : "jpg";
+      const data = matches ? matches[2] : photo_base64;
+      const filename = `report_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      fs.writeFileSync(
+        path.join(CITIZEN_UPLOADS_DIR, filename),
+        Buffer.from(data, "base64"),
+      );
+      photoPath = `/citizen_uploads/${filename}`;
+    } catch (e) {
+      console.error("Failed to save citizen report photo:", e.message);
+      // Continue without the photo rather than failing the whole report -
+      // the location + description are still valuable without it.
+    }
+  }
+
+  const timestamp = new Date().toISOString();
+  const result = insertCitizenReport.run(
+    latitude,
+    longitude,
+    description || null,
+    photoPath,
+    timestamp,
+  );
+  res
+    .status(201)
+    .json({
+      status: "received",
+      report_id: result.lastInsertRowid,
+      photo_saved: !!photoPath,
+    });
+});
+
+// Officer-only: view all citizen reports
+app.get("/api/citizen-reports", requireOfficerAuth, (req, res) => {
+  const rows = selectCitizenReports.all(parseInt(req.query.limit || "100", 10));
+  res.json({ success: true, count: rows.length, data: rows });
+});
+
+// Officer-only: mark a report reviewed, optionally confirming it as a
+// real hazard (this is what turns it into labeled training data later)
+app.post("/api/citizen-reports/:id/review", requireOfficerAuth, (req, res) => {
+  const { confirmed_hazard } = req.body; // e.g. "flood", "gas leak", or null if false alarm
+  updateCitizenReportReview.run(confirmed_hazard || null, req.params.id);
+  res.json({ status: "ok" });
+});
+
+// Officer-only: trigger an immediate backup rather than waiting for the
+// next scheduled interval - useful right before a demo or a risky change.
+app.post("/api/admin/backup-now", requireOfficerAuth, (req, res) => {
+  const backupPath = backupDatabase();
+  if (!backupPath) {
+    return res
+      .status(404)
+      .json({ error: "No database file exists yet to back up" });
+  }
+  res.json({ status: "ok", backup_path: backupPath });
+});
+
+// =====================================================================
+// UPGRADE: WhatsApp Business API SOS integration
+// =====================================================================
+// BLOCKED dependency, be upfront: this needs a real Meta Business
+// account + WhatsApp Business API access (App Review approval for the
+// "whatsapp_business_messaging" permission) - credentials I cannot
+// create on your behalf. This code is REAL and correctly implements
+// Meta's actual Cloud API webhook contract, but I have no live WhatsApp
+// Business account to send/receive real messages against, so this is
+// logic-verified against realistic mock payloads (see the test suite),
+// NOT live-API-verified. Test against a real number before trusting it
+// for a demo.
+//
+// SETUP YOU NEED TO DO (none of this is code - it's Meta's own process):
+// 1. Create a Meta Business account + a WhatsApp Business App at
+//    developers.facebook.com
+// 2. Get a test phone number (free) or register your real business number
+// 3. Get your WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID from
+//    the App Dashboard
+// 4. Pick your own WHATSAPP_VERIFY_TOKEN (any random string YOU choose)
+// 5. In the App Dashboard's Webhooks config, set the callback URL to
+//    https://your-domain/api/whatsapp/webhook and enter the SAME verify
+//    token from step 4
+// 6. Subscribe the webhook to the "messages" field
+// 7. IMPORTANT LIMITATION: Meta only allows freeform text replies within
+//    a 24-hour window after the citizen messages you first. A truly
+//    PROACTIVE outbound alert (nobody messaged you first) requires a
+//    pre-approved MESSAGE TEMPLATE, submitted for Meta review in advance -
+//    you cannot send arbitrary free text as a cold outbound alert.
+// All 3 env vars go in your .env file, loaded by the same dotenv setup
+// already used for OFFICER_API_KEY.
+const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+const WHATSAPP_API_VERSION = "v21.0";
+
+if (
+  !WHATSAPP_ACCESS_TOKEN ||
+  !WHATSAPP_PHONE_NUMBER_ID ||
+  !WHATSAPP_VERIFY_TOKEN
+) {
+  console.warn(
+    "\n[WhatsApp] Not configured - WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID / " +
+      "WHATSAPP_VERIFY_TOKEN missing from .env. The webhook endpoints below will run " +
+      "but any real message send will fail until these are set.\n",
+  );
+}
+
+// Sends a freeform WhatsApp text message. Only works within Meta's 24h
+// customer-service window after the recipient messaged first (see the
+// setup note above) - use sendWhatsAppTemplate() for anything proactive.
+async function sendWhatsAppText(toPhone, body) {
+  const url = `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  return axios.post(
+    url,
+    {
+      messaging_product: "whatsapp",
+      to: toPhone,
+      type: "text",
+      text: { body },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    },
+  );
+}
+
+// Sends a pre-approved TEMPLATE message - the only way to message
+// someone who hasn't messaged you in the last 24h (i.e. a genuinely
+// proactive hazard alert, not a reply). templateName must already be
+// approved in your Meta App Dashboard before this will work.
+async function sendWhatsAppTemplate(
+  toPhone,
+  templateName,
+  languageCode,
+  bodyParams,
+) {
+  const url = `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  return axios.post(
+    url,
+    {
+      messaging_product: "whatsapp",
+      to: toPhone,
+      type: "template",
+      template: {
+        name: templateName,
+        language: { code: languageCode },
+        components: [
+          {
+            type: "body",
+            parameters: bodyParams.map((p) => ({ type: "text", text: p })),
+          },
+        ],
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    },
+  );
+}
+
+// Extracts the sender phone + parsed message content from Meta's actual
+// webhook payload shape. Returns null if the payload isn't a real
+// inbound message (Meta also sends status/delivery-receipt webhooks on
+// the same endpoint, which this correctly ignores rather than crashing on).
+function parseWhatsAppMessage(payload) {
+  try {
+    const value = payload.entry[0].changes[0].value;
+    if (!value.messages || value.messages.length === 0) return null;
+    const message = value.messages[0];
+    const fromPhone = message.from;
+
+    if (message.type === "location") {
+      return {
+        fromPhone,
+        type: "location",
+        latitude: message.location.latitude,
+        longitude: message.location.longitude,
+      };
+    }
+    if (message.type === "text") {
+      return { fromPhone, type: "text", text: message.text.body };
+    }
+    return { fromPhone, type: message.type }; // e.g. image, audio - acknowledged but not actionable for SOS
+  } catch (e) {
+    return null; // malformed/unexpected payload shape - fail closed, not crash
+  }
+}
+
+// Webhook verification - Meta calls this ONCE when you configure the
+// webhook URL in the App Dashboard, to confirm you actually own this
+// endpoint. Must echo back hub.challenge if the verify token matches.
+app.get("/api/whatsapp/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === WHATSAPP_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  return res.status(403).send("Verification failed");
+});
+
+// Actual incoming-message webhook. A citizen messaging your WhatsApp
+// number lands here. Flow: if they share their LOCATION, file an SOS
+// immediately (reusing the exact same createSosRequest() as the web
+// portal) and reply with the nearest hospital. If they send plain TEXT
+// first, ask them to share location, since SOS fundamentally needs
+// coordinates for hospital routing.
+app.post("/api/whatsapp/webhook", async (req, res) => {
+  // Always 200 immediately - Meta retries aggressively on non-200/timeout,
+  // and we don't want a slow downstream call to cause duplicate webhook
+  // deliveries for the same message.
+  res.sendStatus(200);
+
+  const parsed = parseWhatsAppMessage(req.body);
+  if (!parsed) return;
+
+  const deviceId = `whatsapp:${parsed.fromPhone}`;
+
+  try {
+    if (parsed.type === "location") {
+      const { httpStatus, body } = createSosRequest(
+        deviceId,
+        parsed.latitude,
+        parsed.longitude,
+        "Reported via WhatsApp",
+      );
+      if (httpStatus === 409) {
+        await sendWhatsAppText(
+          parsed.fromPhone,
+          `Your SOS is already active. Nearest hospital: ${body.hospital} (${body.distance_km} km). Help is on the way.`,
+        );
+      } else {
+        await sendWhatsAppText(
+          parsed.fromPhone,
+          `SOS received. Responders have been notified.\nNearest hospital: ${body.hospital} (${body.distance_km} km)\nDirections: ${body.maps_url}`,
+        );
+      }
+    } else if (parsed.type === "text") {
+      await sendWhatsAppText(
+        parsed.fromPhone,
+        "This is SANJEEVNI emergency response. To send an SOS, please share your LIVE LOCATION (attachment icon -> Location -> Share Live Location) so we can find you and route help.",
+      );
+    }
+  } catch (e) {
+    console.error(
+      "[WhatsApp] Failed to send reply:",
+      e.response ? e.response.data : e.message,
+    );
+  }
 });
 
 app.listen(3000, () => {

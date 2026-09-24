@@ -74,6 +74,20 @@
   }
   .resolve-all-btn:hover { background: #b8021f; }
   .resolve-all-btn:disabled { background: #9aa1ab; cursor: not-allowed; }
+  /* UPGRADE: responsiveness. #panel previously had a fixed 260px width
+     with NO handling for narrow screens at all - on a ~375px phone,
+     that's ~70% of the viewport, overlapping the map badly. On narrow
+     screens, the panel now sits as a slim top bar instead of a large
+     floating box, and can be collapsed to just its header. */
+  @media (max-width: 600px) {
+    #panel {
+      top: 0; right: 0; left: 0; width: auto;
+      border-radius: 0; padding: 8px 12px;
+      max-height: 40vh; overflow-y: auto;
+    }
+    #panel h2 { font-size: 15px; }
+    .legend { font-size: 11.5px; }
+  }
 </style>
 </head>
 <body>
@@ -84,9 +98,12 @@
   <div id="allClearBanner" class="all-clear-banner" style="display:none">✅ All SOS requests resolved</div>
   <button id="resolveAllBtn" class="resolve-all-btn" style="display:none">Resolve All</button>
   <div class="legend">
+    <div style="font-weight:bold; margin-bottom:4px">Severity (color):</div>
     <div><span style="background:orange"></span>MEDIUM hazard zone</div>
     <div><span style="background:red"></span>HIGH / CRITICAL hazard zone</div>
     <div><span style="background:#d90429"></span>Person needing help (SOS)</div>
+    <div style="font-weight:bold; margin-top:8px; margin-bottom:4px">Hazard type (icon):</div>
+    <div style="line-height:1.5">🌊 Flood &nbsp; 🔥 Fire &nbsp; ☣️ Gas leak<br>🌡️ Heat &nbsp; ⛰️ Landslide<br>😷 Air pollution &nbsp; 💧 Water quality</div>
   </div>
 </div>
 
@@ -101,6 +118,68 @@
 
   let hazardLayer = L.layerGroup().addTo(map);
   let sosLayer = L.layerGroup().addTo(map);
+
+  // UPGRADE: authentication. GET /api/sos and the resolve endpoints now
+  // require an X-API-Key header (see server.js's requireOfficerAuth).
+  // Prompts once per browser and remembers it in localStorage - this is
+  // a simple demo-grade key entry, not a full login system.
+  // UPGRADE: authentication. GET /api/sos and the resolve endpoints now
+  // require an X-API-Key header (see server.js's requireOfficerAuth).
+  // Prompts ONCE per session and remembers it in localStorage. On a
+  // wrong/missing key, shows an on-page banner instead of repeatedly
+  // firing the native prompt() dialog every 5-second poll - that was a
+  // real bug (an earlier version of this code cleared the stored key on
+  // 401 and let the next interval tick re-prompt immediately, looping
+  // forever). Now it prompts once, and only re-prompts if you
+  // deliberately click "Re-enter key".
+  let authFailed = false;
+
+  function getOfficerApiKey() {
+    return localStorage.getItem("sanjeevni_officer_api_key") || "";
+  }
+  function officerAuthHeaders() {
+    return { "X-API-Key": getOfficerApiKey() };
+  }
+  function promptForApiKey() {
+    const key = prompt(
+      "Enter the officer API key to view and manage SOS requests:\n" +
+      "(set by whoever is running the SANJEEVNI backend - ask them if you don't have it.\n" +
+      "If they haven't set one, check their server startup log for the demo default key.)",
+    );
+    if (key) {
+      localStorage.setItem("sanjeevni_officer_api_key", key);
+      authFailed = false;
+      hideAuthBanner();
+      loadSos();
+    }
+  }
+  function showAuthBanner() {
+    authFailed = true;
+    let banner = document.getElementById("authBanner");
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "authBanner";
+      banner.style.cssText =
+        "position:fixed;top:10px;left:50%;transform:translateX(-50%);" +
+        "background:#d90429;color:white;padding:10px 16px;border-radius:8px;" +
+        "z-index:2000;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.3);cursor:pointer";
+      banner.textContent = "⚠ Invalid API key - click here to re-enter it";
+      banner.addEventListener("click", () => {
+        localStorage.removeItem("sanjeevni_officer_api_key");
+        promptForApiKey();
+      });
+      document.body.appendChild(banner);
+    }
+    banner.style.display = "block";
+  }
+  function hideAuthBanner() {
+    const banner = document.getElementById("authBanner");
+    if (banner) banner.style.display = "none";
+  }
+
+  if (!getOfficerApiKey()) {
+    promptForApiKey();
+  }
 
   // Read ?focus=NODE_ID from a link clicked on the dashboard's hazard list,
   // so we can fly straight to it once its data loads.
@@ -123,10 +202,27 @@
     });
   }
 
-  function hazardIcon(severity) {
+  // UPGRADE: multi-hazard visual distinction. Previously every hazard
+  // type (flood, fire, landslide, air pollution, water quality, gas
+  // leak) showed the exact same generic warning triangle - the backend
+  // has correctly classified 7 distinct hazard types since Phase 3, but
+  // the map never visually distinguished any of them. Icon = hazard
+  // TYPE, background color = severity (both dimensions visible at once).
+  const HAZARD_ICONS = {
+    "flood": "🌊",
+    "gas leak": "☣️",
+    "fire": "🔥",
+    "extreme heat": "🌡️",
+    "landslide": "⛰️",
+    "air pollution": "😷",
+    "water quality degradation": "💧",
+  };
+
+  function hazardIcon(severity, hazardType) {
+    const emoji = HAZARD_ICONS[hazardType] || "⚠️";
     return L.divIcon({
       className: "hazard-marker",
-      html: `<div class="hazard-icon-wrap" style="background:${severityColor(severity)}">⚠️</div>`,
+      html: `<div class="hazard-icon-wrap" style="background:${severityColor(severity)}">${emoji}</div>`,
       iconSize: [30, 30],
       iconAnchor: [15, 15],
     });
@@ -154,7 +250,7 @@
         // A marker at the zone center makes it easy to click even before
         // zoomed in, and gives a single tap target instead of hunting for
         // the circle's edge.
-        const marker = L.marker([z.latitude, z.longitude], { icon: hazardIcon(z.severity) })
+        const marker = L.marker([z.latitude, z.longitude], { icon: hazardIcon(z.severity, z.hazard_type) })
           .bindPopup(popupHtml)
           .addTo(hazardLayer);
 
@@ -184,7 +280,7 @@
   }
 
   async function resolveSos(id) {
-    await fetch(`/api/sos/${id}/resolve`, { method: "POST" });
+    await fetch(`/api/sos/${id}/resolve`, { method: "POST", headers: officerAuthHeaders() });
     loadSos();
   }
   window.resolveSos = resolveSos;
@@ -193,7 +289,7 @@
     if (!confirm("Mark ALL open SOS requests as resolved? This cannot be undone.")) return;
     resolveAllBtn.disabled = true;
     try {
-      await fetch("/api/sos/resolve-all", { method: "POST" });
+      await fetch("/api/sos/resolve-all", { method: "POST", headers: officerAuthHeaders() });
     } finally {
       resolveAllBtn.disabled = false;
       loadSos();
@@ -206,7 +302,17 @@
 
   async function loadSos() {
     try {
-      const res = await fetch("/api/sos");
+      const res = await fetch("/api/sos", { headers: officerAuthHeaders() });
+      if (res.status === 401) {
+        // Wrong/missing key - show a persistent on-page banner instead
+        // of clearing the key and letting the next 5-second poll
+        // re-trigger a native prompt() loop (that was the actual bug).
+        // Keeps the bad key stored so we don't spam prompts - the user
+        // decides when to re-enter it via the banner.
+        showAuthBanner();
+        return;
+      }
+      hideAuthBanner();
       const data = await res.json();
       document.getElementById("sosCount").innerText = data.count;
 
@@ -228,8 +334,13 @@
         const marker = L.marker([s.latitude, s.longitude], { icon: sosIcon() });
 
         const time = new Date(s.timestamp).toLocaleTimeString();
+        // UPGRADE: SLA/escalation timers - flag SOS waiting too long
+        const escalationBanner = s.escalated
+          ? `<div style="background:#d90429;color:white;padding:4px 8px;border-radius:4px;margin-bottom:6px;font-weight:bold">⚠ ESCALATED - open ${s.minutes_open} min</div>`
+          : "";
         marker.bindPopup(`
           <div class="sos-popup">
+            ${escalationBanner}
             <strong>SOS #${s.id}</strong> - ${time}<br>
             ${s.note ? s.note + "<br>" : ""}
             Nearest hospital: <strong>${s.nearest_hospital}</strong> (${s.hospital_distance_km} km)
