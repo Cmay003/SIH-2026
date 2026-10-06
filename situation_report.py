@@ -10,6 +10,25 @@ hand to an official who wants a document rather than a dashboard.
 from datetime import datetime
 from fpdf import FPDF
 
+# fpdf 1.7's built-in fonts are Latin-1 only: one "→", "₹" or Hindi place
+# name anywhere in the report raised UnicodeEncodeError and the endpoint
+# returned 500. Common symbols get ASCII stand-ins; anything else outside
+# Latin-1 (e.g. Devanagari) becomes "?" - a readable report with a few
+# "?" beats no report. Full Unicode needs fpdf2 plus a bundled TTF font.
+_PDF_REPLACEMENTS = {
+    "→": "->", "←": "<-", "₹": "Rs.", "–": "-", "—": "-",
+    "‘": "'", "’": "'", "“": '"', "”": '"', "…": "...",
+    "⚠": "!", "✅": "",
+}
+
+
+def _pdf_text(value) -> str:
+    text = str(value)
+    for symbol, replacement in _PDF_REPLACEMENTS.items():
+        text = text.replace(symbol, replacement)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
 SEVERITY_COLORS = {
     "LOW": (46, 125, 50),
     "MEDIUM": (214, 162, 60),
@@ -19,6 +38,14 @@ SEVERITY_COLORS = {
 
 
 class SituationReportPDF(FPDF):
+    # Every piece of text goes through cell()/multi_cell(), so sanitizing
+    # here covers all current and future report fields in one place.
+    def cell(self, w, h=0, txt="", *args, **kwargs):
+        return super().cell(w, h, _pdf_text(txt), *args, **kwargs)
+
+    def multi_cell(self, w, h, txt, *args, **kwargs):
+        return super().multi_cell(w, h, _pdf_text(txt), *args, **kwargs)
+
     def header(self):
         self.set_font("Helvetica", "B", 16)
         self.set_text_color(27, 94, 32)

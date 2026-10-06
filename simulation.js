@@ -49,7 +49,11 @@ function generateData() {
     humidity_pct: +(45 + Math.random() * 30).toFixed(2),
     gas_ppm: +(380 + Math.random() * 40).toFixed(1),
     flame_reading: +(Math.random() * 0.05).toFixed(3),
-    rainfall_mm_since_last: +(Math.random() * 5).toFixed(1),
+    // Rain that fell SINCE THE PREVIOUS READING, not per hour. Each node
+    // reports every ~9s (3s interval, 3 nodes), so 0-0.01mm per reading is
+    // light drizzle of ~0-4 mm/hr. The old 0-5mm per reading (~1000 mm/hr)
+    // only looked sane because the backend summed just the last 50 readings.
+    rainfall_mm_since_last: +(Math.random() * 0.01).toFixed(3),
     // UPGRADE: node health telemetry - simulated here since we're not
     // reading real hardware. Signal strength in typical WiFi dBm range.
     signal_strength_dbm: Math.round(-40 - Math.random() * 40),
@@ -74,10 +78,11 @@ function generateData() {
   if (scenario === 6) {
     // sensor fault - implausible spike, should be suppressed by anomaly filter
     base.river_level_m = 14.2;
-    base.rainfall_mm_since_last = 0.1;
+    base.rainfall_mm_since_last = 0;
   } else if (scenario === 9) {
     // rising flood scenario
-    base.rainfall_mm_since_last = 30 + Math.random() * 20;
+    // ~0.15-0.25mm per ~9s reading = heavy rain of ~60-100 mm/hr
+    base.rainfall_mm_since_last = +(0.15 + Math.random() * 0.1).toFixed(3);
     base.river_level_m = +(2.5 + Math.random() * 1.5).toFixed(2);
   } else if (scenario === 11) {
     // gas leak

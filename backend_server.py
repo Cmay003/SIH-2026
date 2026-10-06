@@ -8,6 +8,8 @@ import os
 import joblib
 import requests
 import statistics
+import math
+import tempfile
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -18,6 +20,7 @@ from predictive_maintenance import check_all_sensors_for_drift
 from fastapi import FastAPI, HTTPException, Response, Header, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from integration_pipeline import (
@@ -73,7 +76,11 @@ _SEED_NODES = {
         "curve_number": 78,
         "latitude": 29.3919,
         "longitude": 79.4542,
-        "upstream_node": None,
+        # Hillside node drains toward the riverside node - lets the
+        # spatial-correlation boost actually run (it never did while every
+        # node had upstream_node = None). Demo topology: confirm against
+        # the real terrain/drainage before field deployment.
+        "upstream_node": "NODE-07",
     },
     "NODE-07": {
         "location": "Sector 7, Hillside",
@@ -132,6 +139,33 @@ def init_node_registry_table(conn):
         print(
             f"[nodes] Seeded {len(_SEED_NODES)} initial nodes into the database (first run)."
         )
+    apply_seed_upstream_links_once(conn)
+
+
+def apply_seed_upstream_links_once(conn):
+    """Databases seeded before _SEED_NODES had upstream links keep
+    upstream_node = NULL forever, since seeding only runs on an empty
+    table. This copies the seed links over ONCE (recorded in schema_meta),
+    and only where the field is still NULL - so a link an admin later
+    removes or changes via the API is never overwritten again."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT)"
+    )
+    marker = "seed_upstream_links_v1"
+    if conn.execute("SELECT 1 FROM schema_meta WHERE key=?", (marker,)).fetchone():
+        return
+    for node_id, cfg in _SEED_NODES.items():
+        if cfg["upstream_node"]:
+            conn.execute(
+                "UPDATE nodes SET upstream_node=? WHERE node_id=? AND upstream_node IS NULL "
+                "AND EXISTS (SELECT 1 FROM nodes WHERE node_id=?)",
+                (cfg["upstream_node"], node_id, cfg["upstream_node"]),
+            )
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?)",
+        (marker, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
 
 
 def reload_node_registry():
@@ -209,6 +243,21 @@ LAND_USE_BASE_CN = {
 }
 SLOPE_CN_ADJUSTMENT_MAX = 6  # cap - slope alone can't swing CN wildly
 
+# Back-off for external APIs. Without it, a failed lookup was retried on
+# EVERY reading, so with no internet each ingest blocked for up to 8s
+# (elevation) + 5s (weather) - longer than the nodes' 5s send interval.
+# After one failure, an API is skipped for this long (globally, not per
+# node - "no internet" affects every node at once).
+EXTERNAL_API_RETRY_AFTER_MINUTES = 10
+_api_failed_at: dict[str, datetime] = {}  # "elevation"/"weather" -> last failure
+
+
+def _api_in_backoff(api_name: str) -> bool:
+    failed_at = _api_failed_at.get(api_name)
+    return failed_at is not None and datetime.now(timezone.utc) - failed_at < timedelta(
+        minutes=EXTERNAL_API_RETRY_AFTER_MINUTES
+    )
+
 
 def fetch_terrain_derived_curve_number(
     latitude: float, longitude: float, land_use: str, node_id: str
@@ -226,6 +275,8 @@ def fetch_terrain_derived_curve_number(
     """
     if node_id in _elevation_cache:
         return _elevation_cache[node_id]
+    if _api_in_backoff("elevation"):
+        return None
 
     try:
         points = [
@@ -267,11 +318,14 @@ def fetch_terrain_derived_curve_number(
             "source": "terrain_derived",
         }
         _elevation_cache[node_id] = result
+        _api_failed_at.pop("elevation", None)
         return result
 
     except Exception as e:
+        _api_failed_at["elevation"] = datetime.now(timezone.utc)
         print(
-            f"[elevation] terrain lookup failed for {node_id}, falling back to hand-typed curve_number: {e}"
+            f"[elevation] terrain lookup failed for {node_id}, falling back to hand-typed "
+            f"curve_number; not retrying for {EXTERNAL_API_RETRY_AFTER_MINUTES} min: {e}"
         )
         return None
 
@@ -314,6 +368,9 @@ def fetch_forecast_rainfall_mm(
         minutes=WEATHER_CACHE_TTL_MINUTES
     ):
         return cached["value"]
+    if _api_in_backoff("weather"):
+        # Same fallback as a failed fetch, without waiting on another timeout
+        return cached["value"] if cached else None
 
     try:
         response = requests.get(
@@ -343,10 +400,15 @@ def fetch_forecast_rainfall_mm(
         forecast_6h_mm = float(sum(hourly_precip[start_idx : start_idx + 6]))
 
         _weather_cache[node_id] = {"value": forecast_6h_mm, "fetched_at": now}
+        _api_failed_at.pop("weather", None)
         return forecast_6h_mm
 
     except Exception as e:
-        print(f"[weather] forecast fetch failed for {node_id}: {e}")
+        _api_failed_at["weather"] = datetime.now(timezone.utc)
+        print(
+            f"[weather] forecast fetch failed for {node_id}; not retrying for "
+            f"{EXTERNAL_API_RETRY_AFTER_MINUTES} min: {e}"
+        )
         # Fall back to the last good cached value rather than nothing, if we have one
         return cached["value"] if cached else None
 
@@ -380,6 +442,33 @@ _rag_collection = None
 _rag_embedder = None
 
 
+# Columns added after the original readings schema, migrated onto existing
+# databases by init_db(). Includes every flood-model input (so real
+# readings can be exported and retrained on), the optional multi-hazard
+# sensor fields, and `simulated` so simulator traffic can be kept out of
+# training data.
+ADDED_READING_COLUMNS = {
+    "forecast_rainfall_6h_mm": "REAL",
+    "severity_source": "TEXT",
+    "land_use": "TEXT",
+    "curve_number": "REAL",
+    "curve_number_source": "TEXT",
+    "rainfall_intensity_mm_hr": "REAL",
+    "river_level_rate_m_per_hr": "REAL",
+    "upstream_level_m": "REAL",
+    "upstream_rate_m_per_hr": "REAL",
+    "soil_saturation": "REAL",
+    "gas_ppm_rate_per_hr": "REAL",
+    "tilt_angle_deg": "REAL",
+    "vibration_magnitude": "REAL",
+    "pm25_ugm3": "REAL",
+    "pm10_ugm3": "REAL",
+    "water_ph": "REAL",
+    "turbidity_ntu": "REAL",
+    "simulated": "INTEGER",
+}
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -409,10 +498,9 @@ def init_db():
     # change, the new column won't just appear - add it explicitly so old
     # databases pick it up without deleting existing history.
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(readings)")}
-    if "forecast_rainfall_6h_mm" not in existing_cols:
-        conn.execute("ALTER TABLE readings ADD COLUMN forecast_rainfall_6h_mm REAL")
-    if "severity_source" not in existing_cols:
-        conn.execute("ALTER TABLE readings ADD COLUMN severity_source TEXT")
+    for column, sql_type in ADDED_READING_COLUMNS.items():
+        if column not in existing_cols:
+            conn.execute(f"ALTER TABLE readings ADD COLUMN {column} {sql_type}")
     conn.commit()
 
     init_node_registry_table(conn)
@@ -420,34 +508,40 @@ def init_db():
 
 
 def save_reading(enriched: dict, result: dict, timestamp: str):
+    # Every model input is stored, not just the raw sensor values - without
+    # them export_readings_to_csv.py could only export 3 flood columns and
+    # retraining on real data failed with KeyError: 'curve_number'.
+    row = {
+        "node_id": enriched["node_id"],
+        "location": enriched["location"],
+        "river_level_m": enriched["river_level_m"],
+        "temp_c": enriched["temp_c"],
+        "humidity_pct": enriched["humidity_pct"],
+        "gas_ppm": enriched["gas_ppm"],
+        "flame_reading": enriched["flame_reading"],
+        "rainfall_24h_mm": enriched["rainfall_24h_mm"],
+        "forecast_rainfall_6h_mm": enriched.get("forecast_rainfall_6h_mm"),
+        "status": result["status"],
+        "hazard_type": result.get("hazard_type"),
+        "risk_score": result.get("risk_score"),
+        "severity": result.get("severity"),
+        "severity_source": result.get("severity_source"),
+        "message": result.get("message"),
+        "eta_minutes": result.get("eta_minutes"),
+        "predicted_time": result.get("predicted_time"),
+        "timestamp": timestamp,
+    }
+    for column in ADDED_READING_COLUMNS:
+        if column not in row:
+            row[column] = enriched.get(column)
+    row["simulated"] = 1 if enriched.get("simulated") else 0
+
+    columns = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        """INSERT INTO readings
-           (node_id, location, river_level_m, temp_c, humidity_pct, gas_ppm,
-            flame_reading, rainfall_24h_mm, forecast_rainfall_6h_mm, status,
-            hazard_type, risk_score, severity, severity_source, message, eta_minutes,
-            predicted_time, timestamp)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            enriched["node_id"],
-            enriched["location"],
-            enriched["river_level_m"],
-            enriched["temp_c"],
-            enriched["humidity_pct"],
-            enriched["gas_ppm"],
-            enriched["flame_reading"],
-            enriched["rainfall_24h_mm"],
-            enriched.get("forecast_rainfall_6h_mm"),
-            result["status"],
-            result.get("hazard_type"),
-            result.get("risk_score"),
-            result.get("severity"),
-            result.get("severity_source"),
-            result.get("message"),
-            result.get("eta_minutes"),
-            result.get("predicted_time"),
-            timestamp,
-        ),
+        f"INSERT INTO readings ({columns}) VALUES ({placeholders})",
+        tuple(row.values()),
     )
     conn.commit()
     conn.close()
@@ -482,7 +576,14 @@ ULTRASONIC_MOUNT_HEIGHT_M = (
 # the value uninverted (False when firmware already inverted it) or
 # double-invert it back to nonsense (True when firmware still sends raw
 # distance) - only ONE side should ever do this conversion.
-FIRMWARE_SENDS_CORRECTED_WATER_LEVEL = False
+#
+# True: every firmware in Arduino/ (node, edge_ai, deep_sleep) already
+# sends the inverted water level via distanceToWaterLevelMeters(). With
+# False, the backend inverted it a second time and a real flood read 0 m.
+# In this mode the mount height lives ONLY in the firmware
+# (ULTRASONIC_MOUNT_HEIGHT_CM); ULTRASONIC_MOUNT_HEIGHT_M above is used
+# only for old firmware that still sends raw distance.
+FIRMWARE_SENDS_CORRECTED_WATER_LEVEL = True
 
 
 def convert_ultrasonic_distance_to_water_level_m(
@@ -503,9 +604,11 @@ def convert_ultrasonic_distance_to_water_level_m(
         return previous_water_level_m if previous_water_level_m is not None else 0.0
 
     if FIRMWARE_SENDS_CORRECTED_WATER_LEVEL:
-        # Firmware already inverted distance -> water level itself.
-        # Just clamp to the valid range - no second inversion here.
-        return max(0.0, min(ULTRASONIC_MOUNT_HEIGHT_M, raw_value_m))
+        # Firmware already inverted distance -> water level itself and
+        # clamped it to its own mount height - no second inversion here,
+        # and no upper clamp to the backend's (legacy) mount height, which
+        # would silently cap a differently-mounted sensor.
+        return max(0.0, raw_value_m)
 
     water_level_m = ULTRASONIC_MOUNT_HEIGHT_M - raw_value_m
     return max(0.0, min(ULTRASONIC_MOUNT_HEIGHT_M, water_level_m))
@@ -516,14 +619,60 @@ WATER_LEVEL_SMOOTHING_WINDOW = (
 )
 
 
+RATE_WINDOW_MINUTES = 15  # rate of rise is measured against the oldest reading this recent
+MIN_RATE_SPAN_SECONDS = 30  # shorter spans turn mm of sensor jitter into huge m/hr values
+SOIL_DRYING_TIME_CONSTANT_HOURS = 48.0  # saturation proxy decays to ~37% after this long without rain
+SOIL_SATURATION_PER_MM = 0.01
+
+# node_id -> deque of (datetime, rainfall_mm), only the last 24 hours.
+# In-memory like node_history, so rainfall totals restart from 0 when the
+# backend restarts.
+node_rainfall: dict[str, deque] = {}
+
+
+def parse_timestamp(timestamp: str) -> datetime:
+    """ISO-8601 string -> timezone-aware datetime. Falls back to "now" for
+    an unparseable client-supplied timestamp rather than rejecting the
+    reading - a bad clock must never drop a hazard reading."""
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def rate_per_hour(history: deque, key: str, current_value: float, now: datetime) -> float:
+    """Change in `key` per HOUR, measured from the oldest reading within the
+    last RATE_WINDOW_MINUTES to `current_value` at `now`. Using a window
+    instead of just the previous reading keeps HC-SR04 jitter from turning
+    into huge rates. Returns 0.0 (no evidence of change) when there isn't
+    at least MIN_RATE_SPAN_SECONDS of history to measure across."""
+    window_start = now - timedelta(minutes=RATE_WINDOW_MINUTES)
+    baseline = next((r for r in history if r["timestamp"] >= window_start), None)
+    if baseline is None:
+        return 0.0
+    span_seconds = (now - baseline["timestamp"]).total_seconds()
+    if span_seconds < MIN_RATE_SPAN_SECONDS:
+        return 0.0
+    return (current_value - baseline[key]) / (span_seconds / 3600)
+
+
 def smooth_water_level(history: deque, current_value: float) -> float:
     """Median-smooths the water level over the last few readings, so a
     single noisy/spiked HC-SR04 reading can't alone trigger a false
     MEDIUM/HIGH. A sustained real change still comes through within a
     few readings - only an isolated one-off spike gets outvoted by the
-    surrounding normal readings around it."""
+    surrounding normal readings around it.
+
+    Medians the RAW (unsmoothed) values. It used to median its own past
+    OUTPUTS (river_level_m), which latches: for a steadily rising level
+    the old outputs outvote every new reading, and in testing a level
+    rising 0.004 -> 0.020 m stayed frozen at 0.0042 m."""
     recent = [
-        r["river_level_m"] for r in list(history)[-(WATER_LEVEL_SMOOTHING_WINDOW - 1) :]
+        r.get("raw_water_level_m", r["river_level_m"])
+        for r in list(history)[-(WATER_LEVEL_SMOOTHING_WINDOW - 1) :]
     ]
     recent.append(current_value)
     return statistics.median(recent)
@@ -602,13 +751,20 @@ def startup():
         _anomaly_model, _anomaly_scaler = train_anomaly_detector()
 
     print("Building RAG knowledge base...")
-    _rag_collection, _rag_embedder = build_knowledge_base()
+    try:
+        _rag_collection, _rag_embedder = build_knowledge_base()
+    except Exception as e:
+        # Never let alert-text enrichment stop hazard detection from
+        # starting - alerts fall back to a template without SOP text.
+        _rag_collection, _rag_embedder = None, None
+        print(f"[RAG] knowledge base unavailable, alerts will omit SOP text: {e}")
     print("Backend ready.")
 
 
-def derive_features(raw: RawReading) -> dict:
+def derive_features(raw: RawReading, timestamp: str) -> dict:
     if raw.node_id not in NODE_REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown node_id '{raw.node_id}'")
+    now = parse_timestamp(timestamp)
 
     config = NODE_REGISTRY[raw.node_id]
     history = node_history[raw.node_id]
@@ -647,21 +803,44 @@ def derive_features(raw: RawReading) -> dict:
         else smooth_water_level(history, converted_value)
     )
 
-    if history:
-        prev = history[-1]
-        river_level_rate_m_per_hr = water_level_m - prev["river_level_m"]
-        gas_ppm_rate_per_hr = raw.gas_ppm - prev["gas_ppm"]
-    else:
-        river_level_rate_m_per_hr = 0.0
-        gas_ppm_rate_per_hr = 0.0
+    # Rates are real per-HOUR values from timestamps. They used to be the
+    # plain difference from the previous reading (3-5s earlier), which
+    # made ETA projections ~700x too slow and fed the flood model a
+    # feature on a different scale than it was trained on.
+    river_level_rate_m_per_hr = rate_per_hour(
+        history, "river_level_m", water_level_m, now
+    )
+    gas_ppm_rate_per_hr = rate_per_hour(history, "gas_ppm", raw.gas_ppm, now)
 
-    rainfall_24h_mm = raw.rainfall_mm_since_last + sum(
-        r["rainfall_mm_since_last"] for r in history
+    # Rainfall totals come from a time-pruned log, not "the last 50
+    # readings" (~4 min at a 5s interval) as before.
+    rain_log = node_rainfall.setdefault(raw.node_id, deque())
+    if raw.rainfall_mm_since_last > 0:
+        rain_log.append((now, raw.rainfall_mm_since_last))
+    while rain_log and rain_log[0][0] < now - timedelta(hours=24):
+        rain_log.popleft()
+    rainfall_24h_mm = sum(mm for _, mm in rain_log)
+    # mm that fell in the last hour IS the intensity in mm/hr - previously
+    # the per-reading amount was passed off as mm/hr.
+    rainfall_intensity_mm_hr = sum(
+        mm for t, mm in rain_log if t >= now - timedelta(hours=1)
     )
 
-    prev_saturation = history[-1]["soil_saturation"] if history else 0.3
+    # Soil saturation proxy (no soil-moisture sensor yet - see up2): dries
+    # out exponentially with real elapsed time instead of 2% per reading,
+    # which emptied it in minutes at a 5s interval.
+    if history:
+        hours_since_prev = max(
+            0.0, (now - history[-1]["timestamp"]).total_seconds() / 3600
+        )
+        prev_saturation = history[-1]["soil_saturation"] * math.exp(
+            -hours_since_prev / SOIL_DRYING_TIME_CONSTANT_HOURS
+        )
+    else:
+        prev_saturation = 0.3
     soil_saturation = min(
-        1.0, max(0.0, prev_saturation * 0.98 + raw.rainfall_mm_since_last * 0.01)
+        1.0,
+        max(0.0, prev_saturation + raw.rainfall_mm_since_last * SOIL_SATURATION_PER_MM),
     )
 
     upstream_node = config.get("upstream_node")
@@ -671,10 +850,11 @@ def derive_features(raw: RawReading) -> dict:
         # UPGRADE: cross-node spatial correlation needs the upstream
         # node's OWN rate of rise, not just its current level - see
         # integration_pipeline.py's apply_spatial_correlation_boost().
-        upstream_rate_m_per_hr = (
-            upstream_hist[-1]["river_level_m"] - upstream_hist[-2]["river_level_m"]
-            if len(upstream_hist) >= 2
-            else 0.0
+        upstream_rate_m_per_hr = rate_per_hour(
+            upstream_hist,
+            "river_level_m",
+            upstream_level_m,
+            upstream_hist[-1]["timestamp"],
         )
     else:
         upstream_level_m = water_level_m
@@ -707,7 +887,7 @@ def derive_features(raw: RawReading) -> dict:
         "curve_number": curve_number,
         "curve_number_source": curve_number_source,
         "rainfall_24h_mm": rainfall_24h_mm,
-        "rainfall_intensity_mm_hr": raw.rainfall_mm_since_last,
+        "rainfall_intensity_mm_hr": rainfall_intensity_mm_hr,
         "forecast_rainfall_6h_mm": forecast_rainfall_6h_mm,
         "river_level_m": water_level_m,
         "simulated": raw.simulated,
@@ -732,7 +912,9 @@ def derive_features(raw: RawReading) -> dict:
 
     history.append(
         {
+            "timestamp": now,
             "river_level_m": water_level_m,
+            "raw_water_level_m": converted_value,  # unsmoothed - see smooth_water_level()
             "rainfall_mm_since_last": raw.rainfall_mm_since_last,
             "soil_saturation": soil_saturation,
             "gas_ppm": raw.gas_ppm,
@@ -752,7 +934,7 @@ def ingest_reading(raw: RawReading):
         "battery_pct": raw.battery_pct,
         "signal_strength_dbm": raw.signal_strength_dbm,
     }
-    enriched = derive_features(raw)
+    enriched = derive_features(raw, timestamp)
 
     result = process_reading(
         enriched,
@@ -851,6 +1033,14 @@ def get_alert_as_cap(alert_id: int):
     if row is None:
         raise HTTPException(status_code=404, detail=f"No reading with id {alert_id}")
     row = dict(row)
+    # Only real alerts become CAP messages. Logged/suppressed readings
+    # (severity LOW or "N/A") previously reached generate_cap_alert and
+    # crashed with a 500 on the unmappable "N/A" severity.
+    if row.get("status") != "alert_dispatched":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reading {alert_id} is not an alert (status '{row.get('status')}')",
+        )
 
     config = NODE_REGISTRY.get(row["node_id"], {})
     cap_xml = generate_cap_alert(
@@ -890,12 +1080,23 @@ def get_situation_report_pdf(alert_id: int):
     conn.close()
     timeline = [dict(r) for r in reversed(timeline_rows)]
 
-    output_path = f"/tmp/situation_report_{alert_id}.pdf"
-    generate_situation_report_pdf(event, timeline, output_path)
+    # Was a hard-coded "/tmp/..." path, which doesn't exist on Windows.
+    # A unique temp file per request (deleted once sent) also avoids two
+    # simultaneous requests for the same alert overwriting each other.
+    fd, output_path = tempfile.mkstemp(
+        prefix=f"situation_report_{alert_id}_", suffix=".pdf"
+    )
+    os.close(fd)
+    try:
+        generate_situation_report_pdf(event, timeline, output_path)
+    except Exception:
+        os.remove(output_path)
+        raise
     return FileResponse(
         output_path,
         media_type="application/pdf",
         filename=f"sanjeevni_situation_report_{alert_id}.pdf",
+        background=BackgroundTask(os.remove, output_path),
     )
 
 

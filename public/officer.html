@@ -134,6 +134,18 @@
   // deliberately click "Re-enter key".
   let authFailed = false;
 
+  // Escapes text before it goes into popup HTML. SOS notes come from
+  // anonymous citizens, so inserting them raw let a note run script in
+  // the officer's browser (and read the stored API key).
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   function getOfficerApiKey() {
     return localStorage.getItem("sanjeevni_officer_api_key") || "";
   }
@@ -244,7 +256,7 @@
           fillOpacity: 0.3,
         }).addTo(hazardLayer);
 
-        const popupHtml = `<strong>${z.node_id}</strong><br>${z.hazard_type} - ${z.severity}<br>Risk score: ${Number(z.risk_score).toFixed(2)}`;
+        const popupHtml = `<strong>${escapeHtml(z.node_id)}</strong><br>${escapeHtml(z.hazard_type)} - ${escapeHtml(z.severity)}<br>Risk score: ${Number(z.risk_score).toFixed(2)}`;
         circle.bindPopup(popupHtml);
 
         // A marker at the zone center makes it easy to click even before
@@ -336,17 +348,18 @@
         const time = new Date(s.timestamp).toLocaleTimeString();
         // UPGRADE: SLA/escalation timers - flag SOS waiting too long
         const escalationBanner = s.escalated
-          ? `<div style="background:#d90429;color:white;padding:4px 8px;border-radius:4px;margin-bottom:6px;font-weight:bold">⚠ ESCALATED - open ${s.minutes_open} min</div>`
+          ? `<div style="background:#d90429;color:white;padding:4px 8px;border-radius:4px;margin-bottom:6px;font-weight:bold">⚠ ESCALATED - open ${Number(s.minutes_open)} min</div>`
           : "";
+        const sosId = Number(s.id);
         marker.bindPopup(`
           <div class="sos-popup">
             ${escalationBanner}
-            <strong>SOS #${s.id}</strong> - ${time}<br>
-            ${s.note ? s.note + "<br>" : ""}
-            Nearest hospital: <strong>${s.nearest_hospital}</strong> (${s.hospital_distance_km} km)
-            <a href="${s.responder_route_url}" target="_blank">Route to this person</a>
-            <a href="${s.hospital_route_url}" target="_blank">Route from person to hospital</a>
-            <button onclick="resolveSos(${s.id})">Mark Resolved</button>
+            <strong>SOS #${sosId}</strong> - ${escapeHtml(time)}<br>
+            ${s.note ? escapeHtml(s.note) + "<br>" : ""}
+            Nearest hospital: <strong>${escapeHtml(s.nearest_hospital)}</strong> (${Number(s.hospital_distance_km)} km)
+            <a href="${escapeHtml(s.responder_route_url)}" target="_blank" rel="noopener">Route to this person</a>
+            <a href="${escapeHtml(s.hospital_route_url)}" target="_blank" rel="noopener">Route from person to hospital</a>
+            <button onclick="resolveSos(${sosId})">Mark Resolved</button>
           </div>
         `);
         marker.addTo(sosLayer);

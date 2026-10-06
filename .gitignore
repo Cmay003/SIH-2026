@@ -35,3 +35,9 @@ Thumbs.db
 *.swp
 .env
 *.log
+
+# Local presentation / planning files (not part of the codebase)
+PPT.pptx
+up1.pdf
+up2.pdf
+progress.txt

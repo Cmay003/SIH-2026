@@ -14,7 +14,9 @@ const path = require("path");
 const app = express();
 app.use(express.json({ limit: "10mb" })); // raised for base64 photo uploads (citizen hazard reports)
 app.use(cors());
-app.use(express.static(__dirname));
+// Serve ONLY the public/ folder. Serving __dirname exposed sanjeevni.db,
+// backups/*.db (citizen SOS locations), models and source to anyone.
+app.use(express.static(path.join(__dirname, "public")));
 
 // --- UPGRADE: authentication on officer dashboard + SOS API ------------
 // Simple API-key auth (X-API-Key header) for OFFICER-facing actions -
@@ -477,21 +479,47 @@ function createSosRequest(deviceId, latitude, longitude, note) {
   };
 }
 
+// Returns {latitude, longitude} as real numbers, or null if either is
+// missing, non-numeric or out of range. SQLite's REAL column would
+// otherwise happily store a string, which then lands inside HTML/URLs on
+// the officer dashboard.
+function parseCoordinates(latitude, longitude) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (
+    latitude == null ||
+    longitude == null ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lon) ||
+    Math.abs(lat) > 90 ||
+    Math.abs(lon) > 180
+  ) {
+    return null;
+  }
+  return { latitude: lat, longitude: lon };
+}
+
+const MAX_NOTE_LENGTH = 500;
+
 app.post("/api/sos", (req, res) => {
-  const { latitude, longitude, note, device_id } = req.body;
-  if (latitude == null || longitude == null) {
+  const { note, device_id } = req.body;
+  const coords = parseCoordinates(req.body.latitude, req.body.longitude);
+  if (!coords) {
     return res
       .status(400)
-      .json({ error: "latitude and longitude are required" });
+      .json({ error: "valid numeric latitude and longitude are required" });
   }
-  if (!device_id) {
+  if (!device_id || typeof device_id !== "string") {
     return res.status(400).json({ error: "device_id is required" });
+  }
+  if (note != null && typeof note !== "string") {
+    return res.status(400).json({ error: "note must be a string" });
   }
   const { httpStatus, body } = createSosRequest(
     device_id,
-    latitude,
-    longitude,
-    note,
+    coords.latitude,
+    coords.longitude,
+    note ? note.slice(0, MAX_NOTE_LENGTH) : note,
   );
   res.status(httpStatus).json(body);
 });
@@ -652,12 +680,14 @@ app.get("/api/hazards", (req, res) => {
 // Public endpoint - any citizen can submit, no auth (same philosophy as
 // SOS submission: reporting a hazard should never be gated behind a login).
 app.post("/api/citizen-reports", (req, res) => {
-  const { latitude, longitude, description, photo_base64 } = req.body;
-  if (latitude == null || longitude == null) {
+  const { description, photo_base64 } = req.body;
+  const coords = parseCoordinates(req.body.latitude, req.body.longitude);
+  if (!coords) {
     return res
       .status(400)
-      .json({ error: "latitude and longitude are required" });
+      .json({ error: "valid numeric latitude and longitude are required" });
   }
+  const { latitude, longitude } = coords;
 
   let photoPath = null;
   if (photo_base64) {

@@ -19,6 +19,7 @@ which is a government partnership question, not a code problem.
 CAP v1.2 spec: https://docs.oasis-open.org/emergency/cap/v1.2/CAP-v1.2-os.html
 """
 
+import os
 import uuid
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -41,13 +42,29 @@ SEVERITY_TO_CAP = {
 # properly-calibrated ML model's output.
 CERTAINTY_BY_SOURCE = {
     "ml_model": "Likely",
+    # hazard_classification.py's threshold classifiers act on a direct
+    # sensor measurement against a published limit (IMD, WHO, CPCB) - as
+    # confident as the model, not "Unknown" as before.
+    "threshold_classifier": "Likely",
     "hardware_test_threshold": "Possible",
 }
 
-HAZARD_TO_CAP_EVENT = {
-    "flood": "Flood Warning",
-    "gas leak": "Hazardous Materials Warning",
+# hazard_type -> (CAP <event> text, CAP <category>). <category> must be one
+# of CAP's fixed values: Geo, Met, Safety, Security, Rescue, Fire, Health,
+# Env, Transport, Infra, CBRNE, Other.
+HAZARD_TO_CAP = {
+    "flood": ("Flood Warning", "Geo"),
+    "gas leak": ("Hazardous Materials Warning", "CBRNE"),
+    "fire": ("Fire Warning", "Fire"),
+    "extreme heat": ("Extreme Heat Warning", "Met"),
+    "landslide": ("Landslide Warning", "Geo"),
+    "air pollution": ("Air Quality Alert", "Env"),
+    "water quality degradation": ("Water Quality Alert", "Health"),
 }
+
+# Optional public dashboard URL for <web>. CAP's <web> is optional, so it
+# is left out entirely when unset instead of emitting an empty element.
+CAP_WEB_URL = os.environ.get("CAP_WEB_URL")
 
 
 def generate_cap_alert(
@@ -71,9 +88,13 @@ def generate_cap_alert(
     if severity not in SEVERITY_TO_CAP:
         raise ValueError(f"Unknown severity '{severity}' - cannot map to CAP vocabulary")
 
-    now = datetime.now(timezone.utc)
+    # CAP 1.2's XSD only accepts YYYY-MM-DDThh:mm:ss+hh:mm - isoformat()'s
+    # microseconds made every alert fail schema validation.
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     identifier = str(uuid.uuid4())
-    cap_event = HAZARD_TO_CAP_EVENT.get(hazard_type, "Other Hazard Warning")
+    cap_event, cap_category = HAZARD_TO_CAP.get(
+        hazard_type, ("Other Hazard Warning", "Other")
+    )
     cap_severity = SEVERITY_TO_CAP[severity]
     cap_certainty = CERTAINTY_BY_SOURCE.get(severity_source, "Unknown")
 
@@ -86,7 +107,7 @@ def generate_cap_alert(
     SubElement(alert, "scope").text = "Public"
 
     info = SubElement(alert, "info")
-    SubElement(info, "category").text = "Geo" if hazard_type == "flood" else "Safety"
+    SubElement(info, "category").text = cap_category
     SubElement(info, "event").text = cap_event
     SubElement(info, "urgency").text = "Immediate" if severity in ("HIGH", "CRITICAL") else "Expected"
     SubElement(info, "severity").text = cap_severity
@@ -94,7 +115,8 @@ def generate_cap_alert(
     SubElement(info, "senderName").text = "SANJEEVNI Disaster Rescue System"
     SubElement(info, "headline").text = f"{cap_event}: {location}"
     SubElement(info, "description").text = message
-    SubElement(info, "web").text = ""  # populate with your public dashboard URL in production
+    if CAP_WEB_URL:
+        SubElement(info, "web").text = CAP_WEB_URL
 
     # Custom parameters preserving SANJEEVNI's own data alongside the
     # standard CAP fields - CAP explicitly supports this via <parameter>.

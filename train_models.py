@@ -31,6 +31,26 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 FLOOD_CSV = os.path.join(DATA_DIR, "flood_history.csv")
 ANOMALY_CSV = os.path.join(DATA_DIR, "anomaly_history.csv")
 
+# Inputs read from a real flood_history.csv. Anything else in the file
+# (export_readings_to_csv.py adds id/node_id/timestamp/... to help with
+# labelling) is ignored instead of being trained on as a "feature".
+FLOOD_INPUT_COLS = [
+    "land_use",
+    "curve_number",
+    "rainfall_24h_mm",
+    "rainfall_intensity_mm_hr",
+    "forecast_rainfall_6h_mm",
+    "river_level_m",
+    "river_level_rate_m_per_hr",
+    "upstream_level_m",
+    "soil_saturation",
+]
+# Fixed category list so one-hot columns are always land_use_forest /
+# _urban_high / _urban_low (what integration_pipeline.py builds at
+# prediction time), even if the real data has no "agricultural" rows -
+# otherwise drop_first dropped a different category and prediction failed.
+LAND_USE_CATEGORIES = ["agricultural", "forest", "urban_high", "urban_low"]
+
 ANOMALY_FEATURES = [
     "river_level_m",
     "temp_c",
@@ -44,9 +64,6 @@ def train_flood_model():
     if os.path.exists(FLOOD_CSV):
         print(f"[flood] Training on real data: {FLOOD_CSV}")
         df = pd.read_csv(FLOOD_CSV)
-        df["runoff_mm"] = scs_cn_runoff(
-            df["rainfall_24h_mm"].to_numpy(), df["curve_number"].to_numpy()
-        )
         if "forecast_rainfall_6h_mm" not in df.columns:
             # Real-data CSVs exported before the weather API was added won't
             # have this column yet - default to 0 (no forecast signal)
@@ -57,6 +74,33 @@ def train_flood_model():
                 "has been logged to actually use this feature."
             )
             df["forecast_rainfall_6h_mm"] = 0.0
+        # Forecast is legitimately missing whenever the weather API was
+        # unreachable - 0 means "no forecast signal", same as at prediction time.
+        df["forecast_rainfall_6h_mm"] = df["forecast_rainfall_6h_mm"].fillna(0.0)
+
+        missing = [c for c in FLOOD_INPUT_COLS + ["flood_event"] if c not in df.columns]
+        if missing:
+            raise SystemExit(
+                f"[flood] {FLOOD_CSV} is missing columns {missing} - re-export it with "
+                "export_readings_to_csv.py"
+            )
+        df = df[FLOOD_INPUT_COLS + ["flood_event"]].dropna()
+        unknown_land_use = set(df["land_use"]) - set(LAND_USE_CATEGORIES)
+        if unknown_land_use:
+            raise SystemExit(
+                f"[flood] unknown land_use values {unknown_land_use}; "
+                f"expected one of {LAND_USE_CATEGORIES}"
+            )
+        if df.empty:
+            raise SystemExit(
+                f"[flood] no labelled rows in {FLOOD_CSV} - fill in flood_event (0/1) first"
+            )
+        df["flood_event"] = df["flood_event"].astype(int)
+        df["land_use"] = pd.Categorical(df["land_use"], categories=LAND_USE_CATEGORIES)
+        df["runoff_mm"] = scs_cn_runoff(
+            df["rainfall_24h_mm"].to_numpy(), df["curve_number"].to_numpy()
+        )
+        print(f"[flood] {len(df)} labelled rows, {int(df['flood_event'].sum())} flood events")
     else:
         print(
             "[flood] No data/flood_history.csv found - training on synthetic data instead"
@@ -67,6 +111,17 @@ def train_flood_model():
     feature_cols = [c for c in df.columns if c != "flood_event"]
     X = df[feature_cols]
     y = df["flood_event"]
+
+    # A one-class model only outputs one probability column, and the
+    # backend's predict_proba(X)[0, 1] then crashes on EVERY reading.
+    # Refuse before anything in models/ is overwritten. Needs a few
+    # examples of each class for the train/test split + calibration CV.
+    class_counts = y.value_counts()
+    if len(class_counts) < 2 or class_counts.min() < 4:
+        raise SystemExit(
+            f"[flood] need at least 4 rows of BOTH flood_event=0 and =1 to train, got "
+            f"{class_counts.to_dict()} - label more data. Existing model left unchanged."
+        )
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y if y.nunique() > 1 else None
@@ -117,8 +172,16 @@ def train_flood_model():
 def train_anomaly_detector():
     if os.path.exists(ANOMALY_CSV):
         print(f"[anomaly] Training on real data: {ANOMALY_CSV}")
-        df = pd.read_csv(ANOMALY_CSV)
-        contamination = df["is_anomaly"].mean() if "is_anomaly" in df.columns else 0.02
+        df = pd.read_csv(ANOMALY_CSV).dropna(subset=ANOMALY_FEATURES)
+        # An exported-but-unlabelled is_anomaly column is all blank (NaN):
+        # treat it as "no labels" instead of computing contamination = NaN.
+        if "is_anomaly" in df.columns and df["is_anomaly"].isna().all():
+            df = df.drop(columns=["is_anomaly"])
+        elif "is_anomaly" in df.columns:
+            df = df.dropna(subset=["is_anomaly"])
+        labelled_rate = df["is_anomaly"].mean() if "is_anomaly" in df.columns else 0.0
+        # IsolationForest needs 0 < contamination <= 0.5
+        contamination = labelled_rate if 0 < labelled_rate <= 0.5 else 0.02
     else:
         print(
             "[anomaly] No data/anomaly_history.csv found - training on synthetic data instead"

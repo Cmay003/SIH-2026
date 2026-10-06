@@ -22,6 +22,7 @@ DEPENDENCIES: pip install chromadb sentence-transformers anthropic
 import os
 import glob
 import chromadb
+from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 COLLECTION_NAME = "sanjeevni_sops"
@@ -44,7 +45,10 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]
 def build_knowledge_base(docs_folder: str = "./sample_sops"):
     """Run this once (or whenever SOP documents change) to populate the
     vector store. Safe to re-run - it recreates the collection each time."""
-    client = chromadb.PersistentClient(path=DB_PATH)
+    # Telemetry off: it phones home on startup, which is pointless offline.
+    client = chromadb.PersistentClient(
+        path=DB_PATH, settings=Settings(anonymized_telemetry=False)
+    )
 
     try:
         client.delete_collection(COLLECTION_NAME)
@@ -52,7 +56,12 @@ def build_knowledge_base(docs_folder: str = "./sample_sops"):
         pass
     collection = client.create_collection(COLLECTION_NAME)
 
-    embedder = SentenceTransformer(EMBEDDING_MODEL)
+    # Load from the local Hugging Face cache first so an offline restart
+    # doesn't wait on network timeouts; download only if it isn't cached.
+    try:
+        embedder = SentenceTransformer(EMBEDDING_MODEL, local_files_only=True)
+    except Exception:
+        embedder = SentenceTransformer(EMBEDDING_MODEL)
 
     doc_paths = glob.glob(os.path.join(docs_folder, "*.txt"))
     if not doc_paths:
@@ -139,18 +148,24 @@ def generate_alert_message(
     API key wired up yet, or want a guaranteed-deterministic demo fallback.
     """
     severity = severity_band(risk_score)
-    query = f"{hazard_type} response {severity} severity procedure"
-    source_filter = HAZARD_SOURCE_MAP.get(hazard_type.lower())
-    if source_filter is None:
-        print(
-            f"[No SOP mapping for hazard_type='{hazard_type}' - searching all documents]"
+    if collection is None or embedder is None:
+        # Knowledge base failed to build (e.g. first start with no
+        # internet to download the embedding model) - an alert without
+        # SOP text is still far better than no alert.
+        context_text = "(SOP knowledge base unavailable - follow local SOPs.)"
+    else:
+        query = f"{hazard_type} response {severity} severity procedure"
+        source_filter = HAZARD_SOURCE_MAP.get(hazard_type.lower())
+        if source_filter is None:
+            print(
+                f"[No SOP mapping for hazard_type='{hazard_type}' - searching all documents]"
+            )
+        context_chunks = retrieve_context(
+            query, collection, embedder, top_k=3, source_filter=source_filter
         )
-    context_chunks = retrieve_context(
-        query, collection, embedder, top_k=3, source_filter=source_filter
-    )
-    context_text = "\n\n".join(
-        f"[Source: {c['source']}]\n{c['text']}" for c in context_chunks
-    )
+        context_text = "\n\n".join(
+            f"[Source: {c['source']}]\n{c['text']}" for c in context_chunks
+        )
 
     if not use_llm:
         return (

@@ -67,7 +67,7 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 float TEMPERATURE_LIMIT = 50.0;
 float HUMIDITY_LIMIT = 85.0;
-int MQ135_LIMIT = 1300;
+float GAS_PPM_LIMIT = 800.0; // ppm - matches backend GAS_LEAK_THRESHOLD_PPM (was 1300 raw ADC counts)
 float DISTANCE_LIMIT = 40.0;
 
 // =====================================================
@@ -89,7 +89,62 @@ float DISTANCE_LIMIT = 40.0;
 // treats as "the alert-worthy close distance". MEASURE YOUR OWN RIG:
 // point the sensor at the empty container and read the Serial Monitor's
 // "Ultrasonic: ... cm" line - use that value here instead if different.
-float ULTRASONIC_MOUNT_HEIGHT_CM = 40.0;
+float ULTRASONIC_MOUNT_HEIGHT_CM = 2.34; // measured on the bench rig (was 40.0 default); the ONLY mount-height setting - backend no longer re-inverts
+
+// =====================================================
+// MQ135 -> GAS PPM (CO2-equivalent)
+// =====================================================
+// The backend, its anomaly model and the edge model all expect gas in
+// ppm (clean air ~400). analogRead() gives raw 0-4095 ADC counts, which
+// were being sent as "gas_ppm" - wrong units everywhere downstream.
+//
+// Conversion: sensor resistance Rs from the load-resistor divider, then
+// the standard MQ135 CO2 curve ppm = PARA * (Rs/R0)^-PARB (datasheet fit,
+// as used by the common GeorgK MQ135 library). This is a CO2-equivalent
+// estimate, NOT a calibrated reading of LPG/NH3/smoke specifically.
+//
+// CALIBRATE BEFORE TRUSTING THE NUMBERS:
+// 1. Burn the sensor in (24h+ powered), then leave it ~10 min in clean
+//    outdoor air.
+// 2. Read the "MQ-135 R0" value printed on the Serial Monitor and put it
+//    in MQ135_R0_KOHM below.
+// 3. Check MQ135_RL_KOHM against your module's load resistor (marked
+//    "102" = 1k, "103" = 10k on most breakout boards).
+// 4. MQ135 modules run at 5V, so AO can exceed the ESP32's 3.3V ADC limit.
+//    Use a divider (e.g. 10k/20k) and set MQ135_ADC_DIVIDER_RATIO to
+//    (R1+R2)/R2 - 1.5 for 10k/20k. 1.0 means AO is wired directly.
+const float MQ135_VCC = 5.0;
+const float MQ135_RL_KOHM = 1.0;
+const float MQ135_R0_KOHM = 76.63;          // library default - replace with your measured R0
+const float MQ135_ADC_DIVIDER_RATIO = 1.0;
+const float MQ135_PARA = 116.6020682;
+const float MQ135_PARB = 2.769034857;
+const float MQ135_ATMOSPHERIC_CO2_PPM = 420.0; // for R0 calibration in clean air
+
+float readMq135ResistanceKohm()
+{
+  // analogReadMilliVolts() applies the ESP32's factory ADC calibration;
+  // raw analogRead() counts are noticeably non-linear on ESP32.
+  float vOut = analogReadMilliVolts(MQ135_PIN) / 1000.0 * MQ135_ADC_DIVIDER_RATIO;
+  if (vOut < 0.01) return -1; // no signal - sensor unpowered/disconnected
+  return MQ135_RL_KOHM * (MQ135_VCC - vOut) / vOut;
+}
+
+float readMq135Ppm()
+{
+  float rs = readMq135ResistanceKohm();
+  if (rs <= 0) return 0;
+  return MQ135_PARA * pow(rs / MQ135_R0_KOHM, -MQ135_PARB);
+}
+
+// R0 this sensor would need for the current air to read as
+// MQ135_ATMOSPHERIC_CO2_PPM - only meaningful in clean outdoor air.
+float calibrateMq135R0Kohm()
+{
+  float rs = readMq135ResistanceKohm();
+  if (rs <= 0) return -1;
+  return rs * pow(MQ135_ATMOSPHERIC_CO2_PPM / MQ135_PARA, 1.0 / MQ135_PARB);
+}
 
 // =====================================================
 // LED BLINK
@@ -192,7 +247,7 @@ float readBatteryPercent()
 void sendData(
   float temperature,
   float humidity,
-  int mq135,
+  float gasPpm,
   float distance,
   bool irDetected
 )
@@ -242,7 +297,7 @@ void sendData(
   json += ",";
 
   json += "\"gas_ppm\":";
-  json += String(mq135);
+  json += String(gasPpm, 1);
   json += ",";
 
   // CHANGED: previously sent raw (uninverted) distance/100.0 here.
@@ -400,7 +455,7 @@ void loop()
 
   float humidity = dht.readHumidity();
 
-  int mq135 = analogRead(MQ135_PIN);
+  float gasPpm = readMq135Ppm();
 
   float distance = getDistance();
 
@@ -433,7 +488,7 @@ void loop()
     humidity >= HUMIDITY_LIMIT;
 
   bool gasAlert =
-    mq135 >= MQ135_LIMIT;
+    gasPpm >= GAS_PPM_LIMIT;
 
   bool ultrasonicAlert =
     (distance > 0 && distance <= DISTANCE_LIMIT);
@@ -488,7 +543,10 @@ void loop()
   Serial.println(" %");
 
   Serial.print("MQ-135      : ");
-  Serial.println(mq135);
+  Serial.print(gasPpm, 0);
+  Serial.print(" ppm CO2-eq  (R0 if clean air: ");
+  Serial.print(calibrateMq135R0Kohm(), 2);
+  Serial.println(" kOhm)");
 
   Serial.print("Ultrasonic  : ");
 
@@ -554,7 +612,7 @@ void loop()
     sendData(
       temperature,
       humidity,
-      mq135,
+      gasPpm,
       distance,
       irDetected
     );
