@@ -1,13 +1,17 @@
 """
 SANJEEVNI - Backend Server (FastAPI, AI layer)
-Run: uvicorn backend_server:app --host 0.0.0.0 --port 8000 --reload
+Run: uvicorn backend_server:app --host 127.0.0.1 --port 8000
+(127.0.0.1: only server.js on the same machine should reach this service.)
 """
 
 import sqlite3
 import os
+import secrets
 import joblib
 import requests
 import statistics
+import threading
+from contextlib import asynccontextmanager
 import math
 import tempfile
 from collections import deque
@@ -21,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Response, Header, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from integration_pipeline import (
     train_flood_model,
@@ -32,9 +36,20 @@ from integration_pipeline import (
 )
 from rag_alert_pipeline import build_knowledge_base, severity_band
 from cap_alert import generate_cap_alert
+from hazard_confirmation import HazardConfirmer
+import river_forecast
+from satellite_check import satellite_flood_check
 from situation_report import generate_situation_report_pdf
 
-app = FastAPI(title="SANJEEVNI Backend")
+@asynccontextmanager
+async def lifespan(_app):
+    # FastAPI's replacement for the deprecated @app.on_event("startup") (B30).
+    # startup() is defined further down; it runs once the module is loaded.
+    startup()
+    yield
+
+
+app = FastAPI(title="SANJEEVNI Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,22 +60,21 @@ app.add_middleware(
 
 DB_PATH = "sanjeevni.db"
 
-# UPGRADE: admin-editable node registry. Loads the same .env file
-# server.js uses (one shared secret across both services, not two
-# separate keys to manage) - falls back to the same insecure demo key
-# with the same warning if unset, for consistency with server.js.
+# Admin node-registry endpoints use the same OFFICER_API_KEY as server.js.
+# There is NO fallback key: the old demo default was published in the repo,
+# so anyone reaching this port could have edited or deleted nodes. Unset =
+# admin endpoints disabled. Also run uvicorn with --host 127.0.0.1 so only
+# server.js (same machine) can reach this service at all.
 load_dotenv()
-ADMIN_API_KEY = os.environ.get("OFFICER_API_KEY", "sanjeevni-demo-key-CHANGE-ME")
-if "OFFICER_API_KEY" not in os.environ:
-    print(
-        "\n[SECURITY WARNING] OFFICER_API_KEY is not set - using an insecure "
-        "default demo key for the admin node-registry endpoints. Set a real "
-        "one in your .env file before any real deployment.\n"
-    )
+ADMIN_API_KEY = os.environ.get("OFFICER_API_KEY") or None
+if not ADMIN_API_KEY:
+    print("[auth] OFFICER_API_KEY not set - admin node-registry endpoints are disabled.")
 
 
 def require_admin_auth(x_api_key: Optional[str] = Header(None)):
-    if x_api_key != ADMIN_API_KEY:
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin API disabled - set OFFICER_API_KEY in .env")
+    if not x_api_key or not secrets.compare_digest(x_api_key, ADMIN_API_KEY):
         raise HTTPException(
             status_code=401, detail="Unauthorized - valid X-API-Key header required"
         )
@@ -120,6 +134,12 @@ def init_node_registry_table(conn):
             upstream_node TEXT
         )
     """)
+    # How often the node is expected to report (NULL = DEFAULT_REPORT_INTERVAL_SECONDS).
+    # Deep-sleep / LoRa nodes report every few minutes, so "missing" must be
+    # judged per node - see compute_node_health().
+    node_cols = {row[1] for row in conn.execute("PRAGMA table_info(nodes)")}
+    if "report_interval_seconds" not in node_cols:
+        conn.execute("ALTER TABLE nodes ADD COLUMN report_interval_seconds REAL")
     row_count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
     if row_count == 0:
         for node_id, cfg in _SEED_NODES.items():
@@ -188,6 +208,7 @@ def reload_node_registry():
             "latitude": row["latitude"],
             "longitude": row["longitude"],
             "upstream_node": row["upstream_node"],
+            "report_interval_seconds": row["report_interval_seconds"],
         }
         # Lazily create history/health tracking for any node not seen
         # before (e.g. just added via the admin API) - never overwrites
@@ -466,6 +487,16 @@ ADDED_READING_COLUMNS = {
     "water_ph": "REAL",
     "turbidity_ntu": "REAL",
     "simulated": "INTEGER",
+    "battery_pct": "REAL",
+    "signal_strength_dbm": "REAL",
+    "reading_uid": "TEXT",
+    "delay_seconds": "REAL",  # received_at - reading time (store-and-forward backlog)
+    "edge_risk_level": "TEXT",
+    "confirmation": "TEXT",  # "persistent" / "neighbour:<id>" / "unconfirmed"
+    "soil_moisture_pct": "REAL",
+    "soil_saturation_source": "TEXT",  # "sensor" or "rainfall_proxy"
+    "link": "TEXT",
+    "rainfall_mm_since_last": "REAL",  # per-reading rain - input for the river forecast
 }
 
 
@@ -501,6 +532,11 @@ def init_db():
     for column, sql_type in ADDED_READING_COLUMNS.items():
         if column not in existing_cols:
             conn.execute(f"ALTER TABLE readings ADD COLUMN {column} {sql_type}")
+    # Duplicate guard for store-and-forward retries (see RawReading.reading_uid)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_readings_node_uid "
+        "ON readings(node_id, reading_uid) WHERE reading_uid IS NOT NULL"
+    )
     conn.commit()
 
     init_node_registry_table(conn)
@@ -533,7 +569,7 @@ def save_reading(enriched: dict, result: dict, timestamp: str):
     }
     for column in ADDED_READING_COLUMNS:
         if column not in row:
-            row[column] = enriched.get(column)
+            row[column] = enriched[column] if column in enriched else result.get(column)
     row["simulated"] = 1 if enriched.get("simulated") else 0
 
     columns = ", ".join(row)
@@ -644,19 +680,26 @@ def parse_timestamp(timestamp: str) -> datetime:
 
 
 def rate_per_hour(history: deque, key: str, current_value: float, now: datetime) -> float:
-    """Change in `key` per HOUR, measured from the oldest reading within the
-    last RATE_WINDOW_MINUTES to `current_value` at `now`. Using a window
-    instead of just the previous reading keeps HC-SR04 jitter from turning
-    into huge rates. Returns 0.0 (no evidence of change) when there isn't
-    at least MIN_RATE_SPAN_SECONDS of history to measure across."""
+    """Change in `key` per HOUR over the last RATE_WINDOW_MINUTES: the
+    least-squares slope through ALL readings in the window plus the
+    current one. Using only the oldest and newest point let ordinary
+    sensor jitter look like a fast rise - the cause of false MEDIUM flood
+    alerts on calm rivers (B33). Returns 0.0 (no evidence of change) when
+    there isn't at least MIN_RATE_SPAN_SECONDS of history."""
     window_start = now - timedelta(minutes=RATE_WINDOW_MINUTES)
-    baseline = next((r for r in history if r["timestamp"] >= window_start), None)
-    if baseline is None:
-        return 0.0
-    span_seconds = (now - baseline["timestamp"]).total_seconds()
+    points = [((r["timestamp"] - now).total_seconds() / 3600, r[key])
+              for r in history if window_start <= r["timestamp"] <= now and r.get(key) is not None]
+    points.append((0.0, current_value))
+    span_seconds = -points[0][0] * 3600 if len(points) > 1 else 0.0
     if span_seconds < MIN_RATE_SPAN_SECONDS:
         return 0.0
-    return (current_value - baseline[key]) / (span_seconds / 3600)
+    n = len(points)
+    mean_t = sum(t for t, _ in points) / n
+    mean_v = sum(v for _, v in points) / n
+    var_t = sum((t - mean_t) ** 2 for t, _ in points)
+    if var_t == 0:
+        return 0.0
+    return sum((t - mean_t) * (v - mean_v) for t, v in points) / var_t
 
 
 def smooth_water_level(history: deque, current_value: float) -> float:
@@ -712,14 +755,34 @@ class RawReading(BaseModel):
     pm10_ugm3: Optional[float] = None  # PMS5003 - air pollution
     water_ph: Optional[float] = None  # water quality sensor
     turbidity_ntu: Optional[float] = None  # water quality sensor
+    # Store-and-forward: a node that queued readings while offline uploads
+    # them later. LoRa-only nodes have no clock (no NTP), so they send how
+    # long ago the reading was taken instead of a timestamp; the backend
+    # turns that into a timestamp. reading_uid (unique per node, e.g.
+    # "<boot>-<seq>") makes a re-sent reading a no-op, so a node can safely
+    # retry an upload whose response it never received.
+    # 0 .. 30 days. A value like 1e20 used to raise OverflowError while
+    # sorting and fail the whole batch with 500 forever (review R7).
+    age_seconds: Optional[float] = Field(default=None, ge=0, le=30 * 24 * 3600)
+    reading_uid: Optional[str] = None
+    # The node's own on-device edge-AI verdict (NORMAL/WATCH/URGENT), stored
+    # so edge and cloud classifications can be compared over time.
+    edge_risk_level: Optional[str] = None
+    # Capacitive soil-moisture sensor (0-100 %). When present it REPLACES
+    # the rainfall-decay soil_saturation proxy with a real measurement.
+    soil_moisture_pct: Optional[float] = None
+    # How the reading reached us: "wifi" (node direct), "lora" (via the
+    # gateway - signal_strength_dbm is then the LoRa RSSI) or "nbiot".
+    # Decides what counts as a weak signal in node health.
+    link: Optional[str] = None
 
 
-@app.on_event("startup")
 def startup():
     global _flood_model, _flood_feature_cols, _anomaly_model, _anomaly_scaler
     global _rag_collection, _rag_embedder
     init_db()
     reload_node_registry()
+    seed_node_health_from_db()
     print(
         f"[nodes] Loaded {len(NODE_REGISTRY)} nodes from the database: {list(NODE_REGISTRY.keys())}"
     )
@@ -826,10 +889,13 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         mm for t, mm in rain_log if t >= now - timedelta(hours=1)
     )
 
-    # Soil saturation proxy (no soil-moisture sensor yet - see up2): dries
-    # out exponentially with real elapsed time instead of 2% per reading,
-    # which emptied it in minutes at a 5s interval.
-    if history:
+    # Soil saturation: the real capacitive sensor when the node has one;
+    # otherwise a proxy that rises with rain and dries out exponentially
+    # with real elapsed time (it used to lose 2% per reading, which emptied
+    # it in minutes at a 5s interval).
+    if raw.soil_moisture_pct is not None:
+        prev_saturation = None
+    elif history:
         hours_since_prev = max(
             0.0, (now - history[-1]["timestamp"]).total_seconds() / 3600
         )
@@ -838,10 +904,15 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         )
     else:
         prev_saturation = 0.3
-    soil_saturation = min(
-        1.0,
-        max(0.0, prev_saturation + raw.rainfall_mm_since_last * SOIL_SATURATION_PER_MM),
-    )
+    if prev_saturation is None:
+        soil_saturation = min(1.0, max(0.0, raw.soil_moisture_pct / 100))
+        soil_saturation_source = "sensor"
+    else:
+        soil_saturation = min(
+            1.0,
+            max(0.0, prev_saturation + raw.rainfall_mm_since_last * SOIL_SATURATION_PER_MM),
+        )
+        soil_saturation_source = "rainfall_proxy"
 
     upstream_node = config.get("upstream_node")
     if upstream_node and node_history.get(upstream_node):
@@ -908,6 +979,15 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         "pm10_ugm3": raw.pm10_ugm3,
         "water_ph": raw.water_ph,
         "turbidity_ntu": raw.turbidity_ntu,
+        # Node telemetry / provenance, stored with the reading
+        "battery_pct": raw.battery_pct,
+        "signal_strength_dbm": raw.signal_strength_dbm,
+        "reading_uid": raw.reading_uid,
+        "edge_risk_level": raw.edge_risk_level,
+        "soil_moisture_pct": raw.soil_moisture_pct,
+        "rainfall_mm_since_last": raw.rainfall_mm_since_last,
+        "soil_saturation_source": soil_saturation_source,
+        "link": raw.link,
     }
 
     history.append(
@@ -926,15 +1006,110 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     return enriched
 
 
-@app.post("/api/ingest")
-def ingest_reading(raw: RawReading):
-    timestamp = raw.timestamp or datetime.now(timezone.utc).isoformat()
-    node_health[raw.node_id] = {
-        "last_seen": timestamp,
-        "battery_pct": raw.battery_pct,
-        "signal_strength_dbm": raw.signal_strength_dbm,
-    }
+MAX_CLOCK_SKEW_MINUTES = 5  # node timestamps further in the future are treated as clock garbage
+MAX_BATCH_SIZE = 200
+
+_confirmer = HazardConfirmer()
+
+
+def resolve_reading_time(raw: RawReading, received_at: datetime) -> datetime:
+    """When the reading was TAKEN: explicit timestamp, else received_at
+    minus age_seconds (clockless LoRa nodes), else received_at. A future
+    timestamp (node clock not set) falls back to received_at."""
+    if raw.timestamp:
+        taken_at = parse_timestamp(raw.timestamp)
+    elif raw.age_seconds is not None:
+        taken_at = received_at - timedelta(seconds=max(0.0, raw.age_seconds))
+    else:
+        taken_at = received_at
+    if taken_at > received_at + timedelta(minutes=MAX_CLOCK_SKEW_MINUTES):
+        taken_at = received_at
+    # Always UTC, so stored timestamps sort and compare correctly as text
+    return taken_at.astimezone(timezone.utc)
+
+
+def is_duplicate_reading(node_id: str, reading_uid: Optional[str]) -> bool:
+    if not reading_uid:
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT 1 FROM readings WHERE node_id=? AND reading_uid=?", (node_id, reading_uid)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def update_node_health(raw: RawReading, received_at: datetime, taken_at: datetime, drift: list):
+    """last_seen = when we last HEARD from the node (received_at), not when
+    a backlogged reading was taken. Battery/signal only move forward in
+    time, so an old queued reading can't overwrite newer telemetry."""
+    health = node_health.setdefault(raw.node_id, {})
+    health["last_seen"] = received_at.isoformat()
+    previous_taken = health.get("last_reading_at")
+    if previous_taken is None or taken_at >= parse_timestamp(previous_taken):
+        health["last_reading_at"] = taken_at.isoformat()
+        health["battery_pct"] = raw.battery_pct
+        health["signal_strength_dbm"] = raw.signal_strength_dbm
+        health["link"] = raw.link
+        health["sensor_drift"] = drift
+
+
+# Readings are processed one at a time. FastAPI runs these sync endpoints
+# on a thread pool, so two requests (e.g. a node retry and the gateway's
+# copy of the same reading) could both pass the duplicate check and both
+# update the in-memory rain log / history / confirmation state before one
+# of them failed on the unique index - double-counting it (review R22).
+# At ~1 reading/s per backend this costs nothing.
+_ingest_lock = threading.Lock()
+
+
+def process_raw_reading(raw: RawReading, received_at: datetime, time_known: bool = True) -> dict:
+    with _ingest_lock:
+        if not time_known:
+            return store_untimed_reading(raw, received_at)
+        return _process_raw_reading(raw, received_at)
+
+
+def store_untimed_reading(raw: RawReading, received_at: datetime) -> dict:
+    """A queued reading whose age is unknown (its node or gateway rebooted
+    while it waited). Stamping it "now" would pile hours of backlog rain
+    into the same instant - inflating rainfall intensity and possibly
+    producing a false flood alert (review R6). So it is STORED for the
+    record but kept out of rates, rainfall totals, alerts and confirmation."""
+    if raw.node_id not in NODE_REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Unknown node_id '{raw.node_id}'")
+    if is_duplicate_reading(raw.node_id, raw.reading_uid):
+        return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
+    node_health.setdefault(raw.node_id, {})["last_seen"] = received_at.isoformat()  # we did hear from it
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """INSERT INTO readings (node_id, location, river_level_m, temp_c, humidity_pct, gas_ppm,
+                   flame_reading, status, timestamp, reading_uid, simulated, link, battery_pct, signal_strength_dbm)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (raw.node_id, NODE_REGISTRY[raw.node_id]["location"], raw.river_level_m, raw.temp_c,
+             raw.humidity_pct, raw.gas_ppm, raw.flame_reading, "untimed", received_at.isoformat(),
+             raw.reading_uid, 1 if raw.simulated else 0, raw.link, raw.battery_pct, raw.signal_strength_dbm),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
+    finally:
+        conn.close()
+    return {"status": "untimed", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
+
+
+def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
+    """Shared by /api/ingest and /api/ingest/batch."""
+    if is_duplicate_reading(raw.node_id, raw.reading_uid):
+        return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
+
+    taken_at = resolve_reading_time(raw, received_at)
+    timestamp = taken_at.isoformat()
+    # derive_features validates node_id, so health is only updated for
+    # registered nodes (unknown IDs used to pollute node_health).
     enriched = derive_features(raw, timestamp)
+    enriched["delay_seconds"] = round((received_at - taken_at).total_seconds(), 1)
 
     result = process_reading(
         enriched,
@@ -964,6 +1139,19 @@ def ingest_reading(raw: RawReading):
     result["predictive_maintenance"] = check_all_sensors_for_drift(
         node_history[raw.node_id]
     )
+    update_node_health(raw, received_at, taken_at, result["predictive_maintenance"])
+
+    # Multi-node cross-check (hazard_confirmation.py): an alert only goes
+    # public once corroborated; until then officers see it as pending.
+    if result["status"] == "alert_dispatched":
+        confirmed, basis = _confirmer.assess(
+            raw.node_id, result["hazard_type"], result["severity"], taken_at, NODE_REGISTRY
+        )
+        result["confirmation"] = basis or "unconfirmed"
+        if not confirmed:
+            result["status"] = "pending_confirmation"
+    result["delay_seconds"] = enriched["delay_seconds"]
+    result["reading_uid"] = raw.reading_uid
 
     eta_minutes = None
     if result.get("hazard_type") == "flood":
@@ -978,15 +1166,63 @@ def ingest_reading(raw: RawReading):
         )
 
     result["eta_minutes"] = eta_minutes
+    # Relative to when the reading was TAKEN - for a backlogged reading,
+    # "now + eta" would push the predicted time into the future.
     result["predicted_time"] = (
-        (datetime.now(timezone.utc) + timedelta(minutes=eta_minutes)).isoformat()
+        (taken_at + timedelta(minutes=eta_minutes)).isoformat()
         if eta_minutes is not None and eta_minutes > 0
         else None
     )
 
-    save_reading(enriched, result, timestamp)
+    try:
+        save_reading(enriched, result, timestamp)
+    except sqlite3.IntegrityError:
+        # Same reading_uid saved by a concurrent request between the
+        # duplicate check and here - the other request already handled it.
+        return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
 
     return result
+
+
+@app.post("/api/ingest")
+def ingest_reading(raw: RawReading):
+    return process_raw_reading(raw, datetime.now(timezone.utc))
+
+
+class ReadingBatch(BaseModel):
+    readings: list[RawReading]
+
+
+@app.post("/api/ingest/batch")
+def ingest_batch(batch: ReadingBatch):
+    """Store-and-forward upload: a node (or LoRa gateway) that was offline
+    sends its queued readings in one request. Readings are processed
+    oldest-first per node so rates, rainfall totals and smoothing see them
+    in the order they happened. Each reading gets its own result; one bad
+    reading (e.g. unknown node) doesn't reject the rest of the batch."""
+    if len(batch.readings) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=413, detail=f"At most {MAX_BATCH_SIZE} readings per batch"
+        )
+    received_at = datetime.now(timezone.utc)
+    order = sorted(
+        range(len(batch.readings)),
+        key=lambda i: resolve_reading_time(batch.readings[i], received_at),
+    )
+    results: list = [None] * len(batch.readings)
+    for i in order:
+        r = batch.readings[i]
+        # In a store-and-forward batch, no timestamp AND no age means the
+        # sender lost track of when it was taken (rebooted) - see R6.
+        time_known = r.timestamp is not None or r.age_seconds is not None
+        try:
+            results[i] = process_raw_reading(r, received_at, time_known)
+        except HTTPException as e:
+            results[i] = {"status": "rejected", "node_id": r.node_id, "reading_uid": r.reading_uid, "detail": e.detail}
+        except Exception as e:  # noqa: BLE001 - one bad reading must not fail (and jam) the whole batch (R7)
+            print(f"[ingest] error processing {r.node_id} {r.reading_uid}: {e!r}")
+            results[i] = {"status": "error", "node_id": r.node_id, "reading_uid": r.reading_uid, "detail": str(e)}
+    return {"count": len(results), "results": results}
 
 
 @app.get("/api/readings")
@@ -1183,6 +1419,215 @@ def get_nodes():
     return out
 
 
+# --- Node health / missing-node alerts ----------------------------------
+DEFAULT_REPORT_INTERVAL_SECONDS = 5  # always-on firmware sends every 5s
+MISSED_REPORTS_BEFORE_OFFLINE = 6
+MIN_OFFLINE_AFTER_SECONDS = 60  # never flag faster than this (network hiccups)
+LOW_BATTERY_PCT = 20
+CRITICAL_BATTERY_PCT = 10
+# Weak-signal threshold per link type: WiFi gets unreliable below about
+# -85 dBm, while LoRa (SF7-SF9) still decodes down to roughly -120 dBm.
+WEAK_SIGNAL_DBM_BY_LINK = {"wifi": -85, "lora": -115, "nbiot": -110}
+WEAK_SIGNAL_DBM_DEFAULT = -85  # readings that don't say (old firmware = WiFi)
+_HEALTH_LEVEL_RANK = {"critical": 0, "warning": 1, "ok": 2}
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def median_gap_seconds(timestamps: list) -> Optional[float]:
+    """Typical seconds between reports, from at least 3 gaps."""
+    gaps = [(b - a).total_seconds() for a, b in zip(timestamps, timestamps[1:])]
+    gaps = [g for g in gaps if g > 0]
+    return statistics.median(gaps) if len(gaps) >= 3 else None
+
+
+def observed_interval_from_db(conn, node_id: str) -> Optional[float]:
+    rows = conn.execute(
+        "SELECT timestamp FROM readings WHERE node_id=? AND timestamp IS NOT NULL ORDER BY id DESC LIMIT 11",
+        (node_id,),
+    ).fetchall()
+    return median_gap_seconds(sorted(parse_timestamp(r[0]) for r in rows))
+
+
+def seed_node_health_from_db():
+    """node_health is in-memory, so after a restart every node looked like
+    it had never reported. Restore last-seen + telemetry from each node's
+    most recent stored reading."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT r.node_id, r.timestamp, r.battery_pct, r.signal_strength_dbm, r.link
+        FROM readings r
+        JOIN (SELECT node_id, MAX(id) AS max_id FROM readings GROUP BY node_id) latest
+          ON r.id = latest.max_id
+    """).fetchall()
+    for row in rows:
+        if row["node_id"] in NODE_REGISTRY and row["timestamp"]:
+            node_health.setdefault(row["node_id"], {}).update(
+                {
+                    "last_seen": row["timestamp"],
+                    "last_reading_at": row["timestamp"],
+                    "battery_pct": row["battery_pct"],
+                    "signal_strength_dbm": row["signal_strength_dbm"],
+                    # restored too, so LoRa nodes aren't judged by the WiFi
+                    # signal threshold after a restart (review R20)
+                    "link": row["link"],
+                    "observed_interval_seconds": observed_interval_from_db(conn, row["node_id"]),
+                }
+            )
+    conn.close()
+
+
+def compute_node_health(now: Optional[datetime] = None) -> list[dict]:
+    """Per-node status (online / offline / never_seen) plus maintenance
+    issues, worst first. A node is offline after missing
+    MISSED_REPORTS_BEFORE_OFFLINE of its expected reports - a dead node
+    otherwise looks exactly like a calm one on the hazard map."""
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for node_id, cfg in NODE_REGISTRY.items():
+        health = node_health.get(node_id, {})
+        # Expected cadence: the configured value, else what the node has
+        # actually been doing. A LoRa node that heartbeats every 60 s used to
+        # be judged against the 5 s default and flagged "missing" all the
+        # time unless someone configured it by hand (review R19).
+        recent = [r["timestamp"] for r in list(node_history.get(node_id, ()))[-11:]]
+        observed = median_gap_seconds(recent) or health.get("observed_interval_seconds")
+        interval = cfg.get("report_interval_seconds") or max(DEFAULT_REPORT_INTERVAL_SECONDS, observed or 0)
+        offline_after = max(MIN_OFFLINE_AFTER_SECONDS, interval * MISSED_REPORTS_BEFORE_OFFLINE)
+        issues = []
+
+        seconds_since_seen = None
+        if health.get("last_seen") is None:
+            status = "never_seen"
+            issues.append({"level": "warning", "type": "never_seen",
+                           "message": "No reading received yet from this node"})
+        else:
+            seconds_since_seen = max(0.0, (now - parse_timestamp(health["last_seen"])).total_seconds())
+            if seconds_since_seen > offline_after:
+                status = "offline"
+                issues.append({
+                    "level": "critical", "type": "missing",
+                    "message": f"No report for {_format_duration(seconds_since_seen)} "
+                               f"(expected every {_format_duration(interval)}) - check power/link or theft",
+                })
+            else:
+                status = "online"
+
+        battery = health.get("battery_pct")
+        if battery is not None and battery < LOW_BATTERY_PCT:
+            issues.append({
+                "level": "critical" if battery < CRITICAL_BATTERY_PCT else "warning",
+                "type": "low_battery", "message": f"Battery at {battery:.0f}%",
+            })
+        signal = health.get("signal_strength_dbm")
+        link = health.get("link")
+        weak_below = WEAK_SIGNAL_DBM_BY_LINK.get(link, WEAK_SIGNAL_DBM_DEFAULT)
+        if signal is not None and signal < weak_below:
+            issues.append({"level": "warning", "type": "weak_signal",
+                           "message": f"Weak {link or 'wifi'} signal ({signal:.0f} dBm)"})
+        for drift in health.get("sensor_drift") or []:
+            issues.append({
+                "level": "warning", "type": "sensor_drift",
+                "message": f"{drift['sensor']} drifting {drift['slope_per_reading']:+} per reading "
+                           f"over {drift['window_size']} readings - inspect / recalibrate",
+            })
+
+        level = "critical" if any(i["level"] == "critical" for i in issues) else (
+            "warning" if issues else "ok")
+        out.append({
+            "node_id": node_id,
+            "location": cfg["location"],
+            "latitude": cfg["latitude"],
+            "longitude": cfg["longitude"],
+            "status": status,
+            "level": level,
+            "last_seen": health.get("last_seen"),
+            "seconds_since_seen": round(seconds_since_seen) if seconds_since_seen is not None else None,
+            "expected_interval_seconds": interval,
+            "battery_pct": battery,
+            "signal_strength_dbm": signal,
+            "link": link,
+            "issues": issues,
+        })
+    out.sort(key=lambda n: (_HEALTH_LEVEL_RANK[n["level"]], n["node_id"]))
+    return out
+
+
+@app.get("/api/forecast/{node_id}")
+def get_river_forecast(node_id: str):
+    """LSTM river-level forecast (+30 / +60 min) for one node, from its
+    last ~2 hours of stored readings, next to the linear extrapolation the
+    ETA uses. Trained on SYNTHETIC hydrology - shown as indicative only and
+    never used to raise or lower an alert."""
+    if node_id not in NODE_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown node_id '{node_id}'")
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT timestamp, river_level_m, rainfall_mm_since_last FROM readings
+           WHERE node_id=? AND status != 'suppressed' AND river_level_m IS NOT NULL
+           ORDER BY id DESC LIMIT 3000""",  # sensor faults excluded
+        (node_id,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return {"node_id": node_id, "available": False, "reason": "no readings yet"}
+    # key=time only: comparing whole tuples hit None-vs-float rain on ties
+    # and raised TypeError (review R23)
+    parsed = sorted(((parse_timestamp(ts), level, rain) for ts, level, rain in rows if ts), key=lambda r: r[0])
+    result = river_forecast.forecast_from_readings(parsed, end=parsed[-1][0])
+    return {"node_id": node_id, "as_of": parsed[-1][0].isoformat(), **result}
+
+
+@app.get("/api/satellite-check/{node_id}")
+def get_satellite_check(node_id: str):
+    """Sentinel-1 radar cross-check of a node's flood readings (see
+    satellite_check.py). On demand only - slow, external, and a pass is
+    usually days old - so it informs officers and never changes alerts."""
+    cfg = NODE_REGISTRY.get(node_id)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"Unknown node_id '{node_id}'")
+    # Copy: the module caches this dict for 6 h - writing the per-request
+    # agreement text into it kept stale "corroborates" text (review R8).
+    result = dict(satellite_flood_check(node_id, cfg["latitude"], cfg["longitude"]))
+
+    conn = sqlite3.connect(DB_PATH)
+    last = conn.execute(
+        """SELECT severity, timestamp FROM readings
+           WHERE node_id=? AND hazard_type='flood' AND status IN ('alert_dispatched','pending_confirmation')
+           ORDER BY id DESC LIMIT 1""",
+        (node_id,),
+    ).fetchone()
+    conn.close()
+    if last and result["status"] in ("flood_signal", "no_flood_signal"):
+        result["node_last_flood_alert"] = {"severity": last[0], "timestamp": last[1]}
+        result["agreement"] = (
+            "satellite corroborates the node's flood alert" if result["status"] == "flood_signal"
+            else "satellite does not show it - the pass may predate the event, or the alert may be local"
+        )
+    return {"node_id": node_id, **result}
+
+
+@app.get("/api/node-health")
+def get_node_health():
+    nodes = compute_node_health()
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            status: sum(1 for n in nodes if n["status"] == status)
+            for status in ("online", "offline", "never_seen")
+        },
+        "nodes_with_issues": sum(1 for n in nodes if n["issues"]),
+        "nodes": nodes,
+    }
+
+
 class NodeConfig(BaseModel):
     """UPGRADE: admin-editable node registry. Adding a node used to mean
     editing Python source code and restarting the server - this is what
@@ -1196,6 +1641,9 @@ class NodeConfig(BaseModel):
     latitude: float
     longitude: float
     upstream_node: Optional[str] = None
+    # Expected seconds between reports; None = DEFAULT_REPORT_INTERVAL_SECONDS.
+    # Set e.g. 300 for a deep-sleep node so it isn't flagged missing.
+    report_interval_seconds: Optional[float] = None
 
 
 @app.get("/api/admin/nodes")
@@ -1218,7 +1666,7 @@ def admin_create_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO nodes (node_id, location, land_use, curve_number, latitude, longitude, upstream_node) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO nodes (node_id, location, land_use, curve_number, latitude, longitude, upstream_node, report_interval_seconds) VALUES (?,?,?,?,?,?,?,?)",
         (
             node_id,
             cfg.location,
@@ -1227,6 +1675,7 @@ def admin_create_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
             cfg.latitude,
             cfg.longitude,
             cfg.upstream_node,
+            cfg.report_interval_seconds,
         ),
     )
     conn.commit()
@@ -1254,7 +1703,7 @@ def admin_update_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "UPDATE nodes SET location=?, land_use=?, curve_number=?, latitude=?, longitude=?, upstream_node=? WHERE node_id=?",
+        "UPDATE nodes SET location=?, land_use=?, curve_number=?, latitude=?, longitude=?, upstream_node=?, report_interval_seconds=? WHERE node_id=?",
         (
             cfg.location,
             cfg.land_use,
@@ -1262,6 +1711,7 @@ def admin_update_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
             cfg.latitude,
             cfg.longitude,
             cfg.upstream_node,
+            cfg.report_interval_seconds,
             node_id,
         ),
     )

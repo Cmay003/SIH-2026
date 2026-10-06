@@ -14,6 +14,7 @@
     box-shadow: 0 2px 8px rgba(0,0,0,0.3); width: 260px;
   }
   #panel h2 { margin: 0 0 8px 0; font-size: 18px; }
+  #panel .user-slot { margin: 0 0 10px; }
   #panel .count { font-weight: bold; color: #e63946; }
   .legend { font-size: 13px; margin-top: 8px; line-height: 1.6; }
   .legend span { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; }
@@ -73,6 +74,16 @@
     cursor: pointer; font-size: 13px;
   }
   .resolve-all-btn:hover { background: #b8021f; }
+
+  /* Node health / missing-node alerts */
+  .node-health { margin-top: 10px; border-top: 1px solid #eee; padding-top: 8px; font-size: 13px; }
+  .node-health-title { font-weight: bold; margin-bottom: 4px; }
+  .node-row { padding: 4px 0; border-bottom: 1px dashed #eee; }
+  .node-row:last-child { border-bottom: none; }
+  .node-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  .node-issue { font-size: 12px; margin-left: 16px; color: #444; }
+  .node-issue.critical { color: #b8021f; font-weight: bold; }
+  .node-issue.warning { color: #8a5a00; }
   .resolve-all-btn:disabled { background: #9aa1ab; cursor: not-allowed; }
   /* UPGRADE: responsiveness. #panel previously had a fixed 260px width
      with NO handling for narrow screens at all - on a ~375px phone,
@@ -94,14 +105,20 @@
 
 <div id="panel">
   <h2>🚨 SANJEEVNI - Officer View</h2>
+  <div id="sjUserChip" data-theme="light" class="user-slot"></div>
   <div id="sosCountRow">Open SOS requests: <span class="count" id="sosCount">0</span></div>
   <div id="allClearBanner" class="all-clear-banner" style="display:none">✅ All SOS requests resolved</div>
   <button id="resolveAllBtn" class="resolve-all-btn" style="display:none">Resolve All</button>
+  <div class="node-health">
+    <div class="node-health-title">Sensor nodes: <span id="nodeHealthSummary">-</span></div>
+    <div id="nodeHealthList"></div>
+  </div>
   <div class="legend">
     <div style="font-weight:bold; margin-bottom:4px">Severity (color):</div>
     <div><span style="background:orange"></span>MEDIUM hazard zone</div>
     <div><span style="background:red"></span>HIGH / CRITICAL hazard zone</div>
     <div><span style="background:#d90429"></span>Person needing help (SOS)</div>
+    <div><span style="background:none; border:2px dashed orange; width:8px; height:8px"></span>Awaiting confirmation (officers only)</div>
     <div style="font-weight:bold; margin-top:8px; margin-bottom:4px">Hazard type (icon):</div>
     <div style="line-height:1.5">🌊 Flood &nbsp; 🔥 Fire &nbsp; ☣️ Gas leak<br>🌡️ Heat &nbsp; ⛰️ Landslide<br>😷 Air pollution &nbsp; 💧 Water quality</div>
   </div>
@@ -109,6 +126,7 @@
 
 <div id="map"></div>
 
+<script src="/auth-ui.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
   const map = L.map("map").setView([29.3919, 79.4542], 12);
@@ -119,24 +137,18 @@
   let hazardLayer = L.layerGroup().addTo(map);
   let sosLayer = L.layerGroup().addTo(map);
 
-  // UPGRADE: authentication. GET /api/sos and the resolve endpoints now
-  // require an X-API-Key header (see server.js's requireOfficerAuth).
-  // Prompts once per browser and remembers it in localStorage - this is
-  // a simple demo-grade key entry, not a full login system.
-  // UPGRADE: authentication. GET /api/sos and the resolve endpoints now
-  // require an X-API-Key header (see server.js's requireOfficerAuth).
-  // Prompts ONCE per session and remembers it in localStorage. On a
-  // wrong/missing key, shows an on-page banner instead of repeatedly
-  // firing the native prompt() dialog every 5-second poll - that was a
-  // real bug (an earlier version of this code cleared the stored key on
-  // 401 and let the next interval tick re-prompt immediately, looping
-  // forever). Now it prompts once, and only re-prompts if you
-  // deliberately click "Re-enter key".
-  let authFailed = false;
+  // Authentication: this page is only served to a signed-in officer (see
+  // auth.js); API calls carry the session cookie automatically, and
+  // auth-ui.js sends the user back to the login page if it expires. This
+  // replaced the old prompt()-for-an-API-key flow, which stored the key in
+  // localStorage where any injected script could read it.
+  function officerAuthHeaders() {
+    return {};
+  }
 
   // Escapes text before it goes into popup HTML. SOS notes come from
   // anonymous citizens, so inserting them raw let a note run script in
-  // the officer's browser (and read the stored API key).
+  // the officer's browser (and act with the officer's session).
   function escapeHtml(value) {
     return String(value ?? "")
       .replace(/&/g, "&amp;")
@@ -144,53 +156,6 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
-  }
-
-  function getOfficerApiKey() {
-    return localStorage.getItem("sanjeevni_officer_api_key") || "";
-  }
-  function officerAuthHeaders() {
-    return { "X-API-Key": getOfficerApiKey() };
-  }
-  function promptForApiKey() {
-    const key = prompt(
-      "Enter the officer API key to view and manage SOS requests:\n" +
-      "(set by whoever is running the SANJEEVNI backend - ask them if you don't have it.\n" +
-      "If they haven't set one, check their server startup log for the demo default key.)",
-    );
-    if (key) {
-      localStorage.setItem("sanjeevni_officer_api_key", key);
-      authFailed = false;
-      hideAuthBanner();
-      loadSos();
-    }
-  }
-  function showAuthBanner() {
-    authFailed = true;
-    let banner = document.getElementById("authBanner");
-    if (!banner) {
-      banner = document.createElement("div");
-      banner.id = "authBanner";
-      banner.style.cssText =
-        "position:fixed;top:10px;left:50%;transform:translateX(-50%);" +
-        "background:#d90429;color:white;padding:10px 16px;border-radius:8px;" +
-        "z-index:2000;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,0.3);cursor:pointer";
-      banner.textContent = "⚠ Invalid API key - click here to re-enter it";
-      banner.addEventListener("click", () => {
-        localStorage.removeItem("sanjeevni_officer_api_key");
-        promptForApiKey();
-      });
-      document.body.appendChild(banner);
-    }
-    banner.style.display = "block";
-  }
-  function hideAuthBanner() {
-    const banner = document.getElementById("authBanner");
-    if (banner) banner.style.display = "none";
-  }
-
-  if (!getOfficerApiKey()) {
-    promptForApiKey();
   }
 
   // Read ?focus=NODE_ID from a link clicked on the dashboard's hazard list,
@@ -242,21 +207,28 @@
 
   async function loadHazardZones() {
     try {
-      const res = await fetch("/api/hazard-zones");
+      const res = await fetch("/api/hazard-zones?include_pending=1");
       const data = await res.json();
       hazardLayer.clearLayers();
 
       let focusTarget = null;
 
       data.zones.forEach((z) => {
+        // Pending = waiting for a repeat reading or a neighbouring node to
+        // corroborate it (hazard_confirmation.py) - shown dashed and faint,
+        // and not on the public map yet.
         const circle = L.circle([z.latitude, z.longitude], {
           radius: z.radius_m,
           color: severityColor(z.severity),
           fillColor: severityColor(z.severity),
-          fillOpacity: 0.3,
+          fillOpacity: z.confirmed ? 0.3 : 0.08,
+          dashArray: z.confirmed ? null : "8 6",
         }).addTo(hazardLayer);
 
-        const popupHtml = `<strong>${escapeHtml(z.node_id)}</strong><br>${escapeHtml(z.hazard_type)} - ${escapeHtml(z.severity)}<br>Risk score: ${Number(z.risk_score).toFixed(2)}`;
+        const confirmationLine = z.confirmed
+          ? ""
+          : "<br><em>Awaiting confirmation - not yet public</em>";
+        const popupHtml = `<strong>${escapeHtml(z.node_id)}</strong><br>${escapeHtml(z.hazard_type)} - ${escapeHtml(z.severity)}<br>Risk score: ${Number(z.risk_score).toFixed(2)}${confirmationLine}`;
         circle.bindPopup(popupHtml);
 
         // A marker at the zone center makes it easy to click even before
@@ -265,6 +237,11 @@
         const marker = L.marker([z.latitude, z.longitude], { icon: hazardIcon(z.severity, z.hazard_type) })
           .bindPopup(popupHtml)
           .addTo(hazardLayer);
+        if (z.hazard_type === "flood") {
+          // Fetched only when an officer opens the popup - the forecast is
+          // an aid for judgement, not part of the alert decision.
+          marker.on("popupopen", () => showFloodForecast(marker, popupHtml, z.node_id));
+        }
 
         if (focusNodeId && z.node_id === focusNodeId) {
           focusTarget = { circle, marker, z };
@@ -288,6 +265,36 @@
       }
     } catch (e) {
       console.log("hazard-zones error", e);
+    }
+  }
+
+  async function showFloodForecast(marker, baseHtml, nodeId) {
+    try {
+      const res = await fetch(`/api/forecast/${encodeURIComponent(nodeId)}`);
+      const f = await res.json();
+      let html;
+      if (!f.available) {
+        html = `<br><small>Forecast unavailable: ${escapeHtml(f.reason || "error")}</small>`;
+      } else {
+        const rows = f.forecast.map((p) =>
+          `+${Number(p.minutes_ahead)} min: <strong>${Number(p.level_m).toFixed(2)} m</strong> ` +
+          `(${p.change_m >= 0 ? "+" : ""}${Number(p.change_m).toFixed(2)}; straight-line ${Number(p.linear_baseline_level_m).toFixed(2)} m)`,
+        ).join("<br>");
+        html = `<br><br><strong>River forecast</strong> (now ${Number(f.current_level_m).toFixed(2)} m)<br>${rows}` +
+          `<br><small><em>Indicative only - model trained on synthetic data</em></small>`;
+      }
+      marker.setPopupContent(baseHtml + html);
+
+      // Satellite cross-check (slower; results are cached server-side for 6 h)
+      const satRes = await fetch(`/api/satellite-check/${encodeURIComponent(nodeId)}`, { headers: officerAuthHeaders() });
+      if (satRes.ok) {
+        const sat = await satRes.json();
+        html += `<br><br><strong>Sentinel-1 radar</strong><br>${escapeHtml(sat.message || sat.status)}` +
+          (sat.agreement ? `<br><em>${escapeHtml(sat.agreement)}</em>` : "");
+        marker.setPopupContent(baseHtml + html);
+      }
+    } catch (e) {
+      console.log("forecast error", e);
     }
   }
 
@@ -315,16 +322,7 @@
   async function loadSos() {
     try {
       const res = await fetch("/api/sos", { headers: officerAuthHeaders() });
-      if (res.status === 401) {
-        // Wrong/missing key - show a persistent on-page banner instead
-        // of clearing the key and letting the next 5-second poll
-        // re-trigger a native prompt() loop (that was the actual bug).
-        // Keeps the bad key stored so we don't spam prompts - the user
-        // decides when to re-enter it via the banner.
-        showAuthBanner();
-        return;
-      }
-      hideAuthBanner();
+      if (!res.ok) return; // 401 -> auth-ui.js redirects to the login page
       const data = await res.json();
       document.getElementById("sosCount").innerText = data.count;
 
@@ -369,10 +367,62 @@
     }
   }
 
+  // --- Node health / missing-node alerts ------------------------------
+  const nodeLayer = L.layerGroup().addTo(map);
+  const NODE_LEVEL_COLOR = { ok: "#2e7d32", warning: "#f2a900", critical: "#d90429" };
+
+  async function loadNodeHealth() {
+    try {
+      const res = await fetch("/api/node-health", { headers: officerAuthHeaders() });
+      if (!res.ok) return; // 401 -> auth-ui.js redirects to the login page
+      const data = await res.json();
+      const s = data.summary;
+      document.getElementById("nodeHealthSummary").innerText =
+        `${s.online} online, ${s.offline} offline` + (s.never_seen ? `, ${s.never_seen} never seen` : "");
+
+      // List only nodes that need attention, worst first (backend sorts)
+      const needsAttention = data.nodes.filter((n) => n.issues.length);
+      document.getElementById("nodeHealthList").innerHTML = needsAttention.length
+        ? needsAttention.map((n) => `
+            <div class="node-row">
+              <span class="node-dot" style="background:${NODE_LEVEL_COLOR[n.level]}"></span>
+              <strong>${escapeHtml(n.node_id)}</strong> - ${escapeHtml(n.location)}
+              ${n.issues.map((i) => `<div class="node-issue ${escapeHtml(i.level)}">${escapeHtml(i.message)}</div>`).join("")}
+            </div>`).join("")
+        : '<div style="color:#2e7d32">All nodes reporting normally</div>';
+
+      nodeLayer.clearLayers();
+      data.nodes.forEach((n) => {
+        if (n.latitude == null || n.longitude == null) return;
+        const offline = n.status !== "online";
+        L.circleMarker([n.latitude, n.longitude], {
+          radius: 7,
+          color: "#333",
+          weight: 1,
+          fillColor: offline ? "#9aa1ab" : NODE_LEVEL_COLOR[n.level],
+          fillOpacity: 0.9,
+        })
+          .bindPopup(`
+            <strong>${escapeHtml(n.node_id)}</strong> (${escapeHtml(n.status)})<br>
+            ${escapeHtml(n.location)}<br>
+            Last seen: ${n.seconds_since_seen == null ? "never" : Number(n.seconds_since_seen) + "s ago"}<br>
+            Battery: ${n.battery_pct == null ? "-" : Number(n.battery_pct).toFixed(0) + "%"} &nbsp;
+            Signal: ${n.signal_strength_dbm == null ? "-" : Number(n.signal_strength_dbm) + " dBm"}
+            ${n.issues.map((i) => `<div class="node-issue ${escapeHtml(i.level)}">${escapeHtml(i.message)}</div>`).join("")}
+          `)
+          .addTo(nodeLayer);
+      });
+    } catch (e) {
+      console.log("node-health error", e);
+    }
+  }
+
   loadHazardZones();
   loadSos();
+  loadNodeHealth();
   setInterval(loadHazardZones, 5000);
   setInterval(loadSos, 5000);
+  setInterval(loadNodeHealth, 10000);
 </script>
 
 </body>

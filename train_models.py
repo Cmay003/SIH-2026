@@ -19,7 +19,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score, brier_score_loss
+from sklearn.metrics import classification_report, roc_auc_score, brier_score_loss, f1_score
 
 from flood_risk_model import generate_synthetic_data, scs_cn_runoff
 from anomaly_detection import generate_sensor_stream
@@ -103,7 +103,10 @@ def train_flood_model():
         print(f"[flood] {len(df)} labelled rows, {int(df['flood_event'].sum())} flood events")
     else:
         print(
-            "[flood] No data/flood_history.csv found - training on synthetic data instead"
+            "[flood] No data/flood_history.csv found - training on SYNTHETIC data.\n"
+            "        !!! The scores below only show the pipeline works. Their labels\n"
+            "        !!! are computed from the same features, so they are NOT evidence\n"
+            "        !!! of real-world accuracy - do not quote them as such (B13)."
         )
         df = generate_synthetic_data()
 
@@ -155,6 +158,16 @@ def train_flood_model():
             )
         )
         print(f"ROC-AUC: {roc_auc_score(y_test, y_proba):.3f}")
+        # Baseline every score must beat to mean anything: "flood if the
+        # river is above a level", threshold picked on the TRAINING set (B13).
+        levels_train, levels_test = X_train["river_level_m"], X_test["river_level_m"]
+        candidates = sorted(set(levels_train.round(2)))
+        best_t = max(candidates, key=lambda t: f1_score(y_train, levels_train >= t, zero_division=0))
+        print(
+            f"Baseline 'river_level_m >= {best_t:.2f} m': F1 {f1_score(y_test, levels_test >= best_t, zero_division=0):.3f}, "
+            f"ROC-AUC {roc_auc_score(y_test, levels_test):.3f}   vs model F1 "
+            f"{f1_score(y_test, model.predict(X_test), zero_division=0):.3f}"
+        )
         # Brier score - lower is better-calibrated (0 = perfect). This is
         # the metric calibration is actually optimizing for, distinct
         # from ROC-AUC (which only cares about ranking, not the actual

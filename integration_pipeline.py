@@ -5,6 +5,8 @@ Requires flood_risk_model.py, anomaly_detection.py, rag_alert_pipeline.py
 in the same folder.
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 import shap
@@ -47,14 +49,55 @@ FLAME_THRESHOLD = 0.3
 # same "trust the raw sensor over the model" pattern your gas/flame
 # hazard-signature check above already uses.
 #
-# >>> SET HARDWARE_TEST_MODE = False BEFORE REAL DEPLOYMENT. <<<
-# Once you're reading a real river gauge on its true scale, a modest
-# 0.6-1.0m reading is often genuinely NOT dangerous - leaving this on
-# in production would cause false MEDIUM/HIGH alerts the ML model would
-# have correctly called LOW.
-HARDWARE_TEST_MODE = True
-HARDWARE_TEST_WATER_MEDIUM_M = 0.00936  # WARNING: this range is smaller than the sensor's own noise - see backend_server.py's ULTRASONIC_MOUNT_HEIGHT_M comment
-HARDWARE_TEST_WATER_HIGH_M = 0.01755  # unreliable until the sensor is physically raised further from its baseline
+# BENCH MODE IS OFF BY DEFAULT (B22). Turn it on only for the tabletop rig:
+#   PowerShell:  $env:SANJEEVNI_BENCH_MODE="1"   (before starting uvicorn)
+# On a real river gauge a 0.6-1.0 m reading is often NOT dangerous - this
+# override left on in the field would cause false MEDIUM/HIGH alerts.
+# Thresholds are fractions of the sensor's mount height above the empty
+# container (SANJEEVNI_BENCH_MOUNT_M, default 0.0234 m = the measured rig):
+# MEDIUM at 40 % full, HIGH at 75 % full.
+HARDWARE_TEST_MODE = os.environ.get("SANJEEVNI_BENCH_MODE", "0") == "1"
+BENCH_MOUNT_HEIGHT_M = float(os.environ.get("SANJEEVNI_BENCH_MOUNT_M", "0.0234"))
+HARDWARE_TEST_WATER_MEDIUM_M = 0.40 * BENCH_MOUNT_HEIGHT_M
+HARDWARE_TEST_WATER_HIGH_M = 0.75 * BENCH_MOUNT_HEIGHT_M
+print(f"[pipeline] bench mode {'ON - tabletop thresholds active' if HARDWARE_TEST_MODE else 'off'}")
+
+# Values no working sensor can produce. A reading outside these is a sensor
+# fault, full stop - checked BEFORE the anomaly model, because Isolation
+# Forest scores every value beyond its training range about the same, so a
+# 14 m "river" could slip through as a flood (B32).
+PHYSICAL_LIMITS = {
+    "river_level_m": (0.0, float(os.environ.get("SANJEEVNI_MAX_RIVER_LEVEL_M", "10"))),
+    "temp_c": (-40.0, 70.0),
+    "humidity_pct": (0.0, 100.0),
+    "gas_ppm": (0.0, 50000.0),
+    "flame_reading": (0.0, 1.0),
+}
+
+
+def physically_implausible(reading: dict) -> str | None:
+    """Name of the first field outside what a working sensor can report."""
+    for field, (low, high) in PHYSICAL_LIMITS.items():
+        value = reading.get(field)
+        if value is not None and not (low <= value <= high):
+            return field
+    return None
+
+
+# A flood announces itself physically: the water rises fast WHILE it rains
+# hard or the upstream node rises too. Such a reading must reach the flood
+# model even if the anomaly model has never seen values like it (B15).
+FLOOD_SIGNATURE_RATE_M_PER_HR = 0.2
+FLOOD_SIGNATURE_RAIN_MM_HR = 5.0
+
+
+def is_flood_signature(reading: dict) -> bool:
+    rising = (reading.get("river_level_rate_m_per_hr") or 0) >= FLOOD_SIGNATURE_RATE_M_PER_HR
+    corroborated = (
+        (reading.get("rainfall_intensity_mm_hr") or 0) >= FLOOD_SIGNATURE_RAIN_MM_HR
+        or (reading.get("upstream_rate_m_per_hr") or 0) >= FLOOD_SIGNATURE_RATE_M_PER_HR
+    )
+    return rising and corroborated
 
 
 def hardware_test_water_severity(reading: dict) -> str | None:
@@ -100,6 +143,7 @@ def is_hazard_signature(reading: dict) -> bool:
     if (
         reading["gas_ppm"] > GAS_LEAK_THRESHOLD_PPM
         or reading["flame_reading"] > FLAME_THRESHOLD
+        or is_flood_signature(reading)
     ):
         return True
 
@@ -283,6 +327,16 @@ def process_reading(
     rag_collection,
     rag_embedder,
 ):
+    impossible_field = physically_implausible(reading)
+    if impossible_field:
+        return {
+            "status": "suppressed",
+            "reason": f"physically_impossible_{impossible_field}",
+            "hazard_type": "sensor_fault",
+            "risk_score": 0.0,
+            "severity": "N/A",
+        }
+
     is_anomaly, anomaly_score = check_anomaly(reading, anomaly_model, anomaly_scaler)
     hazard_signature = is_hazard_signature(reading)
 
@@ -310,7 +364,7 @@ def process_reading(
         candidates["gas leak"] = {
             "risk_score": gas_risk,
             "severity": severity_band(gas_risk),
-            "severity_source": "ml_model",
+            "severity_source": "threshold_classifier",  # a fixed ppm threshold, not the ML model (B26)
         }
 
     flood_risk = compute_flood_risk(reading, flood_model, flood_feature_cols)

@@ -29,7 +29,10 @@ output_scale, output_zero_point = output_details["quantization"]
 predictions = []
 for i in range(len(X_test)):
     x = X_test[i:i+1]
-    x_int8 = (x / input_scale + input_zero_point).astype(np.int8)
+    # Exactly what the firmware does (round, then clamp to int8). A plain
+    # astype(int8) truncates and WRAPS out-of-range values, so this check
+    # used to test something different from what runs on the ESP32 (B19).
+    x_int8 = np.clip(np.round(x / input_scale) + input_zero_point, -128, 127).astype(np.int8)
     interpreter.set_tensor(input_details["index"], x_int8)
     interpreter.invoke()
     output = interpreter.get_tensor(output_details["index"])

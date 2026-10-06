@@ -1,0 +1,345 @@
+/* Citizen page keeps its own blue, high-contrast look (always light, for
+   readability outdoors), scoped to .page so staff pages are unaffected. */
+.page {
+  --blue: #1d4ed8;
+  --blue-dark: #1e3a8a;
+  --bg: #f3f4f6;
+  --card: #ffffff;
+  --box: #eef1f6;
+  --ink: #111827;
+  --muted: #6b7280;
+  --ring: #e3e8f0;
+  --ok: #15803d;
+  --warn: #c2410c;
+  --bad: #dc2626;
+  --halo: #fbdada;
+  --off: #9aa1ab;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  color-scheme: light;
+}
+
+.topbar {
+  background: var(--blue);
+  color: #fff;
+  text-align: center;
+  padding: 26px 20px 20px;
+  position: relative;
+}
+.topbar h1 {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
+.langToggle {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.langToggle:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+.portalLabel {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  margin-top: 6px;
+}
+.connStatus {
+  font-size: 13.5px;
+  opacity: 0.9;
+  margin-top: 10px;
+}
+
+.main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 24px 20px 60px;
+}
+
+.card {
+  background: var(--card);
+  border-radius: 14px;
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.04);
+  padding: 24px 26px;
+}
+.card h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+}
+.smallTitle {
+  font-size: 19px !important;
+}
+.spaced {
+  margin-top: 18px;
+}
+.muted {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 6px 0 0;
+}
+
+.locateCard {
+  margin-bottom: 18px;
+}
+.locateHead {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.locateStatus {
+  margin-top: 18px;
+  background: var(--box);
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-size: 14px;
+  color: #374151;
+}
+
+.btnPrimary {
+  display: inline-block;
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  font-size: 14.5px;
+  font-weight: 700;
+  padding: 12px 20px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  text-decoration: none;
+  margin-top: 10px;
+}
+.btnPrimary:hover {
+  background: var(--blue-dark);
+}
+.btnPrimary:disabled {
+  background: var(--off);
+  cursor: not-allowed;
+}
+.locateHead .btnPrimary {
+  margin-top: 0;
+}
+
+.gridRow {
+  display: flex;
+  gap: 18px;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+.safetyCard {
+  flex: 2 1 480px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+}
+.sosCard {
+  flex: 1 1 300px;
+  text-align: center;
+}
+.sosCard h2 {
+  font-size: 19px;
+}
+.sosCard .muted {
+  max-width: 300px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.eyebrow {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.riskLabel {
+  font-size: 34px;
+  font-weight: 800;
+  margin: 6px 0 8px;
+  color: var(--ok);
+}
+.MEDIUM {
+  color: var(--warn);
+}
+.HIGH,
+.CRITICAL {
+  color: var(--bad);
+}
+
+.scoreRing {
+  flex: 0 0 auto;
+  width: 112px;
+  height: 112px;
+  border-radius: 50%;
+  border: 8px solid var(--ring);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.scoreValue {
+  font-size: 26px;
+  font-weight: 800;
+}
+.scoreLabel {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.sosWrap {
+  margin-top: 20px;
+  display: flex;
+  justify-content: center;
+}
+.sosBtn {
+  width: 130px;
+  height: 130px;
+  border-radius: 50%;
+  border: none;
+  background: var(--bad);
+  color: #fff;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  cursor: pointer;
+  box-shadow: 0 0 0 14px var(--halo);
+}
+.sosBtn:disabled {
+  background: var(--off);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.sosHint {
+  margin-top: 14px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.hospName {
+  margin: 10px 0 4px;
+  font-size: 15px;
+}
+
+.noteWrap {
+  position: relative;
+  margin-top: 8px;
+}
+.noteWrap textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 70px;
+  border: 1px solid #d7dbe3;
+  border-radius: 10px;
+  padding: 12px 52px 12px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--ink);
+  background: #fff;
+}
+.voiceBtn {
+  position: absolute;
+  right: 8px;
+  bottom: 10px;
+  border: none;
+  background: var(--blue);
+  color: #fff;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 16px;
+}
+.listening {
+  background: #d90429;
+}
+.sendStatus {
+  margin-top: 10px;
+  font-size: 14px;
+}
+.error {
+  color: var(--bad);
+}
+.ok {
+  color: var(--ok);
+}
+
+.resultCard h3 {
+  margin: 0 0 8px;
+  color: var(--ok);
+  font-size: 18px;
+}
+.resultCard p {
+  margin: 4px 0;
+  font-size: 14px;
+}
+
+@media (max-width: 640px) {
+  .locateHead {
+    flex-direction: column;
+  }
+  .safetyCard {
+    flex-direction: column;
+    text-align: center;
+  }
+  .langToggle {
+    top: 10px;
+    right: 10px;
+  }
+}
+
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modalBox {
+  background: #fff;
+  border-radius: 14px;
+  padding: 32px 36px;
+  text-align: center;
+  max-width: 320px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+}
+.modalBox p {
+  margin: 16px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.spinner {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto;
+  border: 4px solid var(--ring);
+  border-top-color: var(--bad);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

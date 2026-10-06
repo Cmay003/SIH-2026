@@ -395,7 +395,7 @@
             <button id="sosBtn" class="sos-btn" disabled data-i18n="sosButton">SOS</button>
           </div>
           <div class="sos-hint" id="sosHint">
-            SOS unlocks automatically when high risk is detected nearby.
+            SOS unlocks once your location is detected.
           </div>
         </div>
       </section>
@@ -473,7 +473,7 @@
           needHelp: "Need Emergency Help?",
           sosButton: "SOS",
           riskScoreLabel: "Risk score",
-          sosHintLocked: "SOS unlocks automatically when high risk is detected nearby.",
+          sosHintAvailable: "Tap SOS if you need emergency help - responders will receive your location.",
           sosHintUnlocked: "High risk detected nearby. Tap SOS to alert responders.",
           sosHintActive: "Your SOS is already active. Responders have been notified - waiting for it to be resolved.",
         },
@@ -486,7 +486,7 @@
           needHelp: "आपातकालीन सहायता चाहिए?",
           sosButton: "एसओएस",
           riskScoreLabel: "जोखिम स्कोर",
-          sosHintLocked: "आस-पास खतरा होने पर एसओएस अपने आप सक्रिय हो जाएगा।",
+          sosHintAvailable: "आपातकालीन सहायता चाहिए तो एसओएस दबाएं - आपकी लोकेशन सहायता दल को भेजी जाएगी।",
           sosHintUnlocked: "आस-पास उच्च जोखिम पाया गया। मदद के लिए एसओएस दबाएं।",
           sosHintActive: "आपका एसओएस पहले से सक्रिय है। सहायता दल को सूचित कर दिया गया है - समाधान की प्रतीक्षा है।",
         },
@@ -628,9 +628,10 @@
 
       async function checkConnection() {
         try {
-          const res = await fetch("/api/sensors");
+          // Public reachability check - the full sensor feed is staff-only
+          const res = await fetch("/api/status");
           const data = await res.json();
-          if (!data.success) throw new Error("bad response");
+          if (!data.ok) throw new Error("bad response");
           connStatusEl.innerText = "Connected to SANJEEVNI server.";
         } catch (e) {
           connStatusEl.innerText = "Unable to connect to SANJEEVNI server.";
@@ -744,11 +745,16 @@
           return;
         }
 
+        // Team decision 2026-10-06: once the location is known, SOS is
+        // ALWAYS available - an emergency doesn't have to be one a sensor
+        // detected (house fire, medical, collapse). The zone's risk only
+        // changes the hint. (It used to unlock ONLY inside HIGH/CRITICAL
+        // zones, leaving people outside sensor coverage with no SOS.)
         const isHigh = areaSeverity === "HIGH" || areaSeverity === "CRITICAL";
-        sosBtn.disabled = !isHigh;
+        sosBtn.disabled = false;
         sosHintEl.innerText = isHigh
           ? translations[currentLang].sosHintUnlocked
-          : translations[currentLang].sosHintLocked;
+          : translations[currentLang].sosHintAvailable;
       }
 
       function requestLocation({ silent } = {}) {

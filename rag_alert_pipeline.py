@@ -112,6 +112,10 @@ def retrieve_context(
 
 
 def severity_band(risk_score: float) -> str:
+    # CRITICAL used to be unreachable even though the map radius, CAP
+    # "Extreme" and the UI all expect it (B17).
+    if risk_score > 0.9:
+        return "CRITICAL"
     if risk_score > 0.7:
         return "HIGH"
     elif risk_score > 0.4:
@@ -128,6 +132,10 @@ HAZARD_SOURCE_MAP = {
     "fire": "fire_response.txt",
     "gas leak": "gas_leak_response.txt",
     "gas": "gas_leak_response.txt",
+    "extreme heat": "extreme_heat_response.txt",
+    "landslide": "landslide_response.txt",
+    "air pollution": "air_pollution_response.txt",
+    "water quality degradation": "water_quality_response.txt",
 }
 
 

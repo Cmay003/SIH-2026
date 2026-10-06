@@ -1,0 +1,338 @@
+.page {
+  position: relative;
+  height: 100vh;
+  height: 100dvh;
+}
+
+.map {
+  height: 100%;
+  width: 100%;
+}
+
+/* ---- side panel ---- */
+.panel {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 1000;
+  width: 290px;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+  background: var(--surface);
+  color: var(--text);
+  padding: 12px 16px 14px;
+  border-radius: var(--radius);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  font-size: 14px;
+}
+.panel h1 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+.chipRow {
+  margin-bottom: 10px;
+}
+.count {
+  font-weight: bold;
+  color: var(--sev-high);
+}
+.allClear {
+  margin-top: 8px;
+  background: var(--green-light);
+  color: var(--green-dark);
+  font-weight: bold;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  .allClear {
+    color: #a5d6a7;
+  }
+}
+.resolveAll {
+  margin-top: 8px;
+  width: 100%;
+  background: var(--sos);
+  color: #fff;
+  border: none;
+  padding: 9px 10px;
+  border-radius: 8px;
+  font-weight: bold;
+  cursor: pointer;
+}
+.resolveAll:disabled {
+  background: #9aa1ab;
+  cursor: progress;
+}
+
+.section {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.sectionTitle {
+  font-weight: bold;
+  font-size: 14px;
+  margin: 0 0 6px;
+}
+
+/* ---- SOS queue (keyboard / screen-reader path to every SOS) ---- */
+.queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.queue li {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--sos);
+  border-radius: 8px;
+  padding: 7px 9px;
+}
+.queueEscalated {
+  background: var(--critical-bg);
+}
+.queueNote {
+  margin: 3px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.queueMeta {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.queueActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  align-items: center;
+}
+.queueActions button,
+.queueActions a {
+  font-size: 12.5px;
+  font-weight: bold;
+  border-radius: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+}
+.queueActions button:last-child {
+  background: #2e7d32;
+  border-color: #2e7d32;
+  color: #fff;
+}
+.queueActions button:disabled {
+  opacity: 0.7;
+  cursor: progress;
+}
+.nodeRow {
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.nodeRow:last-child {
+  border-bottom: none;
+}
+.dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.issue_critical {
+  font-size: 12.5px;
+  color: var(--sev-high);
+  font-weight: bold;
+  margin-left: 16px;
+}
+.issue_warning {
+  font-size: 12.5px;
+  color: var(--sev-medium);
+  margin-left: 16px;
+}
+.ok {
+  color: var(--green);
+}
+
+.legend {
+  font-size: 13px;
+  line-height: 1.7;
+}
+.swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.swatchPending {
+  composes: swatch;
+  border: 2px dashed orange;
+  width: 11px;
+  height: 11px;
+}
+
+/* ---- popups (Leaflet renders them light on any theme) ---- */
+.popup {
+  color: #1b1b1b;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.popup a {
+  display: block;
+  margin-top: 4px;
+  color: #1a73e8;
+  font-weight: bold;
+}
+.note {
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: #f4f6f8;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.escalated {
+  background: #d90429;
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+  font-weight: bold;
+}
+.resolveBtn {
+  margin-top: 8px;
+  background: #4caf50;
+  color: #fff;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.resolveBtn:disabled {
+  opacity: 0.7;
+  cursor: progress;
+}
+.errorText {
+  color: #c62828;
+  margin-top: 4px;
+}
+.insights h4 {
+  margin: 10px 0 2px;
+  font-size: 13.5px;
+}
+.muted {
+  color: #5f6b60;
+}
+
+/* ---- map markers ---- */
+.divIconReset {
+  background: none;
+  border: none;
+}
+.hazardIcon {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  border: 2px solid #fff;
+  cursor: pointer;
+}
+.iconHigh {
+  background: red;
+}
+.iconMedium {
+  background: orange;
+}
+.iconLow {
+  background: yellow;
+}
+.sosPinWrap {
+  position: relative;
+  width: 44px;
+  height: 54px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  cursor: pointer;
+}
+.sosPulse {
+  position: absolute;
+  bottom: 6px;
+  width: 40px;
+  height: 40px;
+  background: rgba(217, 4, 41, 0.35);
+  border-radius: 50%;
+  animation: sosPulse 1.6s infinite;
+}
+.sosPin {
+  position: relative;
+  z-index: 2;
+  font-size: 32px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
+}
+@keyframes sosPulse {
+  0% {
+    transform: scale(0.5);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+.focusRing {
+  animation: focusFade 3s ease-out forwards;
+}
+@keyframes focusFade {
+  0% {
+    stroke-opacity: 1;
+  }
+  100% {
+    stroke-opacity: 0;
+  }
+}
+
+/* ---- phones: panel becomes a collapsible top sheet ---- */
+.collapse {
+  display: none;
+}
+@media (max-width: 600px) {
+  .panel {
+    top: 0;
+    right: 0;
+    left: 0;
+    width: auto;
+    border-radius: 0 0 var(--radius) var(--radius);
+    max-height: 45vh;
+    padding: 8px 12px;
+  }
+  .panel h1 {
+    font-size: 15px;
+  }
+  .collapse {
+    display: inline-block;
+    float: right;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .collapsed .body {
+    display: none;
+  }
+}

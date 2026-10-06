@@ -1,0 +1,5 @@
+# Extra packages for training scripts only (not needed to run the backend):
+#   train_river_forecast.py, train_edge_model.py, quantize/verify edge model
+#   .\venv\Scripts\python.exe -m pip install -r requirements-training.txt
+-r requirements.txt
+tensorflow==2.21.0

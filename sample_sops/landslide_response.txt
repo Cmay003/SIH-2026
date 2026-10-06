@@ -1,0 +1,14 @@
+LANDSLIDE RESPONSE SOP
+
+LOW severity: Continue monitoring ground tilt and vibration. No action
+required.
+
+MEDIUM severity: Alert the local disaster management authority and
+public works department. Inspect the slope for new cracks, tilting trees
+or poles, and sudden muddy water in streams. Advise residents to avoid
+travel on hill roads near the affected slope.
+
+HIGH severity: Evacuate houses on and directly below the affected slope
+immediately and move people to stable ground away from the slope. Close
+roads passing through the slide zone and coordinate with NDRF/SDRF teams.
+Do not return until the area is declared safe by authorities.

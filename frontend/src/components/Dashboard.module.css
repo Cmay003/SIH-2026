@@ -1,0 +1,257 @@
+.main {
+  padding: 20px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.main h2 {
+  color: var(--green-dark);
+  margin: 28px 0 12px;
+}
+@media (prefers-color-scheme: dark) {
+  .main h2 {
+    color: #a5d6a7;
+  }
+}
+
+/* ---- KPI tiles ---- */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 15px;
+}
+@media (max-width: 900px) {
+  .tiles {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.tile {
+  background: var(--surface);
+  padding: 18px 20px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+.tiles {
+  margin: 0;
+}
+.tileLabel {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 15px;
+}
+.tileValue {
+  margin: 0;
+  font-size: 28px;
+  font-weight: bold;
+  color: var(--green-dark);
+  overflow-wrap: anywhere;
+}
+@media (prefers-color-scheme: dark) {
+  .tileValue {
+    color: #a5d6a7;
+  }
+}
+
+/* ---- Nearest hospital ---- */
+.hospital {
+  background: var(--green-light);
+  padding: 15px 20px;
+  border-radius: var(--radius);
+  margin-top: 20px;
+  border: 1px solid var(--green-mid);
+}
+.hospital a {
+  font-weight: bold;
+}
+
+/* ---- Critical hazard callout ---- */
+.cardLink {
+  text-decoration: none;
+  color: inherit;
+  display: block;
+}
+
+.critical {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  box-shadow: 0 3px 14px rgba(220, 38, 38, 0.18);
+  border: 2px solid var(--sev-high);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  transition: box-shadow 0.15s;
+}
+.cardLink:hover .critical {
+  box-shadow: 0 6px 20px rgba(220, 38, 38, 0.28);
+}
+.critical h3 {
+  margin: 0 0 6px;
+  font-size: 20px;
+  color: var(--critical-text);
+}
+.criticalScore {
+  font-size: 36px;
+  font-weight: 800;
+  color: var(--critical-text);
+  text-align: center;
+}
+.scoreLabel {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.allClear {
+  background: var(--green-light);
+  border: 1px solid var(--green-mid);
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  color: var(--green-dark);
+  font-weight: bold;
+}
+@media (prefers-color-scheme: dark) {
+  .allClear {
+    color: #a5d6a7;
+  }
+}
+
+.location {
+  color: var(--text-muted);
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.eta {
+  font-size: 13px;
+  background: var(--green-lighter);
+  padding: 8px 10px;
+  border-radius: 6px;
+  display: inline-block;
+}
+.critical .eta {
+  background: var(--critical-bg);
+}
+
+/* ---- Hazard cards ---- */
+.hazardGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 15px;
+}
+
+.hazardCard {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  border-left: 6px solid var(--border);
+  height: 100%;
+  transition: box-shadow 0.15s, transform 0.15s;
+}
+.cardLink:hover .hazardCard {
+  box-shadow: var(--shadow-hover);
+  transform: translateY(-2px);
+}
+.hazardCard h3 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+.MEDIUM {
+  border-left-color: var(--sev-medium);
+}
+.MEDIUM h3 {
+  color: var(--sev-medium);
+}
+.HIGH,
+.CRITICAL {
+  border-left-color: var(--sev-high);
+}
+.HIGH h3,
+.CRITICAL h3 {
+  color: var(--sev-high);
+}
+
+.scoreRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.score {
+  font-size: 22px;
+  font-weight: bold;
+}
+.hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--green);
+  font-weight: bold;
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ---- Sensor table ---- */
+.tableWrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+.table {
+  width: 100%;
+  min-width: 760px;
+  background: var(--surface);
+  border-collapse: collapse;
+}
+.table th,
+.table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  font-size: 14px;
+}
+.table th {
+  background: var(--green-dark);
+  color: #fff;
+  position: sticky;
+  top: 0;
+}
+.table tbody tr:hover {
+  background: var(--green-lighter);
+}
+.risk_LOW {
+  color: var(--sev-low);
+  font-weight: bold;
+}
+.risk_MEDIUM {
+  color: var(--sev-medium);
+  font-weight: bold;
+}
+.risk_HIGH,
+.risk_CRITICAL {
+  color: var(--sev-high);
+  font-weight: bold;
+}
+
+.errorBox {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-top: 16px;
+}

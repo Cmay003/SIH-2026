@@ -18,6 +18,7 @@
         body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: var(--page-bg); color: var(--text-dark); }
 
         header.topbar {
+            position: relative;
             background: linear-gradient(135deg, var(--green-dark), var(--green));
             color: white;
             padding: 22px 20px 20px;
@@ -28,6 +29,12 @@
         }
         .brand-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
         .brand-row h1 { margin: 0; font-size: 30px; letter-spacing: 0.5px; }
+        /* Signed-in user chip (auth-ui.js) - top-right on wide screens,
+           above the title on phones so it never covers the heading. */
+        .user-slot { position: absolute; top: 14px; right: 16px; }
+        @media (max-width: 700px) {
+            .user-slot { position: static; margin-bottom: 12px; }
+        }
         .status { margin-top: 10px; color: white; font-weight: bold; opacity: 0.95; }
         .status.error { color: #ffe1e1; }
 
@@ -88,6 +95,7 @@
 </head>
 <body>
     <header class="topbar">
+        <div id="sjUserChip" class="user-slot"></div>
         <div class="brand-row">
             <svg width="42" height="42" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                 <path d="M24 4 L42 11 V22 C42 33 34.5 41 24 44 C13.5 41 6 33 6 22 V11 Z"
@@ -141,6 +149,7 @@
     </main>
 
 
+    <script src="/auth-ui.js"></script>
     <script>
         let lastDevice = null;
 

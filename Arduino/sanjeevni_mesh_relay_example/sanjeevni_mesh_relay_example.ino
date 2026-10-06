@@ -1,3 +1,12 @@
+// =====================================================================
+// LEGACY SKETCH - kept for reference. For new nodes use
+// Arduino/sanjeevni_lora_node (offline flash queue, all sensors, LoRa,
+// secrets.h for WiFi/keys). This one has no offline queue (B18) and its
+// local water alert assumes an old 40 cm mount (B31).
+// Fill in WiFi / backend URL / DEVICE_KEY below before flashing - the
+// real values were removed from the code (B21); change the hotspot
+// password too, since the old one is still in git history.
+// =====================================================================
 /*
  * SANJEEVNI - ESP-NOW MESH RELAY EXAMPLE
  * =====================================================
@@ -42,10 +51,13 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
-const char* WIFI_SSID = "IQOO Z10X";
-const char* WIFI_PASSWORD = "123456789";
-const char* BACKEND_URL = "https://crusader-equate-spoon.ngrok-free.dev/api/ingest";
+const char* WIFI_SSID = "your-wifi-name";
+const char* WIFI_PASSWORD = "your-wifi-password";
+const char* BACKEND_URL = "https://your-ngrok-address.ngrok-free.app/api/ingest";
 const char* DEVICE_ID = "NODE-07"; // change per node
+// Device key from: node device_keys.js add <name> --nodes <this DEVICE_ID>
+// The backend refuses readings without a valid X-Device-Key.
+const char* DEVICE_KEY = "paste-the-key-printed-by-device_keys.js";
 
 // Fill in with the actual MAC addresses of nearby nodes this one should
 // relay through/for. Get each node's MAC via WiFi.macAddress() on boot.
@@ -111,6 +123,7 @@ bool sendReadingToBackend(const char* nodeId, float river, float temp, float hum
 
   http.addHeader("Content-Type", "application/json");
   http.addHeader("ngrok-skip-browser-warning", "true");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
 
   String json = "{";
   json += "\"node_id\":\"" + String(nodeId) + "\",";

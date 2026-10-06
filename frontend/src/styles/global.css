@@ -1,0 +1,121 @@
+/* SANJEEVNI design tokens - same palette as the original pages, plus a
+   dark theme. Components use these variables only (no raw colours), so
+   both themes stay consistent. */
+:root {
+  --green-dark: #1b5e20;
+  --green: #2e7d32;
+  --green-mid: #43a047;
+  --green-light: #e8f5e9;
+  --green-lighter: #f1f8f2;
+
+  --page-bg: #f6f9f6;
+  --surface: #ffffff;
+  --text: #1b1b1b;
+  --text-muted: #5f6b60;
+  --border: #dbe7dc;
+  --input-bg: #ffffff;
+  --shadow: 0 2px 8px rgba(27, 94, 32, 0.08);
+  --shadow-hover: 0 6px 18px rgba(27, 94, 32, 0.18);
+
+  --sev-medium: #e08a00;
+  --sev-high: #d32f2f;
+  --sev-low: var(--green);
+  --critical-bg: #fef2f2;
+  --critical-text: #b91c1c;
+  --danger: #c62828;
+  --danger-bg: #fdecea;
+  --info: #1a4f8b;
+  --info-bg: #e8f1fd;
+  --sos: #d90429;
+  --focus: #1a73e8;
+
+  --radius: 12px;
+  --font: Arial, Helvetica, sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page-bg: #0f1511;
+    --surface: #18211b;
+    --text: #e8efe9;
+    --text-muted: #9fb0a2;
+    --border: #2b3a30;
+    --input-bg: #111914;
+    --green-light: #1f3324;
+    --green-lighter: #1a2a1e;
+    --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    --shadow-hover: 0 6px 20px rgba(0, 0, 0, 0.5);
+    --sev-medium: #ffb74d;
+    --sev-high: #ff6b6b;
+    --sev-low: #81c784;
+    --critical-bg: #3a1a1a;
+    --critical-text: #ff8a80;
+    --danger: #ff8a80;
+    --danger-bg: #3a1a1a;
+    --info: #9cc3f5;
+    --info-bg: #15263b;
+    color-scheme: dark;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  background: var(--page-bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* "Skip to main content": hidden until a keyboard user tabs to it */
+.skip-link {
+  position: absolute;
+  left: 8px;
+  top: -60px;
+  z-index: 5000;
+  background: #fff;
+  color: #1b5e20;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-weight: bold;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+.skip-link:focus {
+  top: 8px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

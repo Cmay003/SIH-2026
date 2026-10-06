@@ -1,0 +1,13 @@
+WATER QUALITY RESPONSE SOP
+
+LOW severity: Continue monitoring pH and turbidity. No action required.
+
+MEDIUM severity: Notify the water supply and public health engineering
+department to test the source. Advise residents using this source to
+boil drinking water (rolling boil for at least one minute) or use
+treated water until results are available.
+
+HIGH severity: Stop using the affected source for drinking and cooking.
+Arrange an alternative safe water supply such as tankers. Collect water
+samples for laboratory testing and alert health facilities to watch for
+diarrhoea and other waterborne illness.

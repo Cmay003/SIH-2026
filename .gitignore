@@ -41,3 +41,19 @@ PPT.pptx
 up1.pdf
 up2.pdf
 progress.txt
+
+# Firmware secrets (WiFi passwords, backend URLs, APN) - see secrets.example.h
+Arduino/**/secrets.h
+
+# React build output (rebuild with: cd frontend; npm run build)
+frontend/dist/
+
+# SQLite write-ahead log files (server.js turns on WAL mode)
+*.db-wal
+*.db-shm
+
+# VS Code "Code Runner" scratch files (B27)
+tempCodeRunnerFile.*
+
+# Edge-model rebuild output (make_edge_dataset.py -> quantize_edge_model.py)
+edge_ai_build/

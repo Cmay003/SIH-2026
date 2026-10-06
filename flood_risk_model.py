@@ -152,10 +152,10 @@ def main():
     )[feature_cols]
 
     risk_score = model.predict_proba(example)[0, 1]
-    print(
-        f"Risk score: {risk_score}  |  Confidence band: "
-        f"{'LOW' if risk_score < 0.007 else 'MEDIUM' if risk_score < 0.0004 else 'HIGH'}"
-    )
+    # Same bands as the live system (the old thresholds here made MEDIUM
+    # unreachable: < 0.007 LOW, then < 0.0004 MEDIUM).
+    from rag_alert_pipeline import severity_band
+    print(f"Risk score: {risk_score:.3f}  |  Severity: {severity_band(risk_score)}")
 
     return model, feature_cols
 

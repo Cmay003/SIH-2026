@@ -1,0 +1,115 @@
+.header {
+  position: relative;
+  background: linear-gradient(135deg, var(--green-dark), var(--green));
+  color: #fff;
+  padding: 22px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 30px;
+  letter-spacing: 0.5px;
+}
+
+.status {
+  margin-top: 10px;
+  font-weight: bold;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #cfd8dc;
+}
+.connected {
+  background: #69f0ae;
+  box-shadow: 0 0 0 3px rgba(105, 240, 174, 0.25);
+}
+.disconnected {
+  background: #ff8a80;
+}
+.connecting {
+  background: #ffe082;
+}
+
+.userSlot {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 999px;
+  padding: 5px 6px 5px 12px;
+  font-size: 13px;
+}
+
+.role {
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.chip button {
+  border: none;
+  border-radius: 999px;
+  padding: 6px 11px;
+  font-weight: bold;
+  font-size: 12.5px;
+  cursor: pointer;
+  background: #fff;
+  color: var(--green-dark);
+}
+.chip button:hover {
+  filter: brightness(0.93);
+}
+.chip button:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+/* On a white surface (officer panel) instead of the green header */
+.chipLight {
+  background: var(--green-lighter);
+  border-color: var(--border);
+  color: var(--text);
+}
+.chipLight .role {
+  background: var(--green-light);
+  color: var(--green-dark);
+}
+.chipLight button {
+  background: var(--green);
+  color: #fff;
+}
+
+/* Phones: chip sits above the title instead of covering it */
+@media (max-width: 700px) {
+  .userSlot {
+    position: static;
+    margin-bottom: 12px;
+  }
+}

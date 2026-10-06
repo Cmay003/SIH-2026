@@ -1,0 +1,13 @@
+AIR POLLUTION RESPONSE SOP
+
+LOW severity: Continue monitoring PM2.5 and PM10. No action required.
+
+MEDIUM severity: Issue an air quality advisory. Children, elderly people
+and people with asthma, lung or heart disease should reduce prolonged
+outdoor exertion. Authorities should check nearby sources such as open
+burning and construction dust.
+
+HIGH severity: Advise everyone to avoid outdoor exertion, keep windows
+closed and wear N95 masks outdoors. Alert health facilities to expect
+more respiratory complaints. Authorities should act against local
+pollution sources such as open burning and uncovered construction dust.

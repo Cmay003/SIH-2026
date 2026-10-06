@@ -8,48 +8,116 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const { DatabaseSync } = require("node:sqlite");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(express.json({ limit: "10mb" })); // raised for base64 photo uploads (citizen hazard reports)
+app.use(express.json({
+  limit: "10mb", // raised for base64 photo uploads (citizen hazard reports)
+  // Keep the exact bytes of WhatsApp webhooks: Meta's signature is computed
+  // over the raw body, not the re-serialised JSON (see verifyMetaSignature).
+  verify: (req, res, buf) => {
+    if (req.originalUrl.startsWith("/api/whatsapp/webhook")) req.rawBody = buf;
+  },
+}));
 app.use(cors());
-// Serve ONLY the public/ folder. Serving __dirname exposed sanjeevni.db,
-// backups/*.db (citizen SOS locations), models and source to anyone.
-app.use(express.static(path.join(__dirname, "public")));
+// nosniff, referrer policy, no framing, permissions - on every response
+const { basicSecurityHeaders, setReactPageCsp } = require("./security_headers");
+app.use(basicSecurityHeaders);
+// Behind ngrok/a reverse proxy on the same machine: trust its
+// X-Forwarded-Proto/-For so req.secure (Secure cookies) and req.ip (login
+// rate limiting) reflect the real client.
+app.set("trust proxy", "loopback");
 
-// --- UPGRADE: authentication on officer dashboard + SOS API ------------
-// Simple API-key auth (X-API-Key header) for OFFICER-facing actions -
-// viewing all SOS locations, resolving them. Citizen-facing endpoints
-// (submitting an SOS, viewing hazards, ESP32 ingestion) stay open, since
-// those need to work for anonymous citizens and unauthenticated field
-// hardware by design.
+// --- Authentication ----------------------------------------------------
+// Dashboard (index.html) and officer page (officer.html) need a login -
+// see auth.js; accounts via `node create_user.js add <name> <role>`.
+// Citizen-facing endpoints (SOS, public hazard map, ESP32 ingestion) stay
+// open by design: a person in danger can't be asked to log in.
 //
-// SECURITY NOTE: never hardcode a real secret. This falls back to a
-// clearly-labeled DEMO key ONLY so the existing demo flow doesn't break
-// if you haven't set OFFICER_API_KEY yet - replace it before any real
-// deployment. Set a real one via: export OFFICER_API_KEY="your-real-key"
-const OFFICER_API_KEY =
-  process.env.OFFICER_API_KEY || "sanjeevni-demo-key-CHANGE-ME";
-if (!process.env.OFFICER_API_KEY) {
-  console.warn(
-    "\n[SECURITY WARNING] OFFICER_API_KEY is not set - using an insecure " +
-      "default demo key. Set a real one via environment variable before " +
-      'any real deployment: export OFFICER_API_KEY="your-real-key"\n',
-  );
-}
-
-function requireOfficerAuth(req, res, next) {
-  const providedKey = req.headers["x-api-key"];
-  if (providedKey !== OFFICER_API_KEY) {
-    return res
-      .status(401)
-      .json({ error: "Unauthorized - valid X-API-Key header required" });
-  }
-  next();
+// OFFICER_API_KEY (X-API-Key header) still works for scripts and admin
+// tools. It is DISABLED when not set - the old fallback demo key was
+// published in the repo, so anyone could have used it to skip the login.
+const OFFICER_API_KEY = process.env.OFFICER_API_KEY || null;
+if (!OFFICER_API_KEY) {
+  console.warn("[auth] OFFICER_API_KEY not set - X-API-Key access disabled; officers log in instead.");
 }
 
 const db = new DatabaseSync(path.join(__dirname, "sanjeevni.db"));
+// Two processes (this and backend_server.py) write the same SQLite file.
+// WAL lets readers and a writer work at the same time, and busy_timeout
+// makes a writer wait instead of failing with "database is locked" (B23).
+db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+
+const { setupAuth } = require("./auth");
+const auth = setupAuth(app, db, { officerApiKey: OFFICER_API_KEY });
+const requireOfficerAuth = auth.requireOfficer;
+// Sensor ingestion needs a device key (review R1) - see device_auth.js
+const device = require("./device_auth").setupDeviceAuth(db);
+
+// --- Pages -------------------------------------------------------------
+// The React build (frontend/dist - `npm run build` in frontend/) is served
+// by DEFAULT. FRONTEND=classic switches back to the old public/ pages.
+// A page missing from the build (or no build at all) falls back to the
+// classic page automatically, so the site keeps working either way.
+const PUBLIC_DIR = path.join(__dirname, "public");
+const REACT_DIR = path.join(__dirname, "frontend", "dist");
+const USE_REACT = process.env.FRONTEND !== "classic";
+if (USE_REACT && !fs.existsSync(path.join(REACT_DIR, "index.html"))) {
+  console.warn("[frontend] frontend/dist not built - serving classic pages. Build it: cd frontend; npm install; npm run build");
+}
+console.log(`[frontend] ${USE_REACT ? "React pages (FRONTEND=classic for the old ones)" : "classic pages (FRONTEND=classic)"}`);
+
+function sendPage(res, name) {
+  const reactFile = path.join(REACT_DIR, name);
+  if (USE_REACT && fs.existsSync(reactFile)) {
+    setReactPageCsp(res); // strict CSP: React pages have no inline script/style
+    return res.sendFile(reactFile);
+  }
+  return res.sendFile(path.join(PUBLIC_DIR, name));
+}
+
+// Protected pages are matched on the DECODED file name, before any static
+// folder. Matching the raw URL let "/officer%2Ehtml" or "/%69ndex.html"
+// skip the login check, because express.static decodes the path itself and
+// then served the page. Lower-cased + trailing dots/spaces stripped because
+// Windows file lookups ignore both.
+const PROTECTED_PAGES = new Map([
+  ["", { file: "index.html", roles: null }], // "/"
+  ["index.html", { file: "index.html", roles: null }],
+  ["officer.html", { file: "officer.html", roles: auth.OFFICER_ROLES }],
+]);
+app.use((req, res, next) => {
+  if (req.method !== "GET" && req.method !== "HEAD") return next();
+  let decoded;
+  try {
+    decoded = decodeURIComponent(req.path);
+  } catch {
+    return res.status(400).send("Bad request");
+  }
+  const name = path.posix.basename(decoded.replace(/\\/g, "/")).replace(/[. ]+$/, "").toLowerCase();
+  const page = PROTECTED_PAGES.get(decoded === "/" ? "" : name);
+  if (!page) return next();
+  auth.requirePage(page.roles)(req, res, () => sendPage(res, page.file));
+});
+app.get("/login.html", (req, res) => sendPage(res, "login.html")); // auth.js already redirected signed-in users
+
+// Static files: ONLY the frontend folders. Serving __dirname exposed
+// sanjeevni.db, backups/*.db (citizen SOS locations), models and source.
+if (USE_REACT) {
+  app.use(express.static(REACT_DIR, {
+    index: false,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith(".html")) setReactPageCsp(res); // e.g. sos.html
+    },
+  }));
+}
+app.use(express.static(PUBLIC_DIR, { index: false }));
+
+// Public health check for the citizen page ("can I reach the server?") -
+// reveals nothing, unlike the full sensor feed it used to call.
+app.get("/api/status", (req, res) => res.json({ ok: true }));
 
 // --- UPGRADE: redundant database (lightweight backup routine) ----------
 // Full geographic/multi-host redundancy needs real infrastructure (a
@@ -75,7 +143,10 @@ function backupDatabase() {
   }
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupPath = path.join(BACKUPS_DIR, `sanjeevni_backup_${timestamp}.db`);
-  fs.copyFileSync(DB_FILE_PATH, backupPath);
+  // VACUUM INTO writes a consistent snapshot through SQLite itself; copying
+  // the file could catch a half-written page, and in WAL mode would miss
+  // changes still in the -wal file (B23).
+  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
 
   // Prune old backups beyond the retention count, oldest first
   const existingBackups = fs
@@ -131,16 +202,26 @@ const selectHistory = db.prepare(
 
 // Latest reading per node that currently has an active (MEDIUM+) hazard -
 // used for both the map overlay and the numbered hazard list.
-const selectActiveHazards = db.prepare(`
+// Public views only show CONFIRMED alerts (status 'alert_dispatched'):
+// an alert waiting for multi-node / repeat confirmation
+// ('pending_confirmation', see hazard_confirmation.py) is visible to
+// officers only, so one glitching sensor can't put a hazard on the
+// citizen map.
+const ACTIVE_HAZARD_SQL = (statuses) => `
   SELECT sd.node_id, sd.location, sd.hazard_type, sd.severity, sd.risk_score,
-         sd.eta_minutes, sd.predicted_time, sd.latitude, sd.longitude
+         sd.eta_minutes, sd.predicted_time, sd.latitude, sd.longitude, sd.status
   FROM sensor_data sd
   INNER JOIN (
     SELECT node_id, MAX(id) as max_id FROM sensor_data GROUP BY node_id
   ) latest ON sd.node_id = latest.node_id AND sd.id = latest.max_id
   WHERE sd.severity IN ('MEDIUM','HIGH','CRITICAL')
+    AND sd.status IN (${statuses})
   ORDER BY sd.risk_score DESC
-`);
+`;
+const selectActiveHazards = db.prepare(ACTIVE_HAZARD_SQL("'alert_dispatched'"));
+const selectActiveAndPendingHazards = db.prepare(
+  ACTIVE_HAZARD_SQL("'alert_dispatched','pending_confirmation'"),
+);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS sos_requests (
@@ -217,23 +298,18 @@ if (!fs.existsSync(CITIZEN_UPLOADS_DIR)) {
 }
 app.use("/citizen_uploads", express.static(CITIZEN_UPLOADS_DIR));
 
-const NODE_INFO = {
-  "NODE-04": {
-    location: "Sector 4, Riverside",
-    latitude: 29.3919,
-    longitude: 79.4542,
-  },
-  "NODE-07": {
-    location: "Sector 7, Hillside",
-    latitude: 29.4002,
-    longitude: 79.461,
-  },
-  "NODE-INDB": {
-    location: "Industrial Zone B",
-    latitude: 29.385,
-    longitude: 79.448,
-  },
-};
+// Node locations come from the `nodes` table that backend_server.py owns
+// (admin API). A hard-coded copy here meant nodes added through the admin
+// API got 404 on /api/route and no map position fallback (B14).
+let selectNodeInfo = null;
+function nodeInfo(nodeId) {
+  try {
+    selectNodeInfo ??= db.prepare("SELECT location, latitude, longitude FROM nodes WHERE node_id = ?");
+    return selectNodeInfo.get(nodeId) || null;
+  } catch {
+    return null; // backend not started yet -> table doesn't exist yet
+  }
+}
 
 // Responder / control room base - where rescue teams are dispatched from.
 // Replace with your actual station coordinates.
@@ -297,58 +373,149 @@ function etaText(hazard_type, severity, eta_minutes, predicted_time) {
   return `Expected to reach critical level in ~${duration} (around ${when})`;
 }
 
-// 1. Ingestion endpoint - ESP32 / simulator sends raw readings here
-app.post("/api/ingest", async (req, res) => {
-  try {
-    const sensorData = req.body;
+const PYTHON_BACKEND_URL = "http://127.0.0.1:8000";
 
+// Stores one AI result in the dashboard table. Duplicates (a store-and-
+// forward retry of a reading the backend already has) and rejected
+// readings are skipped so they can't appear twice on the dashboard.
+function storeDashboardRow(sensorData, aiResult) {
+  // Not shown on the dashboard: duplicates, rejected/errored readings, and
+  // "untimed" backlog readings (time unknown - stored, but not live data)
+  if (!aiResult || ["duplicate", "rejected", "error", "untimed"].includes(aiResult.status)) {
+    return;
+  }
+  const info = nodeInfo(sensorData.node_id) || {};
+
+  insertReading.run(
+    sensorData.node_id,
+    aiResult.location || info.location || null,
+    aiResult.hazard_type || null,
+    aiResult.severity || null,
+    aiResult.risk_score ?? null,
+    // CHANGED: previously used sensorData.river_level_m - the RAW value
+    // straight from the ESP32's POST body (uninverted ultrasonic
+    // distance). The Python backend computes and returns the CORRECTED
+    // water level in aiResult.river_level_m (see backend_server.py's
+    // convert_ultrasonic_distance_to_water_level_m()) - but this
+    // dashboard-facing table was still storing the raw, backwards
+    // value, so the "Water Level" column kept showing distance
+    // decreasing as water/your hand got closer, even though the AI's
+    // actual severity scoring was already using the corrected value
+    // internally. Falls back to the raw value only if the backend
+    // response is somehow missing it entirely.
+    aiResult.river_level_m ?? sensorData.river_level_m ?? null,
+    sensorData.temp_c ?? null,
+    sensorData.humidity_pct ?? null,
+    sensorData.gas_ppm ?? null,
+    aiResult.status,
+    aiResult.message || null,
+    aiResult.eta_minutes ?? null,
+    aiResult.predicted_time || null,
+    aiResult.latitude ?? info.latitude ?? null,
+    aiResult.longitude ?? info.longitude ?? null,
+    aiResult.timestamp || new Date().toISOString(),
+  );
+
+  // Confirmed alerts -> opted-in WhatsApp subscribers nearby. Not awaited:
+  // a slow/failed WhatsApp call must never delay or fail ingestion.
+  // Never for simulated readings (review R3: a simulator demo used to send
+  // real alerts to real subscribers) unless explicitly enabled for a demo
+  // to the team's own phones.
+  const simulated = sensorData.simulated === true;
+  if (aiResult.status === "alert_dispatched" && (!simulated || WHATSAPP_ALERTS_FOR_SIMULATED)) {
+    queueSubscriberAlert({ ...aiResult, node_id: aiResult.node_id || sensorData.node_id });
+  }
+}
+
+// Passes the Python backend's own status code through (e.g. 400 for an
+// unknown node_id) instead of turning everything into 500. Nodes rely on
+// this: 4xx = drop the reading from the local queue (resending won't
+// help), 5xx / no response = keep it queued and retry later.
+function sendPipelineError(res, error) {
+  const status = error.response ? error.response.status : 502;
+  const detail = error.response ? error.response.data : error.message;
+  console.error("Pipeline error:", status, error.message);
+  res.status(status).json({ status: "error", detail });
+}
+
+// 1. Ingestion endpoint - ESP32 / simulator sends raw readings here.
+// Requires a device key (device_auth.js) allowed to report for this node.
+app.post("/api/ingest", device.requireDeviceKey, async (req, res) => {
+  try {
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+      return res.status(400).json({ error: "body must be one reading object" });
+    }
+    if (!device.nodeAllowed(req.device, req.body.node_id)) {
+      return res.status(403).json({ error: `Device key '${req.device.name}' may not report for ${req.body.node_id}` });
+    }
+    const sensorData = device.applyKeyPolicy(req.device, req.body);
     const pythonResponse = await axios.post(
-      "http://127.0.0.1:8000/api/ingest",
+      `${PYTHON_BACKEND_URL}/api/ingest`,
       sensorData,
     );
     const aiResult = pythonResponse.data;
-
-    const info = NODE_INFO[sensorData.node_id] || {};
-
-    insertReading.run(
-      sensorData.node_id,
-      aiResult.location || info.location || null,
-      aiResult.hazard_type || null,
-      aiResult.severity || null,
-      aiResult.risk_score ?? null,
-      // CHANGED: previously used sensorData.river_level_m - the RAW value
-      // straight from the ESP32's POST body (uninverted ultrasonic
-      // distance). The Python backend computes and returns the CORRECTED
-      // water level in aiResult.river_level_m (see backend_server.py's
-      // convert_ultrasonic_distance_to_water_level_m()) - but this
-      // dashboard-facing table was still storing the raw, backwards
-      // value, so the "Water Level" column kept showing distance
-      // decreasing as water/your hand got closer, even though the AI's
-      // actual severity scoring was already using the corrected value
-      // internally. Falls back to the raw value only if the backend
-      // response is somehow missing it entirely.
-      aiResult.river_level_m ?? sensorData.river_level_m ?? null,
-      sensorData.temp_c ?? null,
-      sensorData.humidity_pct ?? null,
-      sensorData.gas_ppm ?? null,
-      aiResult.status,
-      aiResult.message || null,
-      aiResult.eta_minutes ?? null,
-      aiResult.predicted_time || null,
-      aiResult.latitude ?? info.latitude ?? null,
-      aiResult.longitude ?? info.longitude ?? null,
-      aiResult.timestamp || new Date().toISOString(),
-    );
-
+    storeDashboardRow(sensorData, aiResult);
     res.status(200).json({ status: "success", ai_action: aiResult.status });
   } catch (error) {
-    console.error("Pipeline error:", error.message);
-    res.status(500).json({ status: "error", detail: error.message });
+    sendPipelineError(res, error);
+  }
+});
+
+// 1b. Store-and-forward upload - a node or LoRa gateway sends readings it
+// queued while offline, in one request ({ readings: [...] }). The response
+// lists one status per reading, in the same order, so the sender knows
+// which queue entries it can delete.
+app.post("/api/ingest/batch", device.requireDeviceKey, async (req, res) => {
+  try {
+    const submitted = Array.isArray(req.body?.readings) ? req.body.readings : null;
+    if (!submitted || submitted.some((r) => !r || typeof r !== "object" || Array.isArray(r))) {
+      return res.status(400).json({ error: "body must be { readings: [ {reading}, ... ] }" });
+    }
+    // Readings for nodes this key may not report for are rejected one by
+    // one; the rest still go through (one misconfigured node must not
+    // block every other node's live data).
+    const results = new Array(submitted.length);
+    const allowedIdx = [];
+    submitted.forEach((r, i) => {
+      if (device.nodeAllowed(req.device, r.node_id)) {
+        allowedIdx.push(i);
+      } else {
+        results[i] = { status: "rejected", node_id: r.node_id, reading_uid: r.reading_uid ?? null,
+          detail: `device key '${req.device.name}' may not report for ${r.node_id}` };
+        console.warn(`[ingest] rejected reading for ${r.node_id}: key '${req.device.name}' is not allowed for it`);
+      }
+    });
+    const readings = allowedIdx.map((i) => device.applyKeyPolicy(req.device, submitted[i]));
+    if (readings.length) {
+      const pythonResponse = await axios.post(
+        `${PYTHON_BACKEND_URL}/api/ingest/batch`,
+        { readings },
+      );
+      pythonResponse.data.results.forEach((r, k) => {
+        results[allowedIdx[k]] = r;
+      });
+    }
+    // Insert oldest-first so the dashboard's "latest per node" (MAX(id))
+    // ends up as the newest reading, matching the backend's order.
+    readings
+      .map((sensorData, k) => ({ sensorData, aiResult: results[allowedIdx[k]] }))
+      .sort((a, b) => String(a.aiResult?.timestamp ?? "").localeCompare(String(b.aiResult?.timestamp ?? "")))
+      .forEach(({ sensorData, aiResult }) => storeDashboardRow(sensorData, aiResult));
+    res.status(200).json({
+      status: "success",
+      results: results.map((r) => ({
+        node_id: r.node_id,
+        reading_uid: r.reading_uid ?? null,
+        ai_action: r.status,
+      })),
+    });
+  } catch (error) {
+    sendPipelineError(res, error);
   }
 });
 
 // 2. Dashboard feed - shaped for index.html
-app.get("/api/sensors", (req, res) => {
+app.get("/api/sensors", auth.requireLogin, (req, res) => {
   const limit = parseInt(req.query.limit || "50", 10);
   const rows = selectSensors.all(limit);
 
@@ -368,13 +535,13 @@ app.get("/api/sensors", (req, res) => {
 });
 
 // 3. Raw history (unshaped)
-app.get("/api/history", (req, res) => {
+app.get("/api/history", auth.requireLogin, (req, res) => {
   res.json(selectHistory.all());
 });
 
 // 4. Nearest hospital + directions link for a given sensor node
-app.get("/api/route/:node_id", (req, res) => {
-  const coords = NODE_INFO[req.params.node_id];
+app.get("/api/route/:node_id", auth.requireLogin, (req, res) => {
+  const coords = nodeInfo(req.params.node_id);
   if (!coords) {
     return res.status(404).json({ error: "unknown node_id" });
   }
@@ -501,16 +668,46 @@ function parseCoordinates(latitude, longitude) {
 
 const MAX_NOTE_LENGTH = 500;
 
+// Spam protection for the public endpoints (B20). Deliberately GENEROUS:
+// on mobile networks many people share one IP (carrier-grade NAT), and a
+// real SOS must never be blocked - these limits only stop floods.
+function makeRateLimiter(windowMs, max) {
+  const hits = new Map();
+  return function limited(key) {
+    const now = Date.now();
+    if (hits.size > 10000) {
+      for (const [k, e] of hits) if (now - e.start > windowMs) hits.delete(k);
+    }
+    const entry = hits.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      hits.set(key, { start: now, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > max;
+  };
+}
+const sosPerNetwork = makeRateLimiter(10 * 60 * 1000, 30);
+const sosPerDevice = makeRateLimiter(60 * 60 * 1000, 5);
+const reportsPerNetwork = makeRateLimiter(10 * 60 * 1000, 20);
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9:._-]{3,100}$/;
+
 app.post("/api/sos", (req, res) => {
   const { note, device_id } = req.body;
+  if (typeof device_id === "string" && DEVICE_ID_PATTERN.test(device_id) &&
+      (sosPerDevice(device_id) || sosPerNetwork(req.ip))) {
+    return res.status(429).json({
+      error: "Too many SOS requests from this device or network. If you are in danger, call 112 now.",
+    });
+  }
   const coords = parseCoordinates(req.body.latitude, req.body.longitude);
   if (!coords) {
     return res
       .status(400)
       .json({ error: "valid numeric latitude and longitude are required" });
   }
-  if (!device_id || typeof device_id !== "string") {
-    return res.status(400).json({ error: "device_id is required" });
+  if (!device_id || typeof device_id !== "string" || !DEVICE_ID_PATTERN.test(device_id)) {
+    return res.status(400).json({ error: "device_id is required (3-100 letters, digits or : . _ -)" });
   }
   if (note != null && typeof note !== "string") {
     return res.status(400).json({ error: "note must be a string" });
@@ -632,8 +829,15 @@ app.post("/api/sos/resolve-all", requireOfficerAuth, (req, res) => {
 });
 
 // 8. Hazard zones for the map - latest reading per node with MEDIUM+ severity
-app.get("/api/hazard-zones", (req, res) => {
-  const rows = selectActiveHazards.all();
+// ?include_pending=1 (officer map) also returns alerts still waiting for
+// confirmation, marked confirmed: false - officers only, since an
+// unconfirmed alert isn't reliable enough for the public yet.
+const requireOfficerForPending = (req, res, next) =>
+  req.query.include_pending === "1" ? requireOfficerAuth(req, res, next) : next();
+
+app.get("/api/hazard-zones", requireOfficerForPending, (req, res) => {
+  const includePending = req.query.include_pending === "1";
+  const rows = (includePending ? selectActiveAndPendingHazards : selectActiveHazards).all();
   const zones = rows
     .filter((r) => r.latitude != null && r.longitude != null)
     .map((r) => ({
@@ -644,8 +848,47 @@ app.get("/api/hazard-zones", (req, res) => {
       latitude: r.latitude,
       longitude: r.longitude,
       radius_m: HAZARD_RADIUS_M[r.severity] || 500,
+      confirmed: r.status === "alert_dispatched",
     }));
   res.json({ success: true, zones });
+});
+
+// River-level forecast for one node (+30/+60 min, LSTM vs linear) - see
+// river_forecast.py. Indicative only: trained on synthetic hydrology.
+app.get("/api/forecast/:node_id", auth.requireLogin, async (req, res) => {
+  try {
+    const pythonResponse = await axios.get(
+      `${PYTHON_BACKEND_URL}/api/forecast/${encodeURIComponent(req.params.node_id)}`,
+    );
+    res.json(pythonResponse.data);
+  } catch (error) {
+    sendPipelineError(res, error);
+  }
+});
+
+// Sentinel-1 radar flood cross-check (officer-only; uses the team's
+// Copernicus quota) - see satellite_check.py.
+app.get("/api/satellite-check/:node_id", requireOfficerAuth, async (req, res) => {
+  try {
+    const pythonResponse = await axios.get(
+      `${PYTHON_BACKEND_URL}/api/satellite-check/${encodeURIComponent(req.params.node_id)}`,
+      { timeout: 90000 },
+    );
+    res.json(pythonResponse.data);
+  } catch (error) {
+    sendPipelineError(res, error);
+  }
+});
+
+// Node health / missing-node alerts (officer-only), computed by the
+// Python backend from each node's last report, battery, signal and drift.
+app.get("/api/node-health", requireOfficerAuth, async (req, res) => {
+  try {
+    const pythonResponse = await axios.get(`${PYTHON_BACKEND_URL}/api/node-health`);
+    res.json(pythonResponse.data);
+  } catch (error) {
+    sendPipelineError(res, error);
+  }
 });
 
 // 9. Active hazards, numbered, for the dashboard list - location, AI risk
@@ -680,6 +923,9 @@ app.get("/api/hazards", (req, res) => {
 // Public endpoint - any citizen can submit, no auth (same philosophy as
 // SOS submission: reporting a hazard should never be gated behind a login).
 app.post("/api/citizen-reports", (req, res) => {
+  if (reportsPerNetwork(req.ip)) {
+    return res.status(429).json({ error: "Too many reports from this network - please wait a few minutes. In danger? Call 112." });
+  }
   const { description, photo_base64 } = req.body;
   const coords = parseCoordinates(req.body.latitude, req.body.longitude);
   if (!coords) {
@@ -800,10 +1046,23 @@ if (
   );
 }
 
+// Dry run: log WhatsApp messages instead of sending them. On automatically
+// when the API isn't configured, so alerts can be demoed/tested without a
+// Meta account; force it with WHATSAPP_DRY_RUN=1.
+// Simulated readings never alert real people (review R3) unless this is
+// set on purpose, e.g. to demo alerts to the team's own phones.
+const WHATSAPP_ALERTS_FOR_SIMULATED = process.env.WHATSAPP_ALERTS_FOR_SIMULATED === "1";
+const WHATSAPP_DRY_RUN =
+  process.env.WHATSAPP_DRY_RUN === "1" || !WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID;
+
 // Sends a freeform WhatsApp text message. Only works within Meta's 24h
 // customer-service window after the recipient messaged first (see the
 // setup note above) - use sendWhatsAppTemplate() for anything proactive.
 async function sendWhatsAppText(toPhone, body) {
+  if (WHATSAPP_DRY_RUN) {
+    console.log(`[WhatsApp dry-run] text to ${toPhone}: ${body}`);
+    return { dryRun: true };
+  }
   const url = `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
   return axios.post(
     url,
@@ -832,6 +1091,10 @@ async function sendWhatsAppTemplate(
   languageCode,
   bodyParams,
 ) {
+  if (WHATSAPP_DRY_RUN) {
+    console.log(`[WhatsApp dry-run] template '${templateName}' to ${toPhone}: ${JSON.stringify(bodyParams)}`);
+    return { dryRun: true };
+  }
   const url = `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
   return axios.post(
     url,
@@ -887,6 +1150,175 @@ function parseWhatsAppMessage(payload) {
   }
 }
 
+// =====================================================================
+// Proactive hazard alerts to opted-in WhatsApp users (PPT slide 5)
+// =====================================================================
+// Opt-in only: a citizen sends ALERTS ON, then shares a location; STOP
+// unsubscribes. Only CONFIRMED alerts (status 'alert_dispatched', never
+// 'pending_confirmation') are sent, to subscribers inside the hazard
+// radius + WHATSAPP_ALERT_BUFFER_M.
+//
+// Uses a pre-approved message TEMPLATE (Meta requires one for messages
+// the user didn't just ask for). Create it in WhatsApp Manager with 4
+// body variables, e.g. (category: Utility):
+//   "SANJEEVNI alert: {{1}} risk is {{2}} near {{3}}. {{4}} Reply STOP to unsubscribe."
+// and set WHATSAPP_ALERT_TEMPLATE / WHATSAPP_ALERT_TEMPLATE_LANG in .env.
+//
+// Stored: phone number + chosen location only, deleted on STOP. Mention
+// this in your privacy notice (India's DPDP Act 2023 requires a clear
+// purpose and consent - opt-in covers consent).
+const WHATSAPP_ALERT_TEMPLATE = process.env.WHATSAPP_ALERT_TEMPLATE || "sanjeevni_hazard_alert";
+const WHATSAPP_ALERT_TEMPLATE_LANG = process.env.WHATSAPP_ALERT_TEMPLATE_LANG || "en";
+const WHATSAPP_ALERT_MIN_SEVERITY = process.env.WHATSAPP_ALERT_MIN_SEVERITY || "MEDIUM";
+const WHATSAPP_ALERT_BUFFER_M = 1000;
+const WHATSAPP_ALERT_REPEAT_MINUTES = 60; // same hazard, same person: at most once an hour unless it escalates
+const ALERT_LOCATION_WAIT_MINUTES = 15; // after ALERTS ON, the next location within this time is for alerts
+const SEVERITY_RANK = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 };
+
+const ALERT_OPT_IN_WORDS = new Set(["ALERTS ON", "ALERT ON", "JOIN", "SUBSCRIBE"]);
+const ALERT_OPT_OUT_WORDS = new Set(["STOP", "ALERTS OFF", "ALERT OFF", "UNSUBSCRIBE"]);
+const SOS_WORDS = new Set(["SOS", "HELP", "EMERGENCY"]);
+const normalizeCommand = (text) => String(text || "").trim().toUpperCase().replace(/\s+/g, " ");
+
+// One-line advice per hazard for the template's {{4}} - consistent with
+// sample_sops/. Meta rejects template parameters with newlines/tabs.
+const HAZARD_ADVICE = {
+  flood: "Move to higher ground and avoid flooded roads and bridges.",
+  "gas leak": "Leave the area, avoid flames and electrical switches.",
+  fire: "Move away from the fire and follow official evacuation advice.",
+  "extreme heat": "Drink water often, stay out of the sun 12-3 pm, call 112 for heatstroke.",
+  landslide: "Move away from the slope and avoid hill roads nearby.",
+  "air pollution": "Limit outdoor activity; wear an N95 mask outdoors.",
+  "water quality degradation": "Do not drink untreated water from this source; boil water.",
+};
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS whatsapp_subscribers (
+    phone TEXT PRIMARY KEY,
+    latitude REAL,
+    longitude REAL,
+    status TEXT,          -- 'awaiting_location' | 'active'
+    updated_at TEXT
+  )
+`);
+// When the subscriber last sent ALERTS ON (their next location within
+// ALERT_LOCATION_WAIT_MINUTES is for alerts). Kept separate from status so
+// an ACTIVE subscriber who sends ALERTS ON again stays active (review R10:
+// they used to drop to 'awaiting_location' forever and get no alerts).
+if (!db.prepare("PRAGMA table_info(whatsapp_subscribers)").all().some((c) => c.name === "awaiting_since")) {
+  db.exec("ALTER TABLE whatsapp_subscribers ADD COLUMN awaiting_since TEXT");
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS whatsapp_alert_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT,
+    node_id TEXT,
+    hazard_type TEXT,
+    severity TEXT,
+    sent_at TEXT,
+    dry_run INTEGER
+  )
+`);
+const selectSubscriber = db.prepare("SELECT * FROM whatsapp_subscribers WHERE phone=?");
+const insertAwaitingSubscriber = db.prepare(`
+  INSERT INTO whatsapp_subscribers (phone, status, updated_at, awaiting_since)
+  VALUES (?, 'awaiting_location', ?, ?)
+  ON CONFLICT(phone) DO UPDATE SET awaiting_since=excluded.awaiting_since, updated_at=excluded.updated_at
+`); // existing subscribers keep their status and location
+const activateSubscriber = db.prepare(`
+  INSERT INTO whatsapp_subscribers (phone, latitude, longitude, status, updated_at, awaiting_since)
+  VALUES (?, ?, ?, 'active', ?, NULL)
+  ON CONFLICT(phone) DO UPDATE SET latitude=excluded.latitude, longitude=excluded.longitude,
+    status='active', updated_at=excluded.updated_at, awaiting_since=NULL
+`);
+const deleteSubscriber = db.prepare("DELETE FROM whatsapp_subscribers WHERE phone=?");
+const selectActiveSubscribers = db.prepare(
+  "SELECT * FROM whatsapp_subscribers WHERE status='active' AND latitude IS NOT NULL",
+);
+const selectLastAlertSent = db.prepare(`
+  SELECT severity, sent_at FROM whatsapp_alert_log
+  WHERE phone=? AND node_id=? AND hazard_type=? ORDER BY id DESC LIMIT 1
+`);
+const insertAlertLog = db.prepare(`
+  INSERT INTO whatsapp_alert_log (phone, node_id, hazard_type, severity, sent_at, dry_run)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+function startAlertSubscription(phone) {
+  const now = new Date().toISOString();
+  insertAwaitingSubscriber.run(phone, now, now);
+}
+
+function isAwaitingAlertLocation(phone) {
+  const sub = selectSubscriber.get(phone);
+  if (!sub || !sub.awaiting_since) return false;
+  return Date.now() - new Date(sub.awaiting_since).getTime() < ALERT_LOCATION_WAIT_MINUTES * 60000;
+}
+
+function activateAlertSubscription(phone, latitude, longitude) {
+  activateSubscriber.run(phone, latitude, longitude, new Date().toISOString());
+}
+
+function stopAlertSubscription(phone) {
+  deleteSubscriber.run(phone); // data minimisation: nothing kept after STOP
+}
+
+// Alerts are sent ONE AT A TIME through this chain. A batch upload used to
+// start all its notifications at once; each checked the "sent recently"
+// log before any of them had written to it, so every subscriber got one
+// message per reading in the batch (review R4).
+let notifyChain = Promise.resolve();
+function queueSubscriberAlert(alert) {
+  notifyChain = notifyChain
+    .then(() => notifySubscribersOfAlert(alert))
+    .catch((e) => console.error("[WhatsApp] notify error:", e.message));
+  return notifyChain;
+}
+
+// A store-and-forward backlog can deliver readings hours late. Alerting
+// people now about a reading that old could send them away from a danger
+// that has passed (review R5) - officers still see it on the map.
+const MAX_ALERT_DELAY_SECONDS = 15 * 60;
+
+// Sends one alert to every active subscriber inside the hazard area.
+// Returns how many were notified (dry-run sends count too).
+async function notifySubscribersOfAlert(alert) {
+  if (alert.status !== "alert_dispatched") return 0;
+  if ((alert.delay_seconds ?? 0) > MAX_ALERT_DELAY_SECONDS) {
+    console.log(`[WhatsApp] not alerting about ${alert.hazard_type} at ${alert.node_id}: reading is ${Math.round(alert.delay_seconds / 60)} min old`);
+    return 0;
+  }
+  if ((SEVERITY_RANK[alert.severity] ?? -1) < SEVERITY_RANK[WHATSAPP_ALERT_MIN_SEVERITY]) return 0;
+  if (alert.latitude == null || alert.longitude == null) return 0;
+
+  const reachKm = ((HAZARD_RADIUS_M[alert.severity] || 500) + WHATSAPP_ALERT_BUFFER_M) / 1000;
+  const params = [
+    alert.hazard_type,
+    alert.severity,
+    alert.location || alert.node_id,
+    HAZARD_ADVICE[alert.hazard_type] || "Follow instructions from local authorities.",
+  ].map((p) => String(p).replace(/[\n\t]+/g, " ").replace(/ {4,}/g, " "));
+
+  let notified = 0;
+  for (const sub of selectActiveSubscribers.all()) {
+    if (haversineKm(sub.latitude, sub.longitude, alert.latitude, alert.longitude) > reachKm) continue;
+    const last = selectLastAlertSent.get(sub.phone, alert.node_id, alert.hazard_type);
+    const recent = last && Date.now() - new Date(last.sent_at).getTime() < WHATSAPP_ALERT_REPEAT_MINUTES * 60000;
+    const escalated = last && SEVERITY_RANK[alert.severity] > (SEVERITY_RANK[last.severity] ?? -1);
+    if (recent && !escalated) continue;
+    try {
+      await sendWhatsAppTemplate(sub.phone, WHATSAPP_ALERT_TEMPLATE, WHATSAPP_ALERT_TEMPLATE_LANG, params);
+      insertAlertLog.run(sub.phone, alert.node_id, alert.hazard_type, alert.severity,
+        new Date().toISOString(), WHATSAPP_DRY_RUN ? 1 : 0);
+      notified++;
+    } catch (e) {
+      console.error("[WhatsApp] alert send failed:", e.response ? e.response.data : e.message);
+    }
+  }
+  if (notified) console.log(`[WhatsApp] ${alert.hazard_type} ${alert.severity} alert for ${alert.node_id} -> ${notified} subscriber(s)`);
+  return notified;
+}
+
 // Webhook verification - Meta calls this ONCE when you configure the
 // webhook URL in the App Dashboard, to confirm you actually own this
 // endpoint. Must echo back hub.challenge if the verify token matches.
@@ -907,7 +1339,34 @@ app.get("/api/whatsapp/webhook", (req, res) => {
 // portal) and reply with the nearest hospital. If they send plain TEXT
 // first, ask them to share location, since SOS fundamentally needs
 // coordinates for hospital routing.
-app.post("/api/whatsapp/webhook", async (req, res) => {
+// Every real webhook from Meta carries X-Hub-Signature-256 = HMAC-SHA256
+// of the raw body with your app secret. Without checking it, anyone could
+// forge "ALERTS ON" (subscribe someone without consent) or "STOP"
+// (silently unsubscribe people) for any phone number (review R9).
+// WHATSAPP_APP_SECRET = Meta App Dashboard -> App settings -> Basic -> App secret.
+const WHATSAPP_APP_SECRET = process.env.WHATSAPP_APP_SECRET || "";
+if (!WHATSAPP_APP_SECRET && !WHATSAPP_DRY_RUN) {
+  console.warn("[WhatsApp] WHATSAPP_APP_SECRET not set - incoming webhooks are REFUSED until it is.");
+}
+
+function verifyMetaSignature(req, res, next) {
+  if (!WHATSAPP_APP_SECRET) {
+    // Dry run (no real WhatsApp account): accept unsigned test messages.
+    // Live WhatsApp without the secret: refuse - fail closed.
+    return WHATSAPP_DRY_RUN ? next() : res.sendStatus(403);
+  }
+  const header = req.headers["x-hub-signature-256"];
+  const expected = "sha256=" + crypto.createHmac("sha256", WHATSAPP_APP_SECRET).update(req.rawBody || "").digest("hex");
+  const a = Buffer.from(String(header || ""));
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    console.warn("[WhatsApp] webhook with missing/invalid signature rejected");
+    return res.sendStatus(403);
+  }
+  next();
+}
+
+app.post("/api/whatsapp/webhook", verifyMetaSignature, async (req, res) => {
   // Always 200 immediately - Meta retries aggressively on non-200/timeout,
   // and we don't want a slow downstream call to cause duplicate webhook
   // deliveries for the same message.
@@ -919,7 +1378,37 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
   const deviceId = `whatsapp:${parsed.fromPhone}`;
 
   try {
-    if (parsed.type === "location") {
+    if (parsed.type === "location" && isAwaitingAlertLocation(parsed.fromPhone)) {
+      // Opt-in in progress (see "ALERTS ON" below): this location is for
+      // alerts, not an SOS - and the reply says so, and how to turn it into
+      // an SOS with one word, so nobody in danger is left without help.
+      activateAlertSubscription(parsed.fromPhone, parsed.latitude, parsed.longitude);
+      await sendWhatsAppText(
+        parsed.fromPhone,
+        "You will now get SANJEEVNI hazard alerts for this area. Reply STOP to unsubscribe.\n" +
+          "This location was saved for alerts only - it was NOT sent as an SOS. If you need help now, reply SOS.",
+      );
+    } else if (parsed.type === "text" && SOS_WORDS.has(normalizeCommand(parsed.text))) {
+      // Text SOS (review R11): use the location we already have for this
+      // number; otherwise ask for it. A shared location is still better -
+      // the person may have moved since.
+      const sub = selectSubscriber.get(parsed.fromPhone);
+      if (sub && sub.latitude != null && sub.longitude != null) {
+        const { httpStatus, body } = createSosRequest(deviceId, sub.latitude, sub.longitude,
+          "Reported via WhatsApp text SOS - location from the person's alert subscription, may be outdated");
+        await sendWhatsAppText(
+          parsed.fromPhone,
+          (httpStatus === 409 ? "Your SOS is already active." : "SOS received. Responders have been notified.") +
+            ` Nearest hospital: ${body.hospital} (${body.distance_km} km).\n` +
+            "We used the location you shared for alerts. If you are somewhere else now, share your CURRENT location.",
+        );
+      } else {
+        await sendWhatsAppText(
+          parsed.fromPhone,
+          "To send help we need your location: tap the attachment icon -> Location -> Send your current location. In immediate danger, also call 112.",
+        );
+      }
+    } else if (parsed.type === "location") {
       const { httpStatus, body } = createSosRequest(
         deviceId,
         parsed.latitude,
@@ -937,10 +1426,20 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           `SOS received. Responders have been notified.\nNearest hospital: ${body.hospital} (${body.distance_km} km)\nDirections: ${body.maps_url}`,
         );
       }
+    } else if (parsed.type === "text" && ALERT_OPT_IN_WORDS.has(normalizeCommand(parsed.text))) {
+      startAlertSubscription(parsed.fromPhone);
+      await sendWhatsAppText(
+        parsed.fromPhone,
+        "To get hazard alerts for your area, share your location now (attachment icon -> Location -> Send your current location). Reply STOP any time to unsubscribe.",
+      );
+    } else if (parsed.type === "text" && ALERT_OPT_OUT_WORDS.has(normalizeCommand(parsed.text))) {
+      stopAlertSubscription(parsed.fromPhone);
+      await sendWhatsAppText(parsed.fromPhone, "You will no longer receive SANJEEVNI hazard alerts.");
     } else if (parsed.type === "text") {
       await sendWhatsAppText(
         parsed.fromPhone,
-        "This is SANJEEVNI emergency response. To send an SOS, please share your LIVE LOCATION (attachment icon -> Location -> Share Live Location) so we can find you and route help.",
+        "This is SANJEEVNI emergency response. To send an SOS, please share your LIVE LOCATION (attachment icon -> Location -> Share Live Location) so we can find you and route help.\n" +
+          "To get hazard alerts for your area instead, reply ALERTS ON.",
       );
     }
   } catch (e) {
