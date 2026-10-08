@@ -36,13 +36,19 @@ Thumbs.db
 .env
 *.log
 
+# Runtime data (database, trained models, vector store, backups with
+# citizen SOS locations, uploads, edge-model build output) - see backend/paths.py
+var/
+
 # Local presentation / planning files (not part of the codebase)
+planning/
 PPT.pptx
 up1.pdf
 up2.pdf
 progress.txt
 
 # Firmware secrets (WiFi passwords, backend URLs, APN) - see secrets.example.h
+firmware/**/secrets.h
 Arduino/**/secrets.h
 
 # React build output (rebuild with: cd frontend; npm run build)
@@ -55,5 +61,5 @@ frontend/dist/
 # VS Code "Code Runner" scratch files (B27)
 tempCodeRunnerFile.*
 
-# Edge-model rebuild output (make_edge_dataset.py -> quantize_edge_model.py)
+# Edge-model rebuild output (now in var/edge_ai_build; old location kept ignored)
 edge_ai_build/

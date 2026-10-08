@@ -23,13 +23,14 @@ export function Toast({ message, onDone, ms = 6000 }: { message: string; onDone:
   return createPortal(<div role="status" style={style}>{message}</div>, document.body);
 }
 
-/** server.js sends viewers who open the officer page to /?denied=officer */
+/** server.js sends users without the role back to /?denied=officer (or =admin) */
+const DENIED_MESSAGES: Record<string, string> = {
+  officer: "Your account can view the dashboard only - the officer page needs an officer account.",
+  admin: "Managing sensor nodes needs an admin account.",
+};
+
 export function useDeniedToast() {
-  const [show, setShow] = useState(() => new URLSearchParams(window.location.search).get("denied") === "officer");
-  return show ? (
-    <Toast
-      message="Your account can view the dashboard only - the officer page needs an officer account."
-      onDone={() => setShow(false)}
-    />
-  ) : null;
+  const [denied, setDenied] = useState(() => new URLSearchParams(window.location.search).get("denied"));
+  const message = denied ? DENIED_MESSAGES[denied] : undefined;
+  return message ? <Toast message={message} onDone={() => setDenied(null)} /> : null;
 }

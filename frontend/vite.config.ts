@@ -18,6 +18,7 @@ export default defineConfig({
         index: `${root}index.html`, // dashboard
         login: `${root}login.html`,
         officer: `${root}officer.html`,
+        admin: `${root}admin.html`, // node registry (admin role only - checked by server.js)
         sos: `${root}sos.html`, // citizen page: keep its bundle small (no map, no auth code)
       },
     },

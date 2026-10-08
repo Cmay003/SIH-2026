@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 416" font-family="Arial, Helvetica, sans-serif" font-size="13" role="img" aria-label="LoRa gateway">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="20" y="26" font-size="18" font-weight="bold" fill="#1b5e20">LoRa gateway</text>
+<text x="20" y="44" font-size="11.5" fill="#5f6b60">Logical diagram - pins grouped by module, not in header order. Generated from config.h.</text>
+<rect x="40" y="76" width="200" height="304" rx="10" fill="#e8f5e9" stroke="#1b5e20" stroke-width="2"/>
+<text x="140.0" y="68" text-anchor="middle" font-weight="bold" fill="#1b5e20">ESP32 DevKit</text>
+<rect x="470" y="76" width="380" height="160" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="93" font-weight="bold" fill="#c62828">SX1278 LoRa (Ra-02)  [3V3]</text>
+<text x="48" y="93" fill="#1b1b1b">GPIO18</text>
+<text x="232" y="93" text-anchor="end" font-size="11" fill="#5f6b60">LORA_SCK</text>
+<line x1="240" y1="89" x2="470" y2="89" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="85" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="93" fill="#1b1b1b">SCK</text>
+<text x="48" y="119" fill="#1b1b1b">GPIO19</text>
+<text x="232" y="119" text-anchor="end" font-size="11" fill="#5f6b60">LORA_MISO</text>
+<line x1="240" y1="115" x2="470" y2="115" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="111" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="119" fill="#1b1b1b">MISO</text>
+<text x="48" y="145" fill="#1b1b1b">GPIO23</text>
+<text x="232" y="145" text-anchor="end" font-size="11" fill="#5f6b60">LORA_MOSI</text>
+<line x1="240" y1="141" x2="470" y2="141" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="137" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="145" fill="#1b1b1b">MOSI</text>
+<text x="48" y="171" fill="#1b1b1b">GPIO5</text>
+<text x="232" y="171" text-anchor="end" font-size="11" fill="#5f6b60">LORA_NSS</text>
+<line x1="240" y1="167" x2="470" y2="167" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="163" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="171" fill="#1b1b1b">NSS</text>
+<text x="48" y="197" fill="#1b1b1b">GPIO14</text>
+<text x="232" y="197" text-anchor="end" font-size="11" fill="#5f6b60">LORA_RST</text>
+<line x1="240" y1="193" x2="470" y2="193" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="189" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="197" fill="#1b1b1b">RST</text>
+<text x="48" y="223" fill="#1b1b1b">GPIO26</text>
+<text x="232" y="223" text-anchor="end" font-size="11" fill="#5f6b60">LORA_DIO0</text>
+<line x1="240" y1="219" x2="470" y2="219" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="215" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="223" fill="#1b1b1b">DIO0</text>
+<rect x="470" y="246" width="380" height="82" rx="8" fill="#ffffff" stroke="#6a1b9a" stroke-width="2"/>
+<text x="560" y="263" font-weight="bold" fill="#6a1b9a">SIM7020 NB-IoT  [own supply]</text>
+<text x="48" y="263" fill="#1b1b1b">GPIO32</text>
+<text x="232" y="263" text-anchor="end" font-size="11" fill="#5f6b60">NBIOT_RX_PIN</text>
+<line x1="240" y1="259" x2="470" y2="259" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="255" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="263" fill="#1b1b1b">TX</text>
+<text x="48" y="289" fill="#1b1b1b">GPIO33</text>
+<text x="232" y="289" text-anchor="end" font-size="11" fill="#5f6b60">NBIOT_TX_PIN</text>
+<line x1="240" y1="285" x2="470" y2="285" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="281" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="289" fill="#1b1b1b">RX</text>
+<text x="48" y="315" fill="#1b1b1b">GPIO25</text>
+<text x="232" y="315" text-anchor="end" font-size="11" fill="#5f6b60">NBIOT_PWRKEY_PIN</text>
+<line x1="240" y1="311" x2="470" y2="311" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="307" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="315" fill="#1b1b1b">PWRKEY</text>
+<rect x="470" y="338" width="380" height="30" rx="8" fill="#ffffff" stroke="#546e7a" stroke-width="2"/>
+<text x="560" y="355" font-weight="bold" fill="#546e7a">Status LED</text>
+<text x="48" y="355" fill="#1b1b1b">GPIO2</text>
+<text x="232" y="355" text-anchor="end" font-size="11" fill="#5f6b60">LED_PIN</text>
+<line x1="240" y1="351" x2="470" y2="351" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="347" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="355" fill="#1b1b1b">LED</text>
+<rect x="40" y="388" width="12" height="12" fill="none" stroke="#c62828" stroke-width="2"/>
+<text x="58" y="398" font-size="11.5" fill="#37474f">powered from 3.3 V</text>
+<rect x="190" y="388" width="12" height="12" fill="none" stroke="#e65100" stroke-width="2"/>
+<text x="208" y="398" font-size="11.5" fill="#37474f">powered from 5 V</text>
+<rect x="340" y="388" width="12" height="12" fill="none" stroke="#6a1b9a" stroke-width="2"/>
+<text x="358" y="398" font-size="11.5" fill="#37474f">own supply</text>
+<rect x="490" y="388" width="12" height="12" fill="none" stroke="#546e7a" stroke-width="2"/>
+<text x="508" y="398" font-size="11.5" fill="#37474f">no supply pin</text>
+</svg>

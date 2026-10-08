@@ -13,7 +13,7 @@ from unittest import mock
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
 import hazard_confirmation as hc  # noqa: E402
 import river_forecast as rf  # noqa: E402

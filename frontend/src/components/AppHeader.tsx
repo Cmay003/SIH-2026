@@ -41,6 +41,9 @@ export function UserChip({ variant = "onBrand" }: { variant?: "onBrand" | "light
     <div className={`${styles.chip} ${variant === "light" ? styles.chipLight : ""}`}>
       <span className={styles.name}>{username}</span>
       <span className={styles.role}>{role}</span>
+      {role === "admin" && window.location.pathname !== "/admin.html" && (
+        <a className={styles.adminLink} href="/admin.html">Manage nodes</a>
+      )}
       <button type="button" onClick={() => logout.mutate()} disabled={logout.isPending}>
         {logout.isPending ? "Signing out..." : "Log out"}
       </button>

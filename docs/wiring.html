@@ -1,0 +1,297 @@
+<!doctype html><html lang='en'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>SANJEEVNI Wiring</title><style>
+:root{--bg:#f6f9f6;--surface:#fff;--text:#1b1b1b;--muted:#5f6b60;--border:#dbe7dc;--green:#1b5e20;
+--err-bg:#fdecea;--err:#b71c1c;--warn-bg:#fff8e1;--warn:#8d6e00;--info-bg:#e8f1fd;--info:#1a4f8b;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1511;--surface:#18211b;--text:#e6efe7;--muted:#a3b3a6;--border:#2c3a30;
+--green:#a5d6a7;--err-bg:#3b1414;--err:#ffb4a9;--warn-bg:#3a2f05;--warn:#ffe08a;--info-bg:#10243d;--info:#a8c8ff;color-scheme:dark}}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 Arial,Helvetica,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:20px 16px 48px}
+h1{color:var(--green);margin:0 0 4px}h2{color:var(--green);margin:32px 0 8px}h3{margin:20px 0 6px}
+.muted{color:var(--muted)}.diagram{background:#fff;border:1px solid var(--border);border-radius:12px;padding:8px;overflow-x:auto}
+.diagram svg{display:block;min-width:760px;width:100%;height:auto}
+table{border-collapse:collapse;width:100%;background:var(--surface);font-size:14px}
+th,td{border-bottom:1px solid var(--border);padding:7px 10px;text-align:left;vertical-align:top}th{background:var(--green);color:#fff}
+@media (prefers-color-scheme:dark){th{color:#0f1511}}
+.wrap{overflow-x:auto;border:1px solid var(--border);border-radius:10px}
+.checks{list-style:none;padding:0;margin:0}.checks li{padding:8px 12px;border-radius:8px;margin:6px 0}
+.ERROR{background:var(--err-bg);color:var(--err)}.WARN{background:var(--warn-bg);color:var(--warn)}.INFO{background:var(--info-bg);color:var(--info)}
+code{font-size:13px}
+</style></head><body><main>
+<h1>SANJEEVNI wiring</h1>
+<p class='muted'>Generated from <code>firmware/sanjeevni_lora_node/config.h</code> and <code>firmware/sanjeevni_lora_gateway/config.h</code> by <code>tools/wiring/generate_wiring.py</code> - re-run it after changing a pin. Diagrams are logical (grouped by module), not the physical header order. Supply voltages and output levels are typical for the common breakout boards: check your module's datasheet. All grounds are common.</p>
+<h2>Sensor node NODE-04 (LoRa)</h2>
+<h3>Checks: 0 error(s)</h3><ul class='checks'>
+<li class='WARN'><strong>WARN</strong> - pH board (PH-4502C) PO on GPIO33 (PH_PIN): up to 3.33 V at the pin - above ~3.1 V the ESP32 ADC reads low; a bigger divider gives better accuracy</li>
+<li class='INFO'><strong>INFO</strong> - SX1278 LoRa (Ra-02) NSS on GPIO5 (LORA_NSS): strapping pin - must not be held LOW at boot</li>
+<li class='INFO'><strong>INFO</strong> - Rain gauge (reed switch) reed on GPIO39 (RAIN_GAUGE_PIN): input-only pin has no internal pull-up - the external 10k to 3V3 is required</li>
+<li class='INFO'><strong>INFO</strong> - Status LED LED on GPIO2 (LED_PIN): strapping pin - must not be held HIGH at boot</li>
+</ul><div class='diagram'><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 842" font-family="Arial, Helvetica, sans-serif" font-size="13" role="img" aria-label="Sensor node NODE-04 (LoRa)">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="20" y="26" font-size="18" font-weight="bold" fill="#1b5e20">Sensor node NODE-04 (LoRa)</text>
+<text x="20" y="44" font-size="11.5" fill="#5f6b60">Logical diagram - pins grouped by module, not in header order. Generated from config.h.</text>
+<rect x="40" y="76" width="200" height="730" rx="10" fill="#e8f5e9" stroke="#1b5e20" stroke-width="2"/>
+<text x="140.0" y="68" text-anchor="middle" font-weight="bold" fill="#1b5e20">ESP32 DevKit</text>
+<rect x="470" y="76" width="380" height="160" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="93" font-weight="bold" fill="#c62828">SX1278 LoRa (Ra-02)  [3V3]</text>
+<text x="48" y="93" fill="#1b1b1b">GPIO18</text>
+<text x="232" y="93" text-anchor="end" font-size="11" fill="#5f6b60">LORA_SCK</text>
+<line x1="240" y1="89" x2="470" y2="89" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="85" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="93" fill="#1b1b1b">SCK</text>
+<text x="48" y="119" fill="#1b1b1b">GPIO19</text>
+<text x="232" y="119" text-anchor="end" font-size="11" fill="#5f6b60">LORA_MISO</text>
+<line x1="240" y1="115" x2="470" y2="115" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="111" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="119" fill="#1b1b1b">MISO</text>
+<text x="48" y="145" fill="#1b1b1b">GPIO23</text>
+<text x="232" y="145" text-anchor="end" font-size="11" fill="#5f6b60">LORA_MOSI</text>
+<line x1="240" y1="141" x2="470" y2="141" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="137" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="145" fill="#1b1b1b">MOSI</text>
+<text x="48" y="171" fill="#1b1b1b">GPIO5</text>
+<text x="232" y="171" text-anchor="end" font-size="11" fill="#5f6b60">LORA_NSS</text>
+<line x1="240" y1="167" x2="470" y2="167" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="163" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="171" fill="#1b1b1b">NSS</text>
+<text x="48" y="197" fill="#1b1b1b">GPIO14</text>
+<text x="232" y="197" text-anchor="end" font-size="11" fill="#5f6b60">LORA_RST</text>
+<line x1="240" y1="193" x2="470" y2="193" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="189" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="197" fill="#1b1b1b">RST</text>
+<text x="48" y="223" fill="#1b1b1b">GPIO26</text>
+<text x="232" y="223" text-anchor="end" font-size="11" fill="#5f6b60">LORA_DIO0</text>
+<line x1="240" y1="219" x2="470" y2="219" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="215" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="223" fill="#1b1b1b">DIO0</text>
+<rect x="470" y="246" width="380" height="30" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="263" font-weight="bold" fill="#c62828">DHT22 temp/humidity  [3V3]</text>
+<text x="48" y="263" fill="#1b1b1b">GPIO4</text>
+<text x="232" y="263" text-anchor="end" font-size="11" fill="#5f6b60">DHT_PIN</text>
+<line x1="240" y1="259" x2="470" y2="259" stroke="#37474f" stroke-width="1.6"/>
+<rect x="286.0" y="249" width="138" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="263" text-anchor="middle" font-size="11" fill="#5d4037">pull-up 10k to 3V3</text>
+<text x="480" y="263" fill="#1b1b1b">DATA</text>
+<rect x="470" y="286" width="380" height="56" rx="8" fill="#ffffff" stroke="#e65100" stroke-width="2"/>
+<text x="560" y="303" font-weight="bold" fill="#e65100">HC-SR04 water level  [5V]</text>
+<text x="48" y="303" fill="#1b1b1b">GPIO25</text>
+<text x="232" y="303" text-anchor="end" font-size="11" fill="#5f6b60">ULTRASONIC_TRIG</text>
+<line x1="240" y1="299" x2="470" y2="299" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="295" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="303" fill="#1b1b1b">TRIG</text>
+<text x="48" y="329" fill="#1b1b1b">GPIO27</text>
+<text x="232" y="329" text-anchor="end" font-size="11" fill="#5f6b60">ULTRASONIC_ECHO</text>
+<line x1="240" y1="325" x2="470" y2="325" stroke="#37474f" stroke-width="1.6"/>
+<rect x="296.5" y="315" width="117" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="329" text-anchor="middle" font-size="11" fill="#5d4037">divider 1k / 2k</text>
+<text x="480" y="329" fill="#1b1b1b">ECHO</text>
+<rect x="470" y="352" width="380" height="30" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="369" font-weight="bold" fill="#c62828">IR flame sensor  [3V3]</text>
+<text x="48" y="369" fill="#1b1b1b">GPIO13</text>
+<text x="232" y="369" text-anchor="end" font-size="11" fill="#5f6b60">FLAME_PIN</text>
+<line x1="240" y1="365" x2="470" y2="365" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="361" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="369" fill="#1b1b1b">DO</text>
+<rect x="470" y="392" width="380" height="30" rx="8" fill="#ffffff" stroke="#e65100" stroke-width="2"/>
+<text x="560" y="409" font-weight="bold" fill="#e65100">MQ135 gas  [5V]</text>
+<text x="48" y="409" fill="#1b1b1b">GPIO34</text>
+<text x="232" y="409" text-anchor="end" font-size="11" fill="#5f6b60">MQ135_PIN</text>
+<line x1="240" y1="405" x2="470" y2="405" stroke="#37474f" stroke-width="1.6"/>
+<rect x="289.5" y="395" width="131" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="409" text-anchor="middle" font-size="11" fill="#5d4037">divider 10k / 10k</text>
+<text x="480" y="409" fill="#1b1b1b">AO</text>
+<rect x="470" y="432" width="380" height="30" rx="8" fill="#ffffff" stroke="#546e7a" stroke-width="2"/>
+<text x="560" y="449" font-weight="bold" fill="#546e7a">Rain gauge (reed switch)</text>
+<text x="48" y="449" fill="#1b1b1b">GPIO39</text>
+<text x="232" y="449" text-anchor="end" font-size="11" fill="#5f6b60">RAIN_GAUGE_PIN</text>
+<line x1="240" y1="445" x2="470" y2="445" stroke="#37474f" stroke-width="1.6"/>
+<rect x="286.0" y="435" width="138" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="449" text-anchor="middle" font-size="11" fill="#5d4037">pull-up 10k to 3V3</text>
+<text x="480" y="449" fill="#1b1b1b">reed</text>
+<rect x="470" y="472" width="380" height="30" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="489" font-weight="bold" fill="#c62828">Capacitive soil moisture v1.2  [3V3]</text>
+<text x="48" y="489" fill="#1b1b1b">GPIO32</text>
+<text x="232" y="489" text-anchor="end" font-size="11" fill="#5f6b60">SOIL_PIN</text>
+<line x1="240" y1="485" x2="470" y2="485" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="481" text-anchor="middle" font-size="13" fill="#78909c">← analog</text>
+<text x="480" y="489" fill="#1b1b1b">AO</text>
+<rect x="470" y="512" width="380" height="56" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="529" font-weight="bold" fill="#c62828">MPU6050 tilt/vibration  [3V3]</text>
+<text x="48" y="529" fill="#1b1b1b">GPIO21</text>
+<text x="232" y="529" text-anchor="end" font-size="11" fill="#5f6b60">I2C_SDA</text>
+<line x1="240" y1="525" x2="470" y2="525" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="521" text-anchor="middle" font-size="13" fill="#78909c">↔</text>
+<text x="480" y="529" fill="#1b1b1b">SDA</text>
+<text x="48" y="555" fill="#1b1b1b">GPIO22</text>
+<text x="232" y="555" text-anchor="end" font-size="11" fill="#5f6b60">I2C_SCL</text>
+<line x1="240" y1="551" x2="470" y2="551" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="547" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="555" fill="#1b1b1b">SCL</text>
+<rect x="470" y="578" width="380" height="56" rx="8" fill="#ffffff" stroke="#e65100" stroke-width="2"/>
+<text x="560" y="595" font-weight="bold" fill="#e65100">PMS5003 particulate  [5V]</text>
+<text x="48" y="595" fill="#1b1b1b">GPIO16</text>
+<text x="232" y="595" text-anchor="end" font-size="11" fill="#5f6b60">PMS_RX_PIN</text>
+<line x1="240" y1="591" x2="470" y2="591" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="587" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="595" fill="#1b1b1b">TX</text>
+<text x="48" y="621" fill="#1b1b1b">GPIO17</text>
+<text x="232" y="621" text-anchor="end" font-size="11" fill="#5f6b60">PMS_TX_PIN</text>
+<line x1="240" y1="617" x2="470" y2="617" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="613" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="621" fill="#1b1b1b">RX</text>
+<rect x="470" y="644" width="380" height="30" rx="8" fill="#ffffff" stroke="#e65100" stroke-width="2"/>
+<text x="560" y="661" font-weight="bold" fill="#e65100">pH board (PH-4502C)  [5V]</text>
+<text x="48" y="661" fill="#1b1b1b">GPIO33</text>
+<text x="232" y="661" text-anchor="end" font-size="11" fill="#5f6b60">PH_PIN</text>
+<line x1="240" y1="657" x2="470" y2="657" stroke="#37474f" stroke-width="1.6"/>
+<rect x="289.5" y="647" width="131" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="661" text-anchor="middle" font-size="11" fill="#5d4037">divider 10k / 20k</text>
+<text x="480" y="661" fill="#1b1b1b">PO</text>
+<rect x="470" y="684" width="380" height="30" rx="8" fill="#ffffff" stroke="#e65100" stroke-width="2"/>
+<text x="560" y="701" font-weight="bold" fill="#e65100">Turbidity (SEN0189)  [5V]</text>
+<text x="48" y="701" fill="#1b1b1b">GPIO36</text>
+<text x="232" y="701" text-anchor="end" font-size="11" fill="#5f6b60">TURBIDITY_PIN</text>
+<line x1="240" y1="697" x2="470" y2="697" stroke="#37474f" stroke-width="1.6"/>
+<rect x="289.5" y="687" width="131" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="701" text-anchor="middle" font-size="11" fill="#5d4037">divider 10k / 20k</text>
+<text x="480" y="701" fill="#1b1b1b">AO</text>
+<rect x="470" y="724" width="380" height="30" rx="8" fill="#ffffff" stroke="#546e7a" stroke-width="2"/>
+<text x="560" y="741" font-weight="bold" fill="#546e7a">18650 battery sense</text>
+<text x="48" y="741" fill="#1b1b1b">GPIO35</text>
+<text x="232" y="741" text-anchor="end" font-size="11" fill="#5f6b60">BATTERY_PIN</text>
+<line x1="240" y1="737" x2="470" y2="737" stroke="#37474f" stroke-width="1.6"/>
+<rect x="282.5" y="727" width="145" height="20" rx="4" fill="#fff8e1" stroke="#f9a825"/>
+<text x="355.0" y="741" text-anchor="middle" font-size="11" fill="#5d4037">divider 100k / 100k</text>
+<text x="480" y="741" fill="#1b1b1b">BAT+</text>
+<rect x="470" y="764" width="380" height="30" rx="8" fill="#ffffff" stroke="#546e7a" stroke-width="2"/>
+<text x="560" y="781" font-weight="bold" fill="#546e7a">Status LED</text>
+<text x="48" y="781" fill="#1b1b1b">GPIO2</text>
+<text x="232" y="781" text-anchor="end" font-size="11" fill="#5f6b60">LED_PIN</text>
+<line x1="240" y1="777" x2="470" y2="777" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="773" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="781" fill="#1b1b1b">LED</text>
+<rect x="40" y="814" width="12" height="12" fill="none" stroke="#c62828" stroke-width="2"/>
+<text x="58" y="824" font-size="11.5" fill="#37474f">powered from 3.3 V</text>
+<rect x="190" y="814" width="12" height="12" fill="none" stroke="#e65100" stroke-width="2"/>
+<text x="208" y="824" font-size="11.5" fill="#37474f">powered from 5 V</text>
+<rect x="340" y="814" width="12" height="12" fill="none" stroke="#6a1b9a" stroke-width="2"/>
+<text x="358" y="824" font-size="11.5" fill="#37474f">own supply</text>
+<rect x="490" y="814" width="12" height="12" fill="none" stroke="#546e7a" stroke-width="2"/>
+<text x="508" y="824" font-size="11.5" fill="#37474f">no supply pin</text>
+</svg></div>
+<h3>Connections</h3><div class='wrap'><table><thead><tr><th scope='col'>Module</th><th scope='col'>Supply</th><th scope='col'>Module pin</th><th scope='col'>ESP32</th><th scope='col'>config.h</th><th scope='col'>Direction</th><th scope='col'>In between</th></tr></thead><tbody>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>SCK</td><td>GPIO18</td><td><code>LORA_SCK</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>MISO</td><td>GPIO19</td><td><code>LORA_MISO</code></td><td>in</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>MOSI</td><td>GPIO23</td><td><code>LORA_MOSI</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>NSS</td><td>GPIO5</td><td><code>LORA_NSS</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>RST</td><td>GPIO14</td><td><code>LORA_RST</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>DIO0</td><td>GPIO26</td><td><code>LORA_DIO0</code></td><td>in</td><td></td></tr>
+<tr><td>DHT22 temp/humidity</td><td>3V3</td><td>DATA</td><td>GPIO4</td><td><code>DHT_PIN</code></td><td>io</td><td>pull-up 10k to 3V3 (if not on module)</td></tr>
+<tr><td>HC-SR04 water level</td><td>5V</td><td>TRIG</td><td>GPIO25</td><td><code>ULTRASONIC_TRIG</code></td><td>out</td><td></td></tr>
+<tr><td>HC-SR04 water level</td><td>5V</td><td>ECHO</td><td>GPIO27</td><td><code>ULTRASONIC_ECHO</code></td><td>in</td><td>divider 1k / 2k (5 V -&gt; 3.3 V)</td></tr>
+<tr><td>IR flame sensor</td><td>3V3</td><td>DO</td><td>GPIO13</td><td><code>FLAME_PIN</code></td><td>in</td><td></td></tr>
+<tr><td>MQ135 gas</td><td>5V</td><td>AO</td><td>GPIO34</td><td><code>MQ135_PIN</code></td><td>analog</td><td>divider 10k / 10k (MQ135_ADC_DIVIDER_RATIO = 2)</td></tr>
+<tr><td>Rain gauge (reed switch)</td><td>-</td><td>reed</td><td>GPIO39</td><td><code>RAIN_GAUGE_PIN</code></td><td>in</td><td>pull-up 10k to 3V3 (REQUIRED)</td></tr>
+<tr><td>Capacitive soil moisture v1.2</td><td>3V3</td><td>AO</td><td>GPIO32</td><td><code>SOIL_PIN</code></td><td>analog</td><td></td></tr>
+<tr><td>MPU6050 tilt/vibration</td><td>3V3</td><td>SDA</td><td>GPIO21</td><td><code>I2C_SDA</code></td><td>io</td><td></td></tr>
+<tr><td>MPU6050 tilt/vibration</td><td>3V3</td><td>SCL</td><td>GPIO22</td><td><code>I2C_SCL</code></td><td>out</td><td></td></tr>
+<tr><td>PMS5003 particulate</td><td>5V</td><td>TX</td><td>GPIO16</td><td><code>PMS_RX_PIN</code></td><td>in</td><td></td></tr>
+<tr><td>PMS5003 particulate</td><td>5V</td><td>RX</td><td>GPIO17</td><td><code>PMS_TX_PIN</code></td><td>out</td><td></td></tr>
+<tr><td>pH board (PH-4502C)</td><td>5V</td><td>PO</td><td>GPIO33</td><td><code>PH_PIN</code></td><td>analog</td><td>divider 10k / 20k (PH_ADC_DIVIDER_RATIO = 1.5)</td></tr>
+<tr><td>Turbidity (SEN0189)</td><td>5V</td><td>AO</td><td>GPIO36</td><td><code>TURBIDITY_PIN</code></td><td>analog</td><td>divider 10k / 20k (TURBIDITY_ADC_DIVIDER_RATIO = 1.5)</td></tr>
+<tr><td>18650 battery sense</td><td>-</td><td>BAT+</td><td>GPIO35</td><td><code>BATTERY_PIN</code></td><td>analog</td><td>divider 100k / 100k (BATTERY_DIVIDER_RATIO = 2)</td></tr>
+<tr><td>Status LED</td><td>-</td><td>LED</td><td>GPIO2</td><td><code>LED_PIN</code></td><td>out</td><td></td></tr>
+</tbody></table></div>
+<h3>Extra parts</h3><ul><li>HC-SR04 water level ECHO: resistors 1k / 2k (top / bottom)</li><li>MQ135 gas AO: resistors 10k / 10k (top / bottom)</li><li>Rain gauge (reed switch): 10k resistor, pin to 3V3</li><li>pH board (PH-4502C) PO: resistors 10k / 20k (top / bottom)</li><li>Turbidity (SEN0189) AO: resistors 10k / 20k (top / bottom)</li><li>18650 battery sense BAT+: resistors 100k / 100k (top / bottom)</li></ul>
+<h3>Module notes</h3><ul><li><strong>SX1278 LoRa (Ra-02)</strong>: 3.3 V ONLY - 5 V destroys it. Fit the antenna before powering.</li><li><strong>DHT22 temp/humidity</strong>: Bare sensor: 10k pull-up DATA-&gt;3V3 (modules have one).</li><li><strong>HC-SR04 water level</strong>: 5 V module: ECHO must go through a divider.</li><li><strong>IR flame sensor</strong>: Power it from 3V3 so DO is a 3.3 V signal.</li><li><strong>MQ135 gas</strong>: Heater ~150 mA from 5 V, always on (no deep sleep).</li><li><strong>Rain gauge (reed switch)</strong>: Switch between the pin and GND.</li><li><strong>Capacitive soil moisture v1.2</strong>: At 3.3 V supply AO stays below ~3 V.</li><li><strong>MPU6050 tilt/vibration</strong>: I2C address 0x68 (AD0 to GND).</li><li><strong>PMS5003 particulate</strong>: Fan needs 5 V; its UART is 3.3 V logic.</li><li><strong>pH board (PH-4502C)</strong>: Calibrate with pH 7 and pH 4 buffers (&#x27;p&#x27; command).</li><li><strong>Turbidity (SEN0189)</strong>: Output 0-4.5 V.</li><li><strong>18650 battery sense</strong>: Divider from battery + to the pin (high values: tiny drain).</li><li><strong>Status LED</strong>: On-board LED on most DevKits.</li></ul>
+<h2>LoRa gateway</h2>
+<h3>Checks: 0 error(s)</h3><ul class='checks'>
+<li class='INFO'><strong>INFO</strong> - SX1278 LoRa (Ra-02) NSS on GPIO5 (LORA_NSS): strapping pin - must not be held LOW at boot</li>
+<li class='INFO'><strong>INFO</strong> - SIM7020 NB-IoT TX on GPIO32 (NBIOT_RX_PIN): confirm the module&#x27;s UART runs at 3.3 V logic</li>
+<li class='INFO'><strong>INFO</strong> - SIM7020 NB-IoT RX on GPIO33 (NBIOT_TX_PIN): confirm the module&#x27;s UART runs at 3.3 V logic</li>
+<li class='INFO'><strong>INFO</strong> - Status LED LED on GPIO2 (LED_PIN): strapping pin - must not be held HIGH at boot</li>
+</ul><div class='diagram'><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 416" font-family="Arial, Helvetica, sans-serif" font-size="13" role="img" aria-label="LoRa gateway">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="20" y="26" font-size="18" font-weight="bold" fill="#1b5e20">LoRa gateway</text>
+<text x="20" y="44" font-size="11.5" fill="#5f6b60">Logical diagram - pins grouped by module, not in header order. Generated from config.h.</text>
+<rect x="40" y="76" width="200" height="304" rx="10" fill="#e8f5e9" stroke="#1b5e20" stroke-width="2"/>
+<text x="140.0" y="68" text-anchor="middle" font-weight="bold" fill="#1b5e20">ESP32 DevKit</text>
+<rect x="470" y="76" width="380" height="160" rx="8" fill="#ffffff" stroke="#c62828" stroke-width="2"/>
+<text x="560" y="93" font-weight="bold" fill="#c62828">SX1278 LoRa (Ra-02)  [3V3]</text>
+<text x="48" y="93" fill="#1b1b1b">GPIO18</text>
+<text x="232" y="93" text-anchor="end" font-size="11" fill="#5f6b60">LORA_SCK</text>
+<line x1="240" y1="89" x2="470" y2="89" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="85" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="93" fill="#1b1b1b">SCK</text>
+<text x="48" y="119" fill="#1b1b1b">GPIO19</text>
+<text x="232" y="119" text-anchor="end" font-size="11" fill="#5f6b60">LORA_MISO</text>
+<line x1="240" y1="115" x2="470" y2="115" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="111" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="119" fill="#1b1b1b">MISO</text>
+<text x="48" y="145" fill="#1b1b1b">GPIO23</text>
+<text x="232" y="145" text-anchor="end" font-size="11" fill="#5f6b60">LORA_MOSI</text>
+<line x1="240" y1="141" x2="470" y2="141" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="137" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="145" fill="#1b1b1b">MOSI</text>
+<text x="48" y="171" fill="#1b1b1b">GPIO5</text>
+<text x="232" y="171" text-anchor="end" font-size="11" fill="#5f6b60">LORA_NSS</text>
+<line x1="240" y1="167" x2="470" y2="167" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="163" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="171" fill="#1b1b1b">NSS</text>
+<text x="48" y="197" fill="#1b1b1b">GPIO14</text>
+<text x="232" y="197" text-anchor="end" font-size="11" fill="#5f6b60">LORA_RST</text>
+<line x1="240" y1="193" x2="470" y2="193" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="189" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="197" fill="#1b1b1b">RST</text>
+<text x="48" y="223" fill="#1b1b1b">GPIO26</text>
+<text x="232" y="223" text-anchor="end" font-size="11" fill="#5f6b60">LORA_DIO0</text>
+<line x1="240" y1="219" x2="470" y2="219" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="215" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="223" fill="#1b1b1b">DIO0</text>
+<rect x="470" y="246" width="380" height="82" rx="8" fill="#ffffff" stroke="#6a1b9a" stroke-width="2"/>
+<text x="560" y="263" font-weight="bold" fill="#6a1b9a">SIM7020 NB-IoT  [own supply]</text>
+<text x="48" y="263" fill="#1b1b1b">GPIO32</text>
+<text x="232" y="263" text-anchor="end" font-size="11" fill="#5f6b60">NBIOT_RX_PIN</text>
+<line x1="240" y1="259" x2="470" y2="259" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="255" text-anchor="middle" font-size="13" fill="#78909c">←</text>
+<text x="480" y="263" fill="#1b1b1b">TX</text>
+<text x="48" y="289" fill="#1b1b1b">GPIO33</text>
+<text x="232" y="289" text-anchor="end" font-size="11" fill="#5f6b60">NBIOT_TX_PIN</text>
+<line x1="240" y1="285" x2="470" y2="285" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="281" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="289" fill="#1b1b1b">RX</text>
+<text x="48" y="315" fill="#1b1b1b">GPIO25</text>
+<text x="232" y="315" text-anchor="end" font-size="11" fill="#5f6b60">NBIOT_PWRKEY_PIN</text>
+<line x1="240" y1="311" x2="470" y2="311" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="307" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="315" fill="#1b1b1b">PWRKEY</text>
+<rect x="470" y="338" width="380" height="30" rx="8" fill="#ffffff" stroke="#546e7a" stroke-width="2"/>
+<text x="560" y="355" font-weight="bold" fill="#546e7a">Status LED</text>
+<text x="48" y="355" fill="#1b1b1b">GPIO2</text>
+<text x="232" y="355" text-anchor="end" font-size="11" fill="#5f6b60">LED_PIN</text>
+<line x1="240" y1="351" x2="470" y2="351" stroke="#37474f" stroke-width="1.6"/>
+<text x="355.0" y="347" text-anchor="middle" font-size="13" fill="#78909c">→</text>
+<text x="480" y="355" fill="#1b1b1b">LED</text>
+<rect x="40" y="388" width="12" height="12" fill="none" stroke="#c62828" stroke-width="2"/>
+<text x="58" y="398" font-size="11.5" fill="#37474f">powered from 3.3 V</text>
+<rect x="190" y="388" width="12" height="12" fill="none" stroke="#e65100" stroke-width="2"/>
+<text x="208" y="398" font-size="11.5" fill="#37474f">powered from 5 V</text>
+<rect x="340" y="388" width="12" height="12" fill="none" stroke="#6a1b9a" stroke-width="2"/>
+<text x="358" y="398" font-size="11.5" fill="#37474f">own supply</text>
+<rect x="490" y="388" width="12" height="12" fill="none" stroke="#546e7a" stroke-width="2"/>
+<text x="508" y="398" font-size="11.5" fill="#37474f">no supply pin</text>
+</svg></div>
+<h3>Connections</h3><div class='wrap'><table><thead><tr><th scope='col'>Module</th><th scope='col'>Supply</th><th scope='col'>Module pin</th><th scope='col'>ESP32</th><th scope='col'>config.h</th><th scope='col'>Direction</th><th scope='col'>In between</th></tr></thead><tbody>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>SCK</td><td>GPIO18</td><td><code>LORA_SCK</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>MISO</td><td>GPIO19</td><td><code>LORA_MISO</code></td><td>in</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>MOSI</td><td>GPIO23</td><td><code>LORA_MOSI</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>NSS</td><td>GPIO5</td><td><code>LORA_NSS</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>RST</td><td>GPIO14</td><td><code>LORA_RST</code></td><td>out</td><td></td></tr>
+<tr><td>SX1278 LoRa (Ra-02)</td><td>3V3</td><td>DIO0</td><td>GPIO26</td><td><code>LORA_DIO0</code></td><td>in</td><td></td></tr>
+<tr><td>SIM7020 NB-IoT</td><td>ext</td><td>TX</td><td>GPIO32</td><td><code>NBIOT_RX_PIN</code></td><td>in</td><td></td></tr>
+<tr><td>SIM7020 NB-IoT</td><td>ext</td><td>RX</td><td>GPIO33</td><td><code>NBIOT_TX_PIN</code></td><td>out</td><td></td></tr>
+<tr><td>SIM7020 NB-IoT</td><td>ext</td><td>PWRKEY</td><td>GPIO25</td><td><code>NBIOT_PWRKEY_PIN</code></td><td>out</td><td></td></tr>
+<tr><td>Status LED</td><td>-</td><td>LED</td><td>GPIO2</td><td><code>LED_PIN</code></td><td>out</td><td></td></tr>
+</tbody></table></div>
+<h3>Module notes</h3><ul><li><strong>SX1278 LoRa (Ra-02)</strong>: 3.3 V ONLY. Same frequency / SF / sync word as every node.</li><li><strong>SIM7020 NB-IoT</strong>: Own supply that can deliver its transmit peaks (not the ESP32 3V3 pin); common GND. Check its UART level - use a level shifter if it is not 3.3 V.</li><li><strong>Status LED</strong>: On-board LED on most DevKits.</li></ul>
+</main></body></html>

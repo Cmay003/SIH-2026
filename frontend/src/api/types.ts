@@ -176,3 +176,22 @@ export interface SosCreateResponse {
   distance_km: number;
   maps_url: string;
 }
+
+export type LandUse = "agricultural" | "forest" | "urban_low" | "urban_high";
+
+/** One node in the registry - body of POST/PUT /api/admin/nodes/:id (admin only) */
+export interface NodeConfig {
+  location: string;
+  land_use: LandUse;
+  curve_number: number;
+  latitude: number;
+  longitude: number;
+  upstream_node: string | null;
+  /** null = the default 5 s (always-on firmware) */
+  report_interval_seconds: number | null;
+}
+
+/** GET /api/admin/nodes */
+export interface AdminNodesResponse {
+  nodes: Record<string, NodeConfig>;
+}

@@ -4,9 +4,11 @@
 // real browser. Automated checks find ~30-50% of issues; keyboard and
 // screen-reader passes are still needed by a person.
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setUnauthorizedHandler } from "../api/client";
+import { AdminPage } from "../pages/AdminPage";
 import { DashboardPage } from "../pages/DashboardPage";
 import { LoginPage } from "../pages/LoginPage";
 import { OfficerPage } from "../pages/OfficerPage";
@@ -34,6 +36,8 @@ const API: Record<string, unknown> = {
     nodes: [{ node_id: "NODE-INDB", location: "Industrial Zone B", latitude: 29.385, longitude: 79.448, status: "offline",
       level: "critical", last_seen: null, seconds_since_seen: 420, expected_interval_seconds: 60, battery_pct: 61,
       signal_strength_dbm: -104, link: "lora", issues: [{ level: "critical", type: "missing", message: "No report for 7 min" }] }] },
+  "/api/admin/nodes": { nodes: { "NODE-04": { location: "Sector 4", land_use: "urban_low", curve_number: 78,
+    latitude: 29.3919, longitude: 79.4542, upstream_node: null, report_interval_seconds: null } } },
   "/api/nearest-hospital": { hospital: "District Hospital", distance_km: 1.2, maps_url: "https://maps.example/x" },
 };
 
@@ -78,6 +82,14 @@ describe("accessibility (axe)", () => {
   it("officer page (panel + map)", async () => {
     const { container } = render(<Providers><OfficerPage /></Providers>);
     await screen.findByText("No report for 7 min");
+    expect(await violations(container)).toEqual([]);
+  });
+
+  it("admin page (node table + open editor with errors)", async () => {
+    const { container } = render(<Providers><AdminPage /></Providers>);
+    await userEvent.click(await screen.findByRole("button", { name: "+ Add node" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add node" })); // empty form -> field errors
+    await screen.findByText(/1-12 characters/);
     expect(await violations(container)).toEqual([]);
   });
 

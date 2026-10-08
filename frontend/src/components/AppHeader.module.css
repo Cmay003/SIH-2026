@@ -91,6 +91,13 @@
   opacity: 0.8;
 }
 
+.adminLink {
+  color: inherit;
+  font-weight: bold;
+  font-size: 12.5px;
+  text-underline-offset: 2px;
+}
+
 /* On a white surface (officer panel) instead of the green header */
 .chipLight {
   background: var(--green-lighter);

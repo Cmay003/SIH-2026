@@ -5,8 +5,10 @@
 #include <vector>
 #include "Arduino.h"
 #include "LittleFS.h"
-#include "../../Arduino/sanjeevni_lora_node/sj_packet.h"
-#include "../../Arduino/sanjeevni_lora_node/sj_file_queue.h"
+#include "../../firmware/sanjeevni_lora_node/sj_packet.h"
+#include "../../firmware/sanjeevni_lora_node/sj_file_queue.h"
+#include "../../firmware/sanjeevni_lora_node/sj_sleep.h"
+#include "../../firmware/sanjeevni_lora_node/sj_selftest.h"
 
 static int failures = 0;
 #define CHECK(cond)                                                     \
@@ -68,6 +70,173 @@ int main(int argc, char** argv) {
     CHECK(sjUploadAction(code, 1) == SJ_UPLOAD_RETRY);
   }
 
+  // ---- deep-sleep state + timing (sj_sleep.h) -------------------------
+  {
+    SjSleepState s;
+    std::memset(&s, 0xA5, sizeof(s));  // RTC memory after a power-on: garbage
+    CHECK(!sjSleepStateValid(s));
+    std::memset(&s, 0, sizeof(s));     // ...or all zeros
+    CHECK(!sjSleepStateValid(s));
+    sjSleepStateReset(s, 42);
+    CHECK(sjSleepStateValid(s) && s.session == 42 && s.seq == 0 && s.pendingRainMm == 0.0f);
+    s.seq = 17;                        // changed but not sealed -> rejected
+    CHECK(!sjSleepStateValid(s));
+    sjSleepStateSeal(s);
+    CHECK(sjSleepStateValid(s) && s.seq == 17);
+    s.magic ^= 1;                      // struct layout changed in a newer firmware
+    CHECK(!sjSleepStateValid(s));
+
+    CHECK(sjPlanSleepS(false, 300, 30) == 300);
+    CHECK(sjPlanSleepS(true, 300, 30) == 30);   // elevated: watch closely
+    CHECK(sjRemainingS(1000, 1300) == 300);
+    CHECK(sjRemainingS(1300, 1000) == 0);       // overdue
+    CHECK(sjRainWakeShouldResleep(1000, 1300, 2));   // tip mid-interval: count it, sleep 300 s more
+    CHECK(!sjRainWakeShouldResleep(1299, 1300, 2));  // measurement due in 1 s: measure now
+    CHECK(!sjRainWakeShouldResleep(1400, 1300, 2));  // overdue: measure now
+  }
+
+  // ---- self-test verdicts (sj_selftest.h) -----------------------------
+  // FAIL must line up with the readX() rules in sensors.h that leave a
+  // value out of the reading; OK means the value is sent.
+  {
+    // HC-SR04: readWaterLevelM() needs 3 of 5 echoes
+    CHECK(sjCheckUltrasonic(0, 5, 0, 0, 0, 100).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckUltrasonic(2, 5, 50, 50, 51, 100).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckUltrasonic(5, 5, 49, 50, 51, 100).status == SJ_CHECK_OK);
+    CHECK(std::strstr(sjCheckUltrasonic(5, 5, 49, 50, 51, 100).detail, "level 0.500 m (5/5 echoes)"));
+    CHECK(sjCheckUltrasonic(4, 5, 49, 50, 51, 100).status == SJ_CHECK_WARN);      // sent, but a ping was lost
+    CHECK(sjCheckUltrasonic(3, 5, 49, 50, 51, 100).status == SJ_CHECK_WARN);
+    CHECK(sjCheckUltrasonic(5, 5, 1.0f, 1.5f, 1.8f, 100).status == SJ_CHECK_WARN);  // below 2 cm
+    CHECK(sjCheckUltrasonic(5, 5, 119, 120, 121, 100).status == SJ_CHECK_WARN);     // past the zero surface
+    CHECK(sjCheckUltrasonic(5, 5, 103, 104, 104.5f, 100).status == SJ_CHECK_OK);    // within 5 % of mount
+    CHECK(std::strstr(sjCheckUltrasonic(5, 5, 103, 104, 104.5f, 100).detail, "level 0.000 m"));
+    CHECK(sjCheckUltrasonic(5, 5, 30, 50, 80, 100).status == SJ_CHECK_WARN);        // multipath spread
+
+    // DHT22
+    CHECK(sjCheckDht(false, 0, 0).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckDht(true, 25.0f, 60.0f).status == SJ_CHECK_OK);
+    CHECK(sjCheckDht(true, 85.0f, 60.0f).status == SJ_CHECK_WARN);
+
+    // MQ135 (readGasPpm(): AO < 0.01 V or Rs <= 0 -> left out)
+    CHECK(sjCheckMq135(0, 2.0f, -1, 0, 300).status == SJ_CHECK_FAIL);
+    // clipped with the 2:1 divider -> AO "6.3 V" > MQ135_VCC -> Rs < 0 -> NOT sent (review finding)
+    CHECK(sjCheckMq135(3150, 2.0f, 1.0f * (5 - 6.3f) / 6.3f, 0, 300).status == SJ_CHECK_FAIL);
+    CHECK(std::strstr(sjCheckMq135(3150, 2.0f, -0.2f, 0, 300).detail, "divider missing"));
+    CHECK(sjCheckMq135(3150, 1.0f, 0.59f, 900, 300).status == SJ_CHECK_WARN);  // clipped, still sent
+    // pin at the ADC floor (~142 mV for 0 V): unpowered and clean air look alike -> WARN
+    CHECK(sjCheckMq135(142, 2.0f, 16.6f, 8050, 300).status == SJ_CHECK_WARN);
+    CHECK(sjCheckMq135(2000, 3.0f, -0.2f, 0, 300).status == SJ_CHECK_FAIL);    // AO 6 V > MQ135_VCC
+    CHECK(sjCheckMq135(500, 2.0f, 9.0f, 420, 60).status == SJ_CHECK_WAIT);     // heater still cold
+    CHECK(sjCheckMq135(500, 2.0f, 9.0f, 420, 300).status == SJ_CHECK_OK);
+    CHECK(sjCheckMq135(500, 2.0f, 9.0f, 50000, 300).status == SJ_CHECK_WARN);  // uncalibrated R0
+
+    // IR flame: a loose wire follows the internal pulls
+    CHECK(sjCheckFlame(false, true, true).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckFlame(true, true, true).status == SJ_CHECK_OK);
+    CHECK(sjCheckFlame(false, false, false).status == SJ_CHECK_WARN);  // module pulls LOW: sees flame
+
+    // rain gauge
+    CHECK(sjCheckRain(true, 0).status == SJ_CHECK_OK);
+    CHECK(sjCheckRain(false, 3).status == SJ_CHECK_WARN);
+
+    // soil (readSoilMoisturePct(): < 100 mV -> left out), calibration 2600 dry / 1100 wet
+    CHECK(sjCheckSoil(50, 2600, 1100).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckSoil(142, 2600, 1100).status == SJ_CHECK_FAIL);  // 0 V reads ~142 mV on the ESP32
+    CHECK(sjCheckSoil((uint32_t)SJ_ADC_FLOOR_MV, 2600, 1100).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckSoil((uint32_t)SJ_ADC_FLOOR_MV + 1, 2600, 1100).status != SJ_CHECK_FAIL);
+    CHECK(sjCheckSoil(2000, 2600, 1100).status == SJ_CHECK_OK);
+    CHECK(std::strstr(sjCheckSoil(2000, 2600, 1100).detail, "-> 40 %"));
+    CHECK(sjCheckSoil(2700, 2600, 1100).status == SJ_CHECK_OK);     // a bit drier than calibrated: 0 %
+    CHECK(sjCheckSoil(2900, 2600, 1100).status == SJ_CHECK_WARN);   // way outside the calibration
+    CHECK(sjCheckSoil(850, 2600, 1100).status == SJ_CHECK_WARN);
+    CHECK(sjCheckSoil(3150, 2600, 1100).status == SJ_CHECK_WARN);   // clipped
+
+    // MPU6050
+    CHECK(sjCheckMpu(true, false, -1, false, 0, 0, 5).status == SJ_CHECK_FAIL);   // no I2C answer
+    CHECK(sjCheckMpu(false, true, 0x68, false, 0, 0, 5).status == SJ_CHECK_FAIL); // plugged in after boot
+    CHECK(sjCheckMpu(true, true, 0x68, false, 0, 0, 5).status == SJ_CHECK_FAIL);  // read failed
+    CHECK(sjCheckMpu(true, true, 0x68, true, 1.01f, 0.4f, 5).status == SJ_CHECK_OK);
+    CHECK(sjCheckMpu(true, true, 0x70, true, 1.01f, 0.4f, 5).status == SJ_CHECK_OK);  // MPU6500 clone
+    CHECK(sjCheckMpu(true, true, 0x12, true, 1.01f, 0.4f, 5).status == SJ_CHECK_WARN);
+    CHECK(sjCheckMpu(true, true, 0x68, true, 1.30f, 0.4f, 5).status == SJ_CHECK_WARN);
+    CHECK(sjCheckMpu(true, true, 0x68, true, 1.00f, 6.0f, 5).status == SJ_CHECK_WARN);
+
+    // PMS5003 (readPm(): no frame in 10 s -> left out)
+    CHECK(sjCheckPms(false, 0, 0, 0, 100).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckPms(true, 12000, 10, 20, 100).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckPms(true, 500, 10, 20, 10).status == SJ_CHECK_WAIT);
+    CHECK(sjCheckPms(true, 500, 30, 20, 100).status == SJ_CHECK_WARN);
+    CHECK(sjCheckPms(true, 500, 12, 20, 100).status == SJ_CHECK_OK);
+
+    // pH (readPh(): < 100 mV or outside 0-14 -> left out), calibration 2500 mV @7, 3030 @4
+    CHECK(sjCheckPh(50, 1.5f, 2500, 3030).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckPh(2500 / 1.5f, 1.5f, 2500, 3030).status == SJ_CHECK_OK);
+    CHECK(std::strstr(sjCheckPh(2500 / 1.5f, 1.5f, 2500, 3030).detail, "pH 7.00"));
+    CHECK(sjCheckPh(1000 / 1.5f, 1.5f, 2500, 3030).status == SJ_CHECK_FAIL);  // pH 15.5
+    CHECK(sjCheckPh(142, 1.5f, 2500, 3030).status == SJ_CHECK_FAIL);          // ADC floor: unpowered
+    // clipped with this calibration -> pH -5.6 -> readPh() drops it (review finding)
+    CHECK(sjCheckPh(3150, 1.5f, 2500, 3030).status == SJ_CHECK_FAIL);
+    CHECK(std::strstr(sjCheckPh(3150, 1.5f, 2500, 3030).detail, "bigger divider"));
+    CHECK(sjCheckPh(3150, 1.5f, 5000, 5530).status == SJ_CHECK_WARN);         // clipped but pH 8.6: sent
+
+    // turbidity (< 0.1 V -> left out; < 2.5 V -> sent as 3000 NTU)
+    CHECK(sjCheckTurbidity(50, 1.5f).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckTurbidity(142, 1.5f).status == SJ_CHECK_FAIL);  // ADC floor: unplugged
+    CHECK(sjCheckTurbidity(1000, 1.5f).status == SJ_CHECK_WARN);
+    CHECK(sjCheckTurbidity(2750, 1.5f).status == SJ_CHECK_OK);  // 4.1 V: clear water
+    CHECK(sjCheckTurbidity(3150, 1.5f).status == SJ_CHECK_WARN);
+
+    // battery (< 1 V -> left out), 3.0 V empty, 4.2 V full
+    CHECK(sjCheckBattery(400, 2.0f, 3.0f, 4.2f).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckBattery(1900, 2.0f, 3.0f, 4.2f).status == SJ_CHECK_OK);
+    CHECK(std::strstr(sjCheckBattery(1900, 2.0f, 3.0f, 4.2f).detail, "3.80 V -> 67 %"));
+    CHECK(sjCheckBattery(2300, 2.0f, 3.0f, 4.2f).status == SJ_CHECK_WARN);  // 4.6 V: wrong ratio
+    CHECK(sjCheckBattery(1400, 2.0f, 3.0f, 4.2f).status == SJ_CHECK_WARN);  // 2.8 V: empty
+
+    // SX127x version register (same set RadioLib's SX1278 driver accepts)
+    CHECK(sjCheckLora(0x12, 0).status == SJ_CHECK_OK);
+    CHECK(sjCheckLora(0x13, 0).status == SJ_CHECK_OK);
+    CHECK(sjCheckLora(0x11, 0).status == SJ_CHECK_OK);
+    CHECK(sjCheckLora(0x00, 0).status == SJ_CHECK_FAIL);   // MISO stuck low
+    CHECK(sjCheckLora(0xFF, 0).status == SJ_CHECK_FAIL);   // MISO floating / no power
+    CHECK(sjCheckLora(0x22, 0).status == SJ_CHECK_FAIL);   // SX1272
+    CHECK(sjCheckLora(-2, -2).status == SJ_CHECK_FAIL);    // RadioLib error code
+    // wire fixed after boot -> RESET helps
+    CHECK(sjCheckLora(0x12, SJ_LORA_ERR_CHIP_NOT_FOUND).status == SJ_CHECK_FAIL);
+    CHECK(std::strstr(sjCheckLora(0x12, SJ_LORA_ERR_CHIP_NOT_FOUND).detail, "RESET"));
+    // chip fine but a config.h value refused (e.g. 865 MHz on an SX1278) -> RESET won't help
+    CHECK(sjCheckLora(0x12, -12).status == SJ_CHECK_FAIL);
+    CHECK(std::strstr(sjCheckLora(0x12, -12).detail, "config.h") && !std::strstr(sjCheckLora(0x12, -12).detail, "RESET"));
+
+    CHECK(sjCheckWifi(false, 0).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckWifi(true, -85).status == SJ_CHECK_WARN);
+    CHECK(sjCheckWifi(true, -60).status == SJ_CHECK_OK);
+
+    CHECK(sjCheckQueue(false, 0, 2000, 0).status == SJ_CHECK_FAIL);
+    CHECK(sjCheckQueue(true, 1599, 2000, 0).status == SJ_CHECK_OK);
+    CHECK(sjCheckQueue(true, 1600, 2000, 0).status == SJ_CHECK_WARN);  // 80 % full
+    CHECK(sjCheckQueue(true, 0, 2000, 3).status == SJ_CHECK_WARN);
+
+    CHECK(sjCheckEdge(false, true).status == SJ_CHECK_WARN);
+    CHECK(sjCheckEdge(true, false).status == SJ_CHECK_OK);
+
+    // long values never overflow the detail buffer
+    SjCheckResult big = sjCheckUltrasonic(5, 5, 1e30f, 1e30f, 1e30f, 1e30f);
+    CHECK(std::strlen(big.detail) < sizeof(big.detail));
+
+    // summary line: the worst status decides
+    SjSelfTestTally t;
+    std::memset(&t, 0, sizeof(t));
+    sjTallyAdd(t, SJ_CHECK_OK);
+    CHECK(std::strcmp(sjTallyVerdict(t), "all good") == 0);
+    sjTallyAdd(t, SJ_CHECK_WAIT);
+    CHECK(std::strstr(sjTallyVerdict(t), "again"));
+    sjTallyAdd(t, SJ_CHECK_WARN);
+    CHECK(std::strstr(sjTallyVerdict(t), "WARN"));
+    sjTallyAdd(t, SJ_CHECK_FAIL);
+    CHECK(std::strstr(sjTallyVerdict(t), "FAIL") && t.counts[SJ_CHECK_OK] == 1 && t.counts[SJ_CHECK_FAIL] == 1);
+  }
+
   // ---- JSON samples (validated against the backend in Python) --------
   FILE* jf = std::fopen(jsonOut, "w");
   // 1. full sensor set, known age, 12-char node id (no NUL in the packet)
@@ -101,6 +270,19 @@ int main(int argc, char** argv) {
   String s2;
   sjAppendJson(s2, core, -1, -61, "wifi");
   std::fprintf(jf, "%s\n", s2.c_str());
+  // 3. modular landslide node: MPU6050 + battery only, no core sensors (P2.7)
+  SjReading tiltOnly = makeReading("NODE-HILL", 2, 4);
+  tiltOnly.flags = SJ_HAS_TILT | SJ_HAS_BATTERY;
+  tiltOnly.tilt_deg_x100 = 1250;
+  tiltOnly.vibration_g_x1000 = 400;
+  tiltOnly.battery_x10 = 900;
+  CHECK((tiltOnly.flags & SJ_MEASUREMENT_FLAGS) != 0);
+  SjReading batteryOnly = makeReading("NODE-HILL", 2, 5);
+  batteryOnly.flags = SJ_HAS_BATTERY | SJ_HAS_RAIN;  // telemetry + rain only: not a measurement
+  CHECK((batteryOnly.flags & SJ_MEASUREMENT_FLAGS) == 0);
+  String s3;
+  sjAppendJson(s3, tiltOnly, 30, -80, "lora");
+  std::fprintf(jf, "%s\n", s3.c_str());
   std::fclose(jf);
 
   // ---- persistent queue ---------------------------------------------

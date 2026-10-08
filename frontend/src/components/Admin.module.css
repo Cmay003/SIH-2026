@@ -1,0 +1,248 @@
+/* Admin page - node registry. Colours come from the global tokens only,
+   so the dark theme works without extra rules. */
+.main {
+  padding: 20px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.crumbs {
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.crumbs a {
+  color: var(--green);
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.titleRow h2 {
+  color: var(--green-dark);
+  margin: 16px 0 8px;
+}
+@media (prefers-color-scheme: dark) {
+  .titleRow h2,
+  .editor h3 {
+    color: #a5d6a7;
+  }
+}
+
+.intro {
+  color: var(--text-muted);
+  max-width: 75ch;
+  margin: 0 0 16px;
+  line-height: 1.45;
+}
+
+/* ---- buttons ---- */
+.main button {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.main button:hover:not(:disabled) {
+  border-color: var(--green);
+}
+.main button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.main .primary {
+  background: var(--green);
+  border-color: var(--green);
+  color: #fff;
+  font-weight: bold;
+}
+.main .primary:hover:not(:disabled) {
+  background: var(--green-dark);
+}
+.main .danger {
+  color: var(--danger);
+}
+.main .danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+/* ---- messages ---- */
+.notice {
+  background: var(--info-bg);
+  color: var(--info);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+.notice code,
+.errorBox code {
+  font-size: 13px;
+  word-break: break-all;
+}
+.errorBox {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin: 12px 0;
+}
+.empty {
+  color: var(--text-muted);
+}
+
+/* ---- node table ---- */
+.tableWrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+.table {
+  width: 100%;
+  min-width: 900px;
+  background: var(--surface);
+  border-collapse: collapse;
+}
+.table th,
+.table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  font-size: 14px;
+  vertical-align: middle;
+}
+.table thead th {
+  background: var(--green-dark);
+  color: #fff;
+}
+.table tbody tr:hover {
+  background: var(--green-lighter);
+}
+.actions {
+  white-space: nowrap;
+  text-align: right;
+}
+.actions button + button {
+  margin-left: 6px;
+}
+.statusOk {
+  color: var(--sev-low);
+  font-weight: bold;
+}
+.statusWarn {
+  color: var(--sev-medium);
+  font-weight: bold;
+}
+.statusBad {
+  color: var(--sev-high);
+  font-weight: bold;
+}
+.statusIdle {
+  color: var(--text-muted);
+}
+
+/* ---- editor ---- */
+.editor {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 20px 20px;
+  margin-bottom: 24px;
+}
+.editor h3 {
+  margin: 0 0 12px;
+  color: var(--green-dark);
+}
+.editorGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+}
+@media (max-width: 860px) {
+  .editorGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+@media (max-width: 420px) {
+  .pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.field label {
+  font-weight: bold;
+  font-size: 14px;
+}
+.field input,
+.field select {
+  font: inherit;
+  font-size: 15px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text);
+  width: 100%;
+  box-sizing: border-box;
+}
+.field input:disabled {
+  opacity: 0.7;
+}
+.field [aria-invalid="true"] {
+  border-color: var(--danger);
+}
+.fieldError {
+  color: var(--danger);
+  font-size: 13px;
+}
+.hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.mapBox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 320px;
+}
+.map {
+  flex: 1;
+  min-height: 320px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.buttons {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
