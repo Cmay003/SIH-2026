@@ -6,6 +6,7 @@ import { MapContainer, TileLayer } from "react-leaflet";
 import { apiGet } from "../api/client";
 import type { HazardZone, HazardZonesResponse, NodeHealth, NodeHealthResponse, SosListResponse, SosRequest } from "../api/types";
 import { UserChip } from "../components/AppHeader";
+import { useMe } from "../hooks/useAuth";
 import { AlarmSoundToggle, EmergencyAlarm } from "../components/EmergencyAlarm";
 import { Logo } from "../components/Logo";
 import styles from "../components/Officer.module.css";
@@ -13,7 +14,7 @@ import {
   FocusOnNode, HazardZones, MapAutoResize, NodeMarkers, SosMarkers, prefersReducedMotion, useResolveAllSos,
   useResolveSos, type FocusRequest,
 } from "../components/officerMap";
-import { alarmItemsFromZones, alarmKey, hazardTitle, type AlarmItem } from "../lib/alarm";
+import { alarmItemsFromZones, alarmKey, hazardTitle, receivesAlarm, type AlarmItem } from "../lib/alarm";
 import { hazardIcon, hospitalZoneNote, manualLocationNote, percent } from "../lib/hazards";
 import { SEVERITY_RANK } from "../lib/severity";
 import { useBackgroundRefetch } from "../lib/useBackgroundRefetch";
@@ -73,6 +74,8 @@ export function OfficerPage() {
   };
   const zoneList = useMemo(() => zones.data?.zones ?? [], [zones.data]);
   const alarmItems = useMemo(() => alarmItemsFromZones(zoneList), [zoneList]);
+  // Only officers get the pop-up + siren (admins can open this map too)
+  const alarmOn = receivesAlarm(useMe().data?.user.role);
 
   // "Show" in the alarm: fly to the zone, open the panel, announce it and
   // move keyboard focus to that zone's button (the dialog has just closed).
@@ -127,13 +130,14 @@ export function OfficerPage() {
       </div>
       <OfficerPanel sos={sos.data} health={health.data} zones={zones.data ? zoneList : undefined}
                     loadError={zones.isError || sos.isError} onShowSos={showSosOnMap} onShowZone={showZoneFromList}
-                    collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} mapStatus={mapStatus} />
-      <EmergencyAlarm items={alarmItems} onShow={showAlarmItem} returnFocusTo="officer-panel-title" />
+                    collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} mapStatus={mapStatus}
+                    alarmOn={alarmOn} />
+      {alarmOn && <EmergencyAlarm items={alarmItems} onShow={showAlarmItem} returnFocusTo="officer-panel-title" />}
     </div>
   );
 }
 
-function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, collapsed, onToggle, mapStatus }: {
+function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, collapsed, onToggle, mapStatus, alarmOn }: {
   sos: SosListResponse | undefined;
   health: NodeHealthResponse | undefined;
   zones: HazardZone[] | undefined;
@@ -143,6 +147,7 @@ function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, co
   collapsed: boolean;
   onToggle: () => void;
   mapStatus: string;
+  alarmOn: boolean;
 }) {
   const resolveAll = useResolveAllSos();
 
@@ -180,7 +185,7 @@ function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, co
       <div id="officer-panel-body" className={styles.body} hidden={collapsed}>
         <div className={styles.toolsRow}>
           <UserChip variant="light" />
-          <AlarmSoundToggle variant="light" />
+          {alarmOn && <AlarmSoundToggle variant="light" />}
         </div>
 
         {loadError && <div className={styles.loadError} role="status">Can't reach the server - retrying...</div>}

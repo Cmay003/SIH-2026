@@ -24,7 +24,7 @@
  * subscribers), the models and the RAG store into a temporary
  * SANJEEVNI_VAR_DIR, makes a demo-only simulator key in that copy, and
  * starts its own AI backend + web server on spare ports. Open the printed
- * URL and log in with your usual account.
+ * URL and log in with an OFFICER account (only officers get the siren).
  * Without --fresh it runs against an already running stack (--server,
  * --backend) and needs a simulator device key; it then adds readings and
  * one SOS to THAT database.
@@ -951,7 +951,7 @@ async function main(argv = process.argv.slice(2)) {
       for (const p of problems) console.log(`   - ${p}`);
       return shutdown(1);
     }
-    console.log(`\n   Dashboard:   ${opts.server}/            (log in with your usual account)`);
+    console.log(`\n   Dashboard:   ${opts.server}/            (log in as an officer - only officers get the siren)`);
     console.log(`   Officer map: ${opts.server}/officer.html`);
     console.log(`   Seed ${opts.seed}, a round of readings every ${opts.interval}s, each cue held ${opts.waitEnter ? "until Enter" : `${opts.pace}s`}.`);
 

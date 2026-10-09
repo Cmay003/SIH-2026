@@ -185,7 +185,7 @@
                 // single highest-risk hazard system-wide.
                 const top = result.hazards[0];
                 criticalContainer.innerHTML = `
-                    <a href="officer.html?focus=${encodeURIComponent(top.node_id)}" target="_blank">
+                    <a href="officer.html?focus=${encodeURIComponent(top.node_id)}" target="sanjeevni-officer-map">
                         <div class="critical-hazard-box">
                             <div class="ch-left">
                                 <h4>${hazardIconFor(top.hazard_type)} ${top.label}: ${top.hazard_type.toUpperCase()}</h4>
@@ -200,7 +200,7 @@
                 `;
 
                 container.innerHTML = result.hazards.map(h => `
-                    <a href="officer.html?focus=${encodeURIComponent(h.node_id)}" target="_blank" class="hazard-card-link">
+                    <a href="officer.html?focus=${encodeURIComponent(h.node_id)}" target="sanjeevni-officer-map" class="hazard-card-link">
                         <div class="hazard-card ${h.severity}">
                             <h4>${hazardIconFor(h.hazard_type)} ${h.label}: ${h.hazard_type.toUpperCase()}</h4>
                             <div class="loc">📍 ${h.location} (${h.node_id})</div>

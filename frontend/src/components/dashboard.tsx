@@ -8,6 +8,20 @@ import styles from "./Dashboard.module.css";
 
 const officerLink = (nodeId: string) => `/officer.html?focus=${encodeURIComponent(nodeId)}`;
 
+/**
+ * Every officer-map link from the dashboard targets this one named tab, so a
+ * second click re-uses (and re-focuses) the map tab instead of opening
+ * another one. No rel="noopener" on these links: that puts each new tab in
+ * its own browsing-context group, where the name is never found again.
+ * Same-origin pages, so the opener link is harmless.
+ */
+export const OFFICER_MAP_TAB = "sanjeevni-officer-map";
+
+/** Open (or re-use) the officer-map tab focused on a node - e.g. after Acknowledge. */
+export function openOfficerMap(nodeId: string): void {
+  window.open(officerLink(nodeId), OFFICER_MAP_TAB)?.focus();
+}
+
 /** Same key the emergency alarm uses (node_id + "|" + hazard_type). */
 export const hazardKey = (h: Pick<Hazard, "node_id" | "hazard_type">) => alarmKey(h.node_id, h.hazard_type);
 
@@ -231,7 +245,7 @@ export function CriticalHazard({
   }
   const tone = severityClass(hazard.severity);
   return (
-    <a className={styles.cardLink} href={officerLink(hazard.node_id)} target="_blank" rel="noopener">
+    <a className={styles.cardLink} href={officerLink(hazard.node_id)} target={OFFICER_MAP_TAB}>
       <div className={`${styles.critical} ${styles[`critical_${tone}`] ?? ""} ${highlighted ? styles.highlighted : ""}`}>
         <div className={styles.criticalMain}>
           <div className={styles.criticalTop}>
@@ -286,7 +300,7 @@ export function HazardList({ hazards, highlightKey = null }: { hazards: Hazard[]
         const key = hazardKey(h);
         return (
           <li key={key} className={styles.hazardItem}>
-            <a className={styles.cardLink} href={officerLink(h.node_id)} target="_blank" rel="noopener"
+            <a className={styles.cardLink} href={officerLink(h.node_id)} target={OFFICER_MAP_TAB}
                data-hazard-key={key}>
               <article
                 className={`${styles.hazardCard} ${styles[severityClass(h.severity)] ?? ""} ${

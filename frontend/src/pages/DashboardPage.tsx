@@ -12,14 +12,16 @@ import {
   LiveBar,
   SensorTable,
   hazardKey,
+  openOfficerMap,
   type LiveState,
 } from "../components/dashboard";
 import styles from "../components/Dashboard.module.css";
 import { AlarmSoundToggle, EmergencyAlarm } from "../components/EmergencyAlarm";
-import { alarmItemsFromHazards, type AlarmItem } from "../lib/alarm";
+import { alarmItemsFromHazards, receivesAlarm, type AlarmItem } from "../lib/alarm";
 import { isSevere } from "../lib/hazards";
 import { useBackgroundRefetch } from "../lib/useBackgroundRefetch";
 import { useDeniedToast } from "../components/Toast";
+import { useMe } from "../hooks/useAuth";
 
 // Same refresh rates as the original dashboard (2 s readings, 5 s hazards).
 // TanStack Query pauses polling while the tab is hidden - except for the
@@ -64,6 +66,11 @@ export function DashboardPage() {
   const severeCount = hazardList.filter((h) => isSevere(h.severity)).length;
   const alarmItems = useMemo(() => alarmItemsFromHazards(hazardList), [hazardList]);
   const deniedToast = useDeniedToast();
+  // Only officers get the pop-up + siren (lib/alarm.ts receivesAlarm)
+  const alarmOn = receivesAlarm(useMe().data?.user.role);
+  // Acknowledge on the dashboard takes the officer to the map, in the same
+  // officer-map tab the hazard cards use
+  const ackOpensMap = useCallback((item: AlarmItem) => openOfficerMap(item.nodeId), []);
 
   // "Show" in the alarm pop-up: highlight that hazard's card, scroll to it
   // and move keyboard focus there.
@@ -99,11 +106,16 @@ export function DashboardPage() {
       <a className="skip-link" href="#main">Skip to main content</a>
       {deniedToast}
       <AppHeader connection={connection}>
-        <div className={styles.headerTools}>
-          <AlarmSoundToggle />
-        </div>
+        {alarmOn && (
+          <div className={styles.headerTools}>
+            <AlarmSoundToggle />
+          </div>
+        )}
       </AppHeader>
-      <EmergencyAlarm items={alarmItems} onShow={showHazard} returnFocusTo="main" />
+      {alarmOn && (
+        <EmergencyAlarm items={alarmItems} onShow={showHazard} onAcknowledge={ackOpensMap}
+                        acknowledgeNote="Acknowledge opens the officer map" returnFocusTo="main" />
+      )}
       <main id="main" className={styles.main} tabIndex={-1}>
         <LiveBar
           state={liveState}

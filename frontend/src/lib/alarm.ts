@@ -2,7 +2,7 @@
 // right now. The decision logic is pure functions so it can be tested
 // without React or audio; the small storage-backed stores at the bottom
 // hold the acknowledgements (per tab) and the sound preference.
-import type { Hazard, HazardZone } from "../api/types";
+import type { Hazard, HazardZone, Role } from "../api/types";
 import { readStored, writeStored } from "./storage";
 
 export type AlarmSeverity = "HIGH" | "CRITICAL";
@@ -50,6 +50,14 @@ function isAlarmSeverity(value: unknown): value is AlarmSeverity {
 }
 
 export const alarmKey = (nodeId: string, hazardType: string): string => `${nodeId}|${hazardType}`;
+
+/**
+ * The pop-up + siren is for the people who respond: officers only. Viewers
+ * and admins still see every hazard on the page, just without the alarm.
+ * (To give admins the alarm too, add "admin" here.)
+ */
+const ALARM_ROLES: readonly Role[] = ["officer"];
+export const receivesAlarm = (role: Role | undefined): boolean => role !== undefined && ALARM_ROLES.includes(role);
 
 /** "gas_leak" / "gas leak" -> "Gas leak" */
 export function hazardTitle(hazardType: string): string {

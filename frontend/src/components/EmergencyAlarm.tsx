@@ -62,10 +62,19 @@ const placeText = (item: AlarmItem) =>
 export function EmergencyAlarm({
   items,
   onShow,
+  onAcknowledge,
+  acknowledgeNote,
   returnFocusTo,
 }: {
   items: AlarmItem[];
   onShow?: (item: AlarmItem) => void;
+  /**
+   * Called with the most severe item when the Acknowledge BUTTON is clicked
+   * (not on Escape) - still inside the click, so it may open a tab.
+   */
+  onAcknowledge?: (top: AlarmItem) => void;
+  /** Short text next to Acknowledge saying what else it does (e.g. "Opens the officer map"). */
+  acknowledgeNote?: string;
   returnFocusTo?: string;
 }) {
   const [acks, setAcks] = useState<AckMap>(readAcks);
@@ -83,6 +92,7 @@ export function EmergencyAlarm({
   const releasingRef = useRef(false);
   const titleId = useId();
   const descId = useId();
+  const ackNoteId = useId();
   const itemsRef = useRef(items);
   itemsRef.current = items;
   // a ref keeps it out of the [open] focus effect's dependencies
@@ -131,8 +141,10 @@ export function EmergencyAlarm({
   };
 
   const acknowledgeByClick = () => {
+    const top = alarming[0];
     acknowledgeAll();
     unlockAfterAck();
+    if (top) onAcknowledge?.(top);
   };
 
   const show = (item: AlarmItem) => {
@@ -419,7 +431,9 @@ export function EmergencyAlarm({
               </button>
             </>
           )}
-          <button ref={ackRef} type="button" className={styles.ackBtn} data-own-audio-unlock="" onClick={acknowledgeByClick}>
+          {acknowledgeNote && <p id={ackNoteId} className={styles.mutedNote}>{acknowledgeNote}</p>}
+          <button ref={ackRef} type="button" className={styles.ackBtn} data-own-audio-unlock="" onClick={acknowledgeByClick}
+                  aria-describedby={acknowledgeNote ? ackNoteId : undefined}>
             Acknowledge
           </button>
         </div>

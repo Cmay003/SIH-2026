@@ -3,6 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setUnauthorizedHandler } from "../api/client";
 import type { Hazard, SensorRow } from "../api/types";
+import { OFFICER_MAP_TAB } from "../components/dashboard";
+import { receivesAlarm } from "../lib/alarm";
 import { DashboardPage } from "../pages/DashboardPage";
 import { LoginPage } from "../pages/LoginPage";
 import { Providers } from "../Providers";
@@ -164,5 +166,76 @@ describe("DashboardPage", () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Failed to fetch"));
     renderDashboard();
     expect(await screen.findByText("Backend not connected", {}, { timeout: 4000 })).toBeInTheDocument();
+  });
+});
+
+// User report 2026-10-09: every click on a hazard card opened ANOTHER officer
+// map tab; the siren must be for officers only; Acknowledge on the dashboard
+// should take the officer to the map.
+describe("Dashboard -> officer map + who gets the alarm", () => {
+  const routes = (role: "viewer" | "officer" | "admin", hazards: Hazard[]) => ({
+    "/api/auth/me": () => json(200, { user: { username: `${role}1`, role }, idle_timeout_minutes: 60 }),
+    "/api/sensors": () => json(200, { success: true, count: 0, data: [] }),
+    "/api/hazards": () => json(200, { success: true, count: hazards.length, hazards }),
+  });
+
+  it("only officers receive the alarm", () => {
+    expect(receivesAlarm("officer")).toBe(true);
+    expect(receivesAlarm("viewer")).toBe(false);
+    expect(receivesAlarm("admin")).toBe(false);
+    expect(receivesAlarm(undefined)).toBe(false); // still loading who is signed in
+  });
+
+  it("every hazard card targets the one named officer-map tab, so a second click re-uses it", async () => {
+    routeFetch(routes("officer", [hazard(), hazard({ node_id: "NODE-07", severity: "MEDIUM" })]));
+    renderDashboard();
+    await screen.findByRole("alertdialog");
+    const links = screen.getAllByRole("link", { hidden: true }).filter((a) => a.getAttribute("href")?.startsWith("/officer.html"));
+    expect(links.length).toBeGreaterThanOrEqual(3); // critical callout + 2 cards
+    for (const a of links) {
+      expect(a).toHaveAttribute("target", OFFICER_MAP_TAB);
+      // rel="noopener" would put each tab in its own group, where the name is never found again
+      expect(a).not.toHaveAttribute("rel");
+    }
+  });
+
+  it("a viewer sees the HIGH hazard but gets no pop-up, siren or sound control", async () => {
+    routeFetch(routes("viewer", [hazard({ severity: "CRITICAL" })]));
+    renderDashboard();
+    expect(await screen.findByText("viewer1")).toBeInTheDocument();
+    expect(within(screen.getByRole("main")).getAllByText("82%").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Alarm sound|enable sound/ })).toBeNull();
+  });
+
+  it("an admin on the dashboard gets no pop-up either", async () => {
+    routeFetch(routes("admin", [hazard({ severity: "CRITICAL" })]));
+    renderDashboard();
+    expect(await screen.findByText("admin1")).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("officer: Acknowledge silences the alarm and opens the officer map tab on the most severe hazard", async () => {
+    const focus = vi.fn();
+    const open = vi.spyOn(window, "open").mockReturnValue({ focus } as unknown as Window);
+    routeFetch(routes("officer", [hazard(), hazard({ node_id: "NODE-07", severity: "CRITICAL", risk_score: 0.95 })]));
+    renderDashboard();
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText("Acknowledge opens the officer map")).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Acknowledge" }));
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledWith("/officer.html?focus=NODE-07", OFFICER_MAP_TAB);
+    expect(focus).toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  it("officer: Escape only acknowledges - it does not open the map", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    routeFetch(routes("officer", [hazard()]));
+    renderDashboard();
+    await screen.findByRole("alertdialog");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(open).not.toHaveBeenCalled();
   });
 });

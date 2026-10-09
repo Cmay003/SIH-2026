@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import L from "leaflet";
 import { useRef } from "react";
 import { MapContainer } from "react-leaflet";
@@ -345,6 +345,28 @@ describe("Officer page", { timeout: 30_000 }, () => {
     routeFetch(officerRoutes(() => [], [zone()])); // NODE-04 only
     render(<Providers><OfficerPage /></Providers>);
     expect(await screen.findByText("NODE-09 has no active hazard zone on the map")).toBeInTheDocument();
+  });
+
+  it("officer: a confirmed HIGH zone pops up the alarm; Acknowledge just closes it (already on the map)", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    routeFetch(officerRoutes(() => [], [zone()]));
+    render(<Providers><OfficerPage /></Providers>);
+    const dialog = await screen.findByRole("alertdialog", {}, { timeout: 5000 });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Acknowledge" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("admin: the same zone shows on the map but there is no alarm or sound control", async () => {
+    routeFetch({
+      ...officerRoutes(() => [], [zone({ severity: "CRITICAL" })]),
+      "/api/auth/me": () => json(200, { user: { username: "admin1", role: "admin" }, idle_timeout_minutes: 60 }),
+    });
+    render(<Providers><OfficerPage /></Providers>);
+    expect(await screen.findByText("admin1", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByText(/All SOS requests resolved/)).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Alarm sound|enable sound/ })).toBeNull();
   });
 
   it("shows the all-clear when there are no open SOS requests", async () => {
