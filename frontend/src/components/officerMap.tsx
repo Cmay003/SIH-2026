@@ -9,7 +9,7 @@ import { Fragment, useEffect, useRef, useState, type RefObject } from "react";
 import { Circle, CircleMarker, Marker, Popup, useMap } from "react-leaflet";
 import { apiGet, apiPost } from "../api/client";
 import type { ForecastResponse, HazardZone, NodeHealth, SatelliteCheck, SosRequest } from "../api/types";
-import { hazardIcon } from "../lib/hazards";
+import { hazardIcon, hospitalZoneNote, manualLocationNote, staleText } from "../lib/hazards";
 import { severityMapColor } from "../lib/severity";
 import styles from "./Officer.module.css";
 
@@ -43,20 +43,40 @@ const hazardMarkerIcon = (severity: string, hazardType: string) =>
     }),
   );
 
-const sosMarkerIcon = () =>
-  cachedIcon("sos", () =>
+/**
+ * manual: the person placed the point by hand on a map (no device fix), so
+ * the pin carries a "?" badge - it can be off by a street or more and must
+ * not look as exact as a GPS pin.
+ */
+const sosMarkerIcon = (manual: boolean) =>
+  cachedIcon(manual ? "sos-manual" : "sos", () =>
     L.divIcon({
       className: styles.divIconReset,
-      html: `<div class="${styles.sosPinWrap}"><div class="${styles.sosPulse}"></div><div class="${styles.sosPin}">📍</div></div>`,
+      html: `<div class="${styles.sosPinWrap}"><div class="${styles.sosPulse}"></div><div class="${styles.sosPin}">📍</div>` +
+        (manual ? `<div class="${styles.sosManualBadge}">?</div>` : "") + "</div>",
       iconSize: [44, 54],
       iconAnchor: [22, 54],
       popupAnchor: [0, -48],
     }),
   );
 
+/**
+ * Stacking order for SOS pins. Leaflet stacks markers by screen y unless told
+ * otherwise, so a newer SOS a little further south would cover an escalated
+ * one - and a click on the pin underneath opens the wrong popup. Escalated SOS
+ * go on top, then the longest-open ones (the same order as the queue). The
+ * +1000 base keeps every SOS above hazard icons (offset 0); the cap of 999
+ * keeps a non-escalated SOS below every escalated one.
+ */
+export const sosZIndexOffset = (s: Pick<SosRequest, "escalated" | "minutes_open">) =>
+  (s.escalated ? 2000 : 1000) + Math.min(Math.max(Math.round(s.minutes_open) || 0, 0), 999);
+
 export const NODE_LEVEL_COLOR = { ok: "#2e7d32", warning: "#f2a900", critical: "#d90429" } as const;
 
 // ---- hazard zones -------------------------------------------------------
+/** markerRefs key for one zone; a node can carry several hazards at once. */
+export const zoneMarkerKey = (z: Pick<HazardZone, "node_id" | "hazard_type">) => `zone:${z.node_id}|${z.hazard_type}`;
+
 export function HazardZones({ zones, markerRefs }: {
   zones: HazardZone[];
   markerRefs: RefObject<Map<string, L.Marker>>;
@@ -77,7 +97,11 @@ export function HazardZones({ zones, markerRefs }: {
             </Circle>
             <Marker position={[z.latitude, z.longitude]} icon={hazardMarkerIcon(z.severity, z.hazard_type)}
                     title={`${z.hazard_type} ${z.severity} at ${z.node_id}${z.confirmed ? "" : " (awaiting confirmation)"}`}
-                    ref={(m) => { if (m) markerRefs.current?.set(z.node_id, m); }}>
+                    ref={(m) => {
+                      if (!m) return;
+                      markerRefs.current?.set(z.node_id, m); // ?focus=NODE-xx deep link
+                      markerRefs.current?.set(zoneMarkerKey(z), m); // exact zone (alarm "Show on map")
+                    }}>
               <Popup minWidth={240}><HazardPopup zone={z} withInsights /></Popup>
             </Marker>
           </Fragment>
@@ -90,10 +114,18 @@ export function HazardZones({ zones, markerRefs }: {
 function HazardPopup({ zone, withInsights = false }: { zone: HazardZone; withInsights?: boolean }) {
   return (
     <div className={styles.popup}>
-      <strong>{zone.node_id}</strong>
-      <div>{hazardIcon(zone.hazard_type)} {zone.hazard_type} - {zone.severity}</div>
+      <div className={styles.popupHead}>
+        <strong>{zone.node_id}</strong>
+        <span className={`${styles.popupSev} ${severityIconClass(zone.severity)}`}>{zone.severity}</span>
+      </div>
+      <div><span aria-hidden="true">{hazardIcon(zone.hazard_type)}</span> {zone.hazard_type}</div>
       <div>Risk score: {zone.risk_score.toFixed(2)}</div>
-      {!zone.confirmed && <div><em>Awaiting confirmation - not yet public</em></div>}
+      {!zone.confirmed && <div className={styles.pendingNote}><em>Awaiting confirmation - not yet public</em></div>}
+      {zone.stale === true && (
+        <div className={styles.pendingNote} title={zone.last_reading_at ? `Last reading: ${zone.last_reading_at}` : undefined}>
+          <strong>{staleText(zone.last_reading_at)}</strong>
+        </div>
+      )}
       {withInsights && zone.hazard_type === "flood" && <FloodInsights nodeId={zone.node_id} />}
     </div>
   );
@@ -144,33 +176,95 @@ function FloodInsights({ nodeId }: { nodeId: string }) {
   );
 }
 
-// ---- deep link: /officer.html?focus=NODE-04 -------------------------------
-export function FocusOnNode({ nodeId, zones, markerRefs }: {
-  nodeId: string | null;
+/** Leaflet's flyTo is a JS animation the CSS reduced-motion rules can't stop. */
+export function prefersReducedMotion(): boolean {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+}
+
+// ---- fly to a zone: ?focus=NODE-04 deep link and the alarm's "Show on map" ----
+/** `seq` changes on every request, so asking for the same zone twice flies there again. */
+export interface FocusRequest {
+  nodeId: string;
+  hazardType?: string;
+  seq: number;
+}
+
+/**
+ * loaded: the zone list has arrived at least once. Until then a missing zone
+ * may just be "not loaded yet" and the request is retried on each refresh;
+ * after that, a missing zone means the hazard has ended and the request is
+ * dropped (onMissing is told). It used to stay pending, and hours later the
+ * node's next hazard flew the map away from whatever the officer was doing
+ * (B63).
+ */
+export function FocusOnNode({ request, zones, loaded, markerRefs, onMissing }: {
+  request: FocusRequest | null;
   zones: HazardZone[];
+  loaded: boolean;
   markerRefs: RefObject<Map<string, L.Marker>>;
+  onMissing?: (request: FocusRequest) => void;
 }) {
   const map = useMap();
-  const done = useRef(false);
-  const [ring, setRing] = useState<HazardZone | null>(null);
+  const handled = useRef(0);
+  const cancelPending = useRef<(() => void) | null>(null);
+  const [ring, setRing] = useState<{ zone: HazardZone; seq: number } | null>(null);
+  // a ref, so a new callback identity on each render doesn't re-run the effect
+  const onMissingRef = useRef(onMissing);
+  onMissingRef.current = onMissing;
   useEffect(() => {
-    if (!nodeId || done.current) return;
-    const zone = zones.find((z) => z.node_id === nodeId);
-    if (!zone) return;
-    done.current = true;
-    map.flyTo([zone.latitude, zone.longitude], 15, { duration: 1.2 });
-    setRing(zone);
-    const openTimer = setTimeout(() => markerRefs.current?.get(nodeId)?.openPopup(), 1300);
+    if (!request || handled.current === request.seq) return;
+    const zone =
+      (request.hazardType && zones.find((z) => z.node_id === request.nodeId && z.hazard_type === request.hazardType)) ||
+      zones.find((z) => z.node_id === request.nodeId);
+    if (!zone) {
+      if (loaded) {
+        handled.current = request.seq; // the hazard has ended - never fly there later
+        onMissingRef.current?.(request);
+      }
+      return; // zones not loaded yet - tried again when they arrive
+    }
+    handled.current = request.seq;
+    cancelPending.current?.();
+    const reduce = prefersReducedMotion();
+    if (reduce) map.setView([zone.latitude, zone.longitude], 15, { animate: false });
+    else map.flyTo([zone.latitude, zone.longitude], 15, { duration: 1.2 });
+    setRing({ zone, seq: request.seq });
+    // Timers live in a ref, not in this effect's cleanup: the 5 s zone
+    // refresh re-runs the effect and must not cancel the popup half-way.
+    const openTimer = setTimeout(
+      () => (markerRefs.current?.get(zoneMarkerKey(zone)) ?? markerRefs.current?.get(zone.node_id))?.openPopup(),
+      reduce ? 50 : 1300,
+    );
     const ringTimer = setTimeout(() => setRing(null), 3000);
-    return () => {
+    cancelPending.current = () => {
       clearTimeout(openTimer);
       clearTimeout(ringTimer);
     };
-  }, [nodeId, zones, map, markerRefs]);
+  }, [request, zones, loaded, map, markerRefs]);
+  useEffect(
+    () => () => {
+      cancelPending.current?.();
+      cancelPending.current = null;
+      handled.current = 0; // a remount (StrictMode) runs the request again
+    },
+    [],
+  );
   return ring ? (
-    <Circle center={[ring.latitude, ring.longitude]} radius={ring.radius_m + 150}
+    <Circle key={ring.seq} center={[ring.zone.latitude, ring.zone.longitude]} radius={ring.zone.radius_m + 150}
             pathOptions={{ color: "#1a73e8", weight: 4, fill: false, className: styles.focusRing }} />
   ) : null;
+}
+
+/** Leaflet only re-measures on window resize; the panel can resize the map too (phones). */
+export function MapAutoResize() {
+  const map = useMap();
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => map.invalidateSize());
+    observer.observe(map.getContainer());
+    return () => observer.disconnect();
+  }, [map]);
+  return null;
 }
 
 // ---- SOS ------------------------------------------------------------------
@@ -181,8 +275,10 @@ export function SosMarkers({ requests, markerRefs }: {
   return (
     <>
       {requests.map((s) => (
-        <Marker key={s.id} position={[s.latitude, s.longitude]} icon={sosMarkerIcon()}
-                title={`SOS #${s.id}${s.escalated ? ", escalated" : ""}, open ${s.minutes_open} min`}
+        <Marker key={s.id} position={[s.latitude, s.longitude]} icon={sosMarkerIcon(s.location_source === "manual")}
+                zIndexOffset={sosZIndexOffset(s)}
+                title={`SOS #${s.id}${s.escalated ? ", escalated" : ""}${
+                  s.location_source === "manual" ? ", location set by hand (approximate)" : ""}, open ${s.minutes_open} min`}
                 ref={(m) => { if (m) markerRefs.current?.set(`sos:${s.id}`, m); }}>
           <Popup minWidth={230}><SosPopup sos={s} /></Popup>
         </Marker>
@@ -197,8 +293,10 @@ function SosPopup({ sos }: { sos: SosRequest }) {
     <div className={styles.popup}>
       {sos.escalated && <div className={styles.escalated}>⚠ ESCALATED - open {sos.minutes_open} min</div>}
       <strong>SOS #{sos.id}</strong> - {new Date(sos.timestamp).toLocaleTimeString()}
+      {manualLocationNote(sos) && <div className={styles.manualLocation}>{manualLocationNote(sos)}</div>}
       {sos.note && <div className={styles.note}>{sos.note}</div>}
-      <div>Nearest hospital: <strong>{sos.nearest_hospital}</strong> ({sos.hospital_distance_km} km)</div>
+      <div>Nearest hospital: <strong>{sos.nearest_hospital}</strong> ({sos.hospital_distance_km} km straight-line)</div>
+      {hospitalZoneNote(sos) && <div className={styles.note}>{hospitalZoneNote(sos)}</div>}
       <a href={sos.responder_route_url} target="_blank" rel="noopener noreferrer">Route to this person</a>
       <a href={sos.hospital_route_url} target="_blank" rel="noopener noreferrer">Route from person to hospital</a>
       <button type="button" className={styles.resolveBtn} disabled={resolve.isPending}
@@ -218,10 +316,15 @@ export function useResolveSos() {
   });
 }
 
+/**
+ * Resolves only the SOS ids passed in - the ones the officer was shown. The
+ * server refuses a request without ids, so an SOS that arrives while the
+ * confirm dialog is open (it blocks polling) stays open (B42).
+ */
 export function useResolveAllSos() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: () => apiPost<{ resolved_count: number }>("/api/sos/resolve-all"),
+    mutationFn: (ids: number[]) => apiPost<{ resolved_count: number }>("/api/sos/resolve-all", { ids }),
     onSuccess: () => client.invalidateQueries({ queryKey: ["sos"] }),
   });
 }

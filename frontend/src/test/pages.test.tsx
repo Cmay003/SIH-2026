@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setUnauthorizedHandler } from "../api/client";
@@ -22,6 +22,7 @@ function routeFetch(routes: Record<string, () => Response>) {
 let replace: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   replace = vi.fn();
+  sessionStorage.clear(); // alarm acknowledgements are kept per tab
   vi.stubGlobal("location", { ...window.location, search: "", pathname: "/", replace });
   setUnauthorizedHandler(vi.fn());
 });
@@ -92,7 +93,12 @@ describe("DashboardPage", () => {
     });
     renderDashboard();
     expect(await screen.findByText("Backend connected")).toBeInTheDocument();
-    expect(await screen.findAllByText("82%")).toHaveLength(2); // critical callout + card
+    // On the page: critical callout + hazard card. The HIGH hazard also opens
+    // the emergency alarm (portalled outside <main>) with its own risk score.
+    const main = screen.getByRole("main");
+    expect(await within(main).findAllByText("82%")).toHaveLength(2);
+    const alarm = await screen.findByRole("alertdialog", { name: "Emergency alert" });
+    expect(within(alarm).getByText("82%")).toBeInTheDocument();
     expect(screen.getByText("District Hospital")).toBeInTheDocument();
     expect(await screen.findByText("officer1")).toBeInTheDocument();
     const cardLinks = screen.getAllByRole("link").filter((a) => a.getAttribute("href")?.startsWith("/officer.html"));
@@ -109,6 +115,35 @@ describe("DashboardPage", () => {
     expect(await screen.findByText(/No critical hazard right now/)).toBeInTheDocument();
     expect(screen.getByText("No active hazards - all nodes normal.")).toBeInTheDocument();
     expect(screen.getByText("No readings yet.")).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).toBeNull(); // nothing to alarm about
+  });
+
+  it("a stale CRITICAL hazard (node stopped reporting) is listed and labelled, but does not alarm", async () => {
+    const lastReading = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    routeFetch({
+      "/api/auth/me": () => json(200, { user: { username: "officer1", role: "officer" }, idle_timeout_minutes: 60 }),
+      "/api/sensors": () => json(200, { success: true, count: 0, data: [] }),
+      "/api/hazards": () =>
+        json(200, {
+          success: true,
+          count: 1,
+          hazards: [
+            hazard({
+              severity: "CRITICAL",
+              stale: true,
+              last_reading_at: lastReading,
+              prediction_text: "No recent reading from this node - last known state only",
+            }),
+          ],
+        }),
+    });
+    renderDashboard();
+    const labels = await screen.findAllByText(/Stale - last reading 2 h ago; node may be offline/);
+    expect(labels.length).toBeGreaterThan(0);
+    expect(labels[0]).toHaveAttribute("title", `Last reading: ${lastReading}`);
+    // the stale note alone carries the staleness - no duplicate server text
+    expect(screen.queryByText(/No recent reading from this node/)).toBeNull();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 
   it("renders hostile text from the server as plain text, never as HTML", async () => {

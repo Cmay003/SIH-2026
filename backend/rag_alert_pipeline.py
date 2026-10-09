@@ -148,9 +148,14 @@ def generate_alert_message(
     collection,
     embedder,
     use_llm: bool = True,
+    detail: str | None = None,
 ) -> str:
     """
     Turns a risk score into an actionable alert message.
+
+    detail: one optional sentence placed right after the headline (e.g.
+    what triggered a landslide alert - see integration_pipeline's
+    LANDSLIDE_TRIGGER_TEXT) and given to the LLM as a fact to keep.
 
     use_llm=True calls an LLM (Anthropic API here) to write a natural,
     specific alert from the retrieved SOP context.
@@ -177,9 +182,11 @@ def generate_alert_message(
             f"[Source: {c['source']}]\n{c['text']}" for c in context_chunks
         )
 
+    detail_text = f"{detail} " if detail else ""
     if not use_llm:
         return (
             f"[{severity} ALERT] {hazard_type.upper()} risk detected in {location}. "
+            f"{detail_text}"
             f"Risk score: {risk_score:.2f}. Follow standard {severity.lower()}-severity "
             f"procedure. Relevant guidance:\n\n{context_text}"
         )
@@ -190,7 +197,7 @@ def generate_alert_message(
         client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from environment
         prompt = f"""You are generating a short, actionable disaster alert message for
 {hazard_type} hazard in {location}. Risk score: {risk_score:.2f} ({severity} severity).
-
+{detail_text}
 Relevant SOP guidance retrieved from the knowledge base:
 {context_text}
 
@@ -208,7 +215,8 @@ guidance, include it."""
     except Exception as e:
         print(f"[LLM call failed: {e} - falling back to template]")
         return generate_alert_message(
-            hazard_type, risk_score, location, collection, embedder, use_llm=False
+            hazard_type, risk_score, location, collection, embedder, use_llm=False,
+            detail=detail,
         )
 
 

@@ -12,14 +12,31 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
+// Citizen report photos arrive as base64 JSON (see /api/citizen-reports),
+// so that ONE public route gets a larger body limit - enough for a 2 MB
+// photo once base64 adds a third. It used to be 10 MB for EVERY route,
+// which let anyone push 10 MB bodies at any endpoint. Registered first:
+// body-parser skips a body that is already parsed.
+const CITIZEN_PHOTO_MAX_BYTES = 2 * 1024 * 1024;
+app.use("/api/citizen-reports", express.json({ limit: "3mb" }));
 app.use(express.json({
-  limit: "10mb", // raised for base64 photo uploads (citizen hazard reports)
+  // Biggest normal body: a 200-reading store-and-forward batch (the
+  // backend's MAX_BATCH_SIZE) at well under 1 KB per reading.
+  limit: "1mb",
   // Keep the exact bytes of WhatsApp webhooks: Meta's signature is computed
   // over the raw body, not the re-serialised JSON (see verifyMetaSignature).
   verify: (req, res, buf) => {
     if (req.originalUrl.startsWith("/api/whatsapp/webhook")) req.rawBody = buf;
   },
 }));
+// Body-parser errors (too large, broken JSON) as short JSON. Express's
+// default answer is an HTML page with a stack trace (NODE_ENV is not set
+// to production here), which the public didn't need to see.
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") return res.status(413).json({ error: "Request body too large" });
+  if (err && err.type === "entity.parse.failed") return res.status(400).json({ error: "Request body is not valid JSON" });
+  next(err);
+});
 app.use(cors());
 // nosniff, referrer policy, no framing, permissions - on every response
 const { basicSecurityHeaders, setReactPageCsp } = require("./security_headers");
@@ -143,6 +160,9 @@ function backupDatabase() {
   }
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupPath = path.join(BACKUPS_DIR, `sanjeevni_backup_${timestamp}.db`);
+  // The folder may have been deleted while the server runs - recreate it
+  // rather than failing every backup from then on.
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
   // VACUUM INTO writes a consistent snapshot through SQLite itself; copying
   // the file could catch a half-written page, and in WAL mode would miss
   // changes still in the -wal file (B23).
@@ -161,7 +181,16 @@ function backupDatabase() {
   return backupPath;
 }
 
-setInterval(backupDatabase, BACKUP_INTERVAL_MS);
+// An exception thrown inside a timer callback is uncaught and EXITS Node -
+// a full disk or a locked database must cost one backup, not take SOS
+// intake and ingestion down with it (B48).
+setInterval(() => {
+  try {
+    backupDatabase();
+  } catch (e) {
+    console.error("[backup] scheduled backup failed:", e.message);
+  }
+}, BACKUP_INTERVAL_MS);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS sensor_data (
@@ -207,21 +236,55 @@ const selectHistory = db.prepare(
 // ('pending_confirmation', see hazard_confirmation.py) is visible to
 // officers only, so one glitching sensor can't put a hazard on the
 // citizen map.
-const ACTIVE_HAZARD_SQL = (statuses) => `
+// Only nodes still in the registry count (B69): a deleted node can never
+// send the reading that would clear its last hazard, so it used to stay on
+// the public map forever. The readings themselves are kept (history).
+const ACTIVE_HAZARD_SQL = (statuses, onlyRegistered) => `
   SELECT sd.node_id, sd.location, sd.hazard_type, sd.severity, sd.risk_score,
-         sd.eta_minutes, sd.predicted_time, sd.latitude, sd.longitude, sd.status
+         sd.eta_minutes, sd.predicted_time, sd.latitude, sd.longitude, sd.status,
+         sd.timestamp
   FROM sensor_data sd
   INNER JOIN (
     SELECT node_id, MAX(id) as max_id FROM sensor_data GROUP BY node_id
   ) latest ON sd.node_id = latest.node_id AND sd.id = latest.max_id
   WHERE sd.severity IN ('MEDIUM','HIGH','CRITICAL')
     AND sd.status IN (${statuses})
+    ${onlyRegistered ? "AND EXISTS (SELECT 1 FROM nodes n WHERE n.node_id = sd.node_id)" : ""}
   ORDER BY sd.risk_score DESC
 `;
-const selectActiveHazards = db.prepare(ACTIVE_HAZARD_SQL("'alert_dispatched'"));
-const selectActiveAndPendingHazards = db.prepare(
-  ACTIVE_HAZARD_SQL("'alert_dispatched','pending_confirmation'"),
-);
+// The `nodes` table belongs to backend_server.py and doesn't exist until it
+// has started once, so the filtered query is prepared lazily (like
+// nodeInfo below). Until then the unfiltered query is used - there is no
+// registry yet, so nothing can have been deleted from it.
+function hazardQuery(statuses) {
+  const unfiltered = db.prepare(ACTIVE_HAZARD_SQL(statuses, false));
+  let filtered = null;
+  return {
+    all() {
+      if (!filtered) {
+        try {
+          filtered = db.prepare(ACTIVE_HAZARD_SQL(statuses, true));
+        } catch {
+          return unfiltered.all(); // "no such table: nodes" - try again next time
+        }
+      }
+      return filtered.all();
+    },
+  };
+}
+const selectActiveHazards = hazardQuery("'alert_dispatched'");
+
+// A hazard whose node has not reported for this long is "stale": it stays
+// listed (the node may have gone silent BECAUSE of the hazard) but is
+// labelled as last-known state and does not set off the staff alarm.
+const STALE_HAZARD_MS = (parseInt(process.env.STALE_HAZARD_MINUTES || "30", 10) || 30) * 60000;
+// A missing/unparseable timestamp counts as NOT stale (fail safe: keep alarming).
+function hazardAge(ts) {
+  const t = new Date(ts).getTime();
+  if (!Number.isFinite(t)) return { last_reading_at: ts || null, stale: false };
+  return { last_reading_at: ts, stale: Date.now() - t > STALE_HAZARD_MS };
+}
+const selectActiveAndPendingHazards = hazardQuery("'alert_dispatched','pending_confirmation'");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS sos_requests (
@@ -245,11 +308,18 @@ db.exec(`
   if (!existingCols.includes("device_id")) {
     db.exec("ALTER TABLE sos_requests ADD COLUMN device_id TEXT");
   }
+  // Where the coordinates came from: 'gps' (the phone's location), 'manual'
+  // (the person tapped a point on the SOS page map because location was
+  // denied, unavailable or too slow - approximate, officers must be told) or
+  // 'whatsapp'. Rows from before this column existed stay NULL (unknown).
+  if (!existingCols.includes("location_source")) {
+    db.exec("ALTER TABLE sos_requests ADD COLUMN location_source TEXT");
+  }
 }
 
 const insertSos = db.prepare(
-  `INSERT INTO sos_requests (device_id, latitude, longitude, note, status, timestamp)
-   VALUES (?, ?, ?, ?, 'open', ?)`,
+  `INSERT INTO sos_requests (device_id, latitude, longitude, note, status, timestamp, location_source)
+   VALUES (?, ?, ?, ?, 'open', ?, ?)`,
 );
 // One-open-SOS-per-device check - a device can't file a second SOS while
 // an earlier one from the same device is still unresolved.
@@ -296,7 +366,20 @@ const CITIZEN_UPLOADS_DIR = paths.CITIZEN_UPLOADS_DIR;
 if (!fs.existsSync(CITIZEN_UPLOADS_DIR)) {
   fs.mkdirSync(CITIZEN_UPLOADS_DIR, { recursive: true });
 }
-app.use("/citizen_uploads", express.static(CITIZEN_UPLOADS_DIR));
+// Uploaded files come from anonymous citizens. Even with the type check in
+// POST /api/citizen-reports (B38), anything already on disk - e.g. an .html
+// or .svg saved before that check existed - must never run script on this
+// origin: the sandbox CSP gives the response an opaque origin with no
+// scripts, nosniff (basicSecurityHeaders) stops type guessing, and any
+// file that isn't a photo is offered as a download, never rendered.
+const CITIZEN_PHOTO_FILE = /\.(jpg|png|webp)$/i;
+app.use("/citizen_uploads", express.static(CITIZEN_UPLOADS_DIR, {
+  index: false,
+  setHeaders: (res, filePath) => {
+    res.set("Content-Security-Policy", "default-src 'none'; sandbox");
+    if (!CITIZEN_PHOTO_FILE.test(filePath)) res.set("Content-Disposition", "attachment");
+  },
+}));
 
 // Node locations come from the `nodes` table that backend_server.py owns
 // (admin API). A hard-coded copy here meant nodes added through the admin
@@ -337,21 +420,106 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function nearestHospital(lat, lon) {
+// Confirmed HIGH/CRITICAL hazard areas (same circles as the public map).
+// Stale ones count too: a node may have gone silent BECAUSE of the hazard,
+// and the map still shows them as last-known state.
+function severeHazardZones() {
+  return selectActiveHazards.all()
+    .filter((r) => (r.severity === "HIGH" || r.severity === "CRITICAL") && r.latitude != null && r.longitude != null)
+    .map((r) => ({
+      hazard_type: r.hazard_type,
+      severity: r.severity,
+      latitude: r.latitude,
+      longitude: r.longitude,
+      radius_m: HAZARD_RADIUS_M[r.severity] || 500,
+    }));
+}
+
+// The most severe zone that (lat, lon) lies inside, or null.
+function zoneContaining(lat, lon, zones) {
+  let found = null;
+  for (const z of zones) {
+    if (haversineKm(lat, lon, z.latitude, z.longitude) * 1000 > z.radius_m) continue;
+    if (!found || SEVERITY_RANK[z.severity] > SEVERITY_RANK[found.severity]) found = z;
+  }
+  return found;
+}
+
+// Nearest hospital by STRAIGHT-LINE distance (not a road route), skipping
+// hospitals inside an active HIGH/CRITICAL zone: sending someone into a
+// flood or gas-leak area to reach care is worse than a longer trip. The
+// nearer hospital that was skipped is returned too, so the page can say
+// why a farther one is shown. If EVERY hospital is inside a zone, the
+// nearest one is still returned (flagged) - no hospital at all helps nobody.
+function nearestHospital(lat, lon, zones = []) {
   let best = null;
   let bestDist = Infinity;
+  let any = null; // nearest regardless of zones (fallback)
+  let anyDist = Infinity;
+  let skipped = null; // nearest hospital passed over because of a zone
+  let skippedDist = Infinity;
   for (const h of hospitals) {
     const d = haversineKm(lat, lon, h.latitude, h.longitude);
-    if (d < bestDist) {
+    if (!(d < Infinity)) continue; // NaN coordinates: no hospital (B47)
+    if (d < anyDist) {
+      anyDist = d;
+      any = h;
+    }
+    const zone = zoneContaining(h.latitude, h.longitude, zones);
+    if (zone) {
+      if (d < skippedDist) {
+        skippedDist = d;
+        skipped = { hospital: h, zone };
+      }
+    } else if (d < bestDist) {
       bestDist = d;
       best = h;
     }
   }
-  return { hospital: best, distance_km: +bestDist.toFixed(2) };
+  if (!best && any) {
+    return { hospital: any, distance_km: +anyDist.toFixed(2), inZone: zoneContaining(any.latitude, any.longitude, zones), skipped: null };
+  }
+  return {
+    hospital: best,
+    distance_km: +bestDist.toFixed(2),
+    inZone: null,
+    // only worth mentioning when it really was closer than the one shown
+    skipped: best && skipped && skippedDist < bestDist ? { ...skipped, distance_km: +skippedDist.toFixed(2) } : null,
+  };
 }
 
 function mapsLink(oLat, oLon, dLat, dLon) {
   return `https://www.google.com/maps/dir/?api=1&origin=${oLat},${oLon}&destination=${dLat},${dLon}&travelmode=driving`;
+}
+
+// Nearest hospital + route from (lat, lon), with nulls instead of a crash
+// when there is none. Non-numeric coordinates make every distance NaN, so
+// nearestHospital() finds no hospital; reading hospital.name then threw,
+// and ONE bad SOS row turned the whole officer SOS feed into a 500 (B47).
+// `zones` = severeHazardZones(); pass it in when looking up many points
+// (officer feed) so the hazard query runs once, not once per SOS.
+// distance_km is straight-line; maps_url gives the real road route.
+function hospitalFor(lat, lon, zones = severeHazardZones()) {
+  const { hospital, distance_km, inZone, skipped } = nearestHospital(lat, lon, zones);
+  if (!hospital) {
+    return { hospital: null, distance_km: null, maps_url: null, skipped_hospital: null, hospital_in_hazard_zone: null };
+  }
+  return {
+    hospital: hospital.name,
+    distance_km,
+    maps_url: mapsLink(lat, lon, hospital.latitude, hospital.longitude),
+    // a nearer hospital left out because it lies inside an active zone
+    skipped_hospital: skipped
+      ? {
+          hospital: skipped.hospital.name,
+          distance_km: skipped.distance_km,
+          hazard_type: skipped.zone.hazard_type,
+          severity: skipped.zone.severity,
+        }
+      : null,
+    // set only when every hospital is inside a zone and this one was the nearest
+    hospital_in_hazard_zone: inZone ? { hazard_type: inZone.hazard_type, severity: inZone.severity } : null,
+  };
 }
 
 // Turns the eta_minutes/predicted_time computed by the Python AI backend
@@ -373,7 +541,9 @@ function etaText(hazard_type, severity, eta_minutes, predicted_time) {
   return `Expected to reach critical level in ~${duration} (around ${when})`;
 }
 
-const PYTHON_BACKEND_URL = "http://127.0.0.1:8000";
+// SANJEEVNI_BACKEND_URL / SANJEEVNI_PORT (bottom of file) only exist so a
+// test copy can run beside the real servers; leave them unset normally.
+const PYTHON_BACKEND_URL = process.env.SANJEEVNI_BACKEND_URL || "http://127.0.0.1:8000";
 
 // Stores one AI result in the dashboard table. Duplicates (a store-and-
 // forward retry of a reading the backend already has) and rejected
@@ -431,7 +601,24 @@ function storeDashboardRow(sensorData, aiResult) {
 // unknown node_id) instead of turning everything into 500. Nodes rely on
 // this: 4xx = drop the reading from the local queue (resending won't
 // help), 5xx / no response = keep it queued and retry later.
+// Exception: the backend's own 401/403 (it rejected OFFICER_API_KEY) is a
+// server-to-server config problem, not the caller's. Passed through, a 401
+// sent the browser to the login page in an endless loop (B53), and a 4xx
+// tells a node to DROP readings that a fixed config would accept - so it
+// becomes 502 ("retry later").
+function upstreamAuthRejected(error) {
+  const status = error.response && error.response.status;
+  if (status !== 401 && status !== 403) return false;
+  console.error(`[backend] AI backend answered HTTP ${status} - OFFICER_API_KEY differs between the two servers?`);
+  return true;
+}
+const UPSTREAM_AUTH_MESSAGE =
+  "The AI backend rejected this server's OFFICER_API_KEY. Set the same key for both servers in .env and restart both.";
+
 function sendPipelineError(res, error) {
+  if (upstreamAuthRejected(error)) {
+    return res.status(502).json({ status: "error", detail: UPSTREAM_AUTH_MESSAGE });
+  }
   const status = error.response ? error.response.status : 502;
   const detail = error.response ? error.response.data : error.message;
   console.error("Pipeline error:", status, error.message);
@@ -485,6 +672,18 @@ app.post("/api/ingest/batch", device.requireDeviceKey, async (req, res) => {
         console.warn(`[ingest] rejected reading for ${r.node_id}: key '${req.device.name}' is not allowed for it`);
       }
     });
+    // NOTHING in the request is allowed: answer 403 like /api/ingest does
+    // (B56). With 200 the node/gateway deleted these readings from its
+    // flash queue, so a key/--nodes mistake silently lost every reading;
+    // 403 keeps them queued (sjUploadAction -> RETRY) until the key is
+    // fixed. A MIXED batch still gets 200: a 403 there would block the
+    // allowed nodes' newer readings behind it forever (FIFO queue), so the
+    // rejected ones are only logged above - every node a gateway hears must
+    // be in its key's --nodes list.
+    if (submitted.length > 0 && allowedIdx.length === 0) {
+      const nodes = [...new Set(submitted.map((r) => String(r.node_id)))].join(", ");
+      return res.status(403).json({ error: `Device key '${req.device.name}' may not report for ${nodes}` });
+    }
     const readings = allowedIdx.map((i) => device.applyKeyPolicy(req.device, submitted[i]));
     if (readings.length) {
       const pythonResponse = await axios.post(
@@ -545,21 +744,7 @@ app.get("/api/route/:node_id", auth.requireLogin, (req, res) => {
   if (!coords) {
     return res.status(404).json({ error: "unknown node_id" });
   }
-  const { hospital, distance_km } = nearestHospital(
-    coords.latitude,
-    coords.longitude,
-  );
-  res.json({
-    node_id: req.params.node_id,
-    hospital: hospital.name,
-    distance_km,
-    maps_url: mapsLink(
-      coords.latitude,
-      coords.longitude,
-      hospital.latitude,
-      hospital.longitude,
-    ),
-  });
+  res.json({ node_id: req.params.node_id, ...hospitalFor(coords.latitude, coords.longitude) });
 });
 
 // 4b. Nearest hospital + route for ANY coordinates (not just a sensor
@@ -568,24 +753,15 @@ app.get("/api/route/:node_id", auth.requireLogin, (req, res) => {
 // first. This does NOT write anything to the database - it's a pure
 // lookup, safe to call as often as the portal needs.
 app.get("/api/nearest-hospital", (req, res) => {
-  const latitude = parseFloat(req.query.latitude);
-  const longitude = parseFloat(req.query.longitude);
-  if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+  // parseCoordinates (defined below) also refuses "Infinity" and
+  // out-of-range values, which parseFloat let through to a 500.
+  const coords = parseCoordinates(req.query.latitude, req.query.longitude);
+  if (!coords) {
     return res
       .status(400)
       .json({ error: "latitude and longitude query params are required" });
   }
-  const { hospital, distance_km } = nearestHospital(latitude, longitude);
-  res.json({
-    hospital: hospital.name,
-    distance_km,
-    maps_url: mapsLink(
-      latitude,
-      longitude,
-      hospital.latitude,
-      hospital.longitude,
-    ),
-  });
+  res.json(hospitalFor(coords.latitude, coords.longitude));
 });
 
 // 5. Citizen presses SOS -> stored, and they immediately get the route to
@@ -594,13 +770,18 @@ app.get("/api/nearest-hospital", (req, res) => {
 // /api/sos AND the new WhatsApp webhook below - one source of truth
 // for "what happens when someone reports an SOS", regardless of which
 // channel it came in through.
-function createSosRequest(deviceId, latitude, longitude, note) {
+// locationSource: "gps" | "manual" | "whatsapp" (see the sos_requests
+// location_source column).
+function createSosRequest(deviceId, latitude, longitude, note, locationSource) {
   const existing = selectOpenSosByDevice.get(deviceId);
-  if (existing) {
-    const { hospital, distance_km } = nearestHospital(
-      existing.latitude,
-      existing.longitude,
-    );
+  // An open row without real coordinates (only possible from before B47) is
+  // never shown to officers and can't be routed to, so it must not block
+  // this person's REAL SOS with a 409 "help is on the way" that nobody
+  // acts on. Close it as 'invalid' and store the new one.
+  if (existing && !parseCoordinates(existing.latitude, existing.longitude)) {
+    console.warn(`[sos] SOS #${existing.id} had invalid coordinates (${existing.latitude}, ${existing.longitude}) - closed as 'invalid', new SOS stored`);
+    updateSosStatus.run("invalid", existing.id);
+  } else if (existing) {
     return {
       httpStatus: 409,
       body: {
@@ -608,14 +789,7 @@ function createSosRequest(deviceId, latitude, longitude, note) {
         error:
           "This device already has an active SOS request awaiting response.",
         sos_id: existing.id,
-        hospital: hospital.name,
-        distance_km,
-        maps_url: mapsLink(
-          existing.latitude,
-          existing.longitude,
-          hospital.latitude,
-          hospital.longitude,
-        ),
+        ...hospitalFor(existing.latitude, existing.longitude),
       },
     };
   }
@@ -627,21 +801,14 @@ function createSosRequest(deviceId, latitude, longitude, note) {
     longitude,
     note || null,
     timestamp,
+    locationSource,
   );
-  const { hospital, distance_km } = nearestHospital(latitude, longitude);
   return {
     httpStatus: 201,
     body: {
       status: "received",
       sos_id: result.lastInsertRowid,
-      hospital: hospital.name,
-      distance_km,
-      maps_url: mapsLink(
-        latitude,
-        longitude,
-        hospital.latitude,
-        hospital.longitude,
-      ),
+      ...hospitalFor(latitude, longitude),
     },
   };
 }
@@ -691,11 +858,23 @@ const sosPerNetwork = makeRateLimiter(10 * 60 * 1000, 30);
 const sosPerDevice = makeRateLimiter(60 * 60 * 1000, 5);
 const reportsPerNetwork = makeRateLimiter(10 * 60 * 1000, 20);
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9:._-]{3,100}$/;
+// "whatsapp:<phone>" is the device ID of SOS requests filed through the
+// WhatsApp webhook, which calls createSosRequest() directly. The public web
+// endpoints must never accept it (B39): anyone could open a fake SOS for a
+// victim's number, so the victim's REAL location later got "already
+// active" (409) and was never stored - and GET /api/sos/device/... handed
+// out the location of any WhatsApp user's open SOS. Web IDs are "dev-...".
+const RESERVED_DEVICE_PREFIX = /^whatsapp:/i;
+// What a web client may say about its coordinates. Missing = "gps": the
+// classic sos.html and older cached pages only ever send the phone's
+// location. "whatsapp" is only set by the webhook itself.
+const WEB_LOCATION_SOURCES = new Set(["gps", "manual"]);
+const webDeviceIdOk = (id) =>
+  typeof id === "string" && DEVICE_ID_PATTERN.test(id) && !RESERVED_DEVICE_PREFIX.test(id);
 
 app.post("/api/sos", (req, res) => {
   const { note, device_id } = req.body;
-  if (typeof device_id === "string" && DEVICE_ID_PATTERN.test(device_id) &&
-      (sosPerDevice(device_id) || sosPerNetwork(req.ip))) {
+  if (webDeviceIdOk(device_id) && (sosPerDevice(device_id) || sosPerNetwork(req.ip))) {
     return res.status(429).json({
       error: "Too many SOS requests from this device or network. If you are in danger, call 112 now.",
     });
@@ -706,17 +885,24 @@ app.post("/api/sos", (req, res) => {
       .status(400)
       .json({ error: "valid numeric latitude and longitude are required" });
   }
-  if (!device_id || typeof device_id !== "string" || !DEVICE_ID_PATTERN.test(device_id)) {
+  if (!webDeviceIdOk(device_id)) {
     return res.status(400).json({ error: "device_id is required (3-100 letters, digits or : . _ -)" });
   }
   if (note != null && typeof note !== "string") {
     return res.status(400).json({ error: "note must be a string" });
+  }
+  // Refused rather than guessed: storing an unknown value as "gps" would
+  // show a hand-placed (approximate) point to officers as a precise fix.
+  const locationSource = req.body.location_source ?? "gps";
+  if (!WEB_LOCATION_SOURCES.has(locationSource)) {
+    return res.status(400).json({ error: "location_source must be \"gps\" or \"manual\"" });
   }
   const { httpStatus, body } = createSosRequest(
     device_id,
     coords.latitude,
     coords.longitude,
     note ? note.slice(0, MAX_NOTE_LENGTH) : note,
+    locationSource,
   );
   res.status(httpStatus).json(body);
 });
@@ -726,25 +912,22 @@ app.post("/api/sos", (req, res) => {
 // the "your SOS is active" state and keep the button locked until an
 // officer marks it resolved, instead of allowing a second SOS to be sent.
 app.get("/api/sos/device/:device_id", (req, res) => {
-  const existing = selectOpenSosByDevice.get(req.params.device_id);
-  if (!existing) {
+  // WhatsApp IDs are phone numbers - never look them up for the public
+  // (B39); the WhatsApp user gets their status in the chat instead.
+  if (RESERVED_DEVICE_PREFIX.test(req.params.device_id)) {
     return res.json({ active: false });
   }
-  const { hospital, distance_km } = nearestHospital(
-    existing.latitude,
-    existing.longitude,
-  );
+  const existing = selectOpenSosByDevice.get(req.params.device_id);
+  // A legacy row with junk coordinates (pre-B47) is invisible to officers
+  // and is closed by the next SOS from this device (createSosRequest), so
+  // it must not keep the citizen's SOS button locked as "active".
+  if (!existing || !parseCoordinates(existing.latitude, existing.longitude)) {
+    return res.json({ active: false });
+  }
   res.json({
     active: true,
     sos_id: existing.id,
-    hospital: hospital.name,
-    distance_km,
-    maps_url: mapsLink(
-      existing.latitude,
-      existing.longitude,
-      hospital.latitude,
-      hospital.longitude,
-    ),
+    ...hospitalFor(existing.latitude, existing.longitude),
   });
 });
 
@@ -765,14 +948,27 @@ function computeEscalation(status, timestamp) {
   };
 }
 
+const loggedInvalidSos = new Set();
 app.get("/api/sos", requireOfficerAuth, (req, res) => {
   const rows =
     req.query.status === "all"
       ? selectAllSos.all(parseInt(req.query.limit || "200", 10))
       : selectOpenSos.all();
 
-  const data = rows.map((r) => {
-    const { hospital, distance_km } = nearestHospital(r.latitude, r.longitude);
+  // A row without real coordinates (only possible from before B47 was
+  // fixed - every channel now validates) can't be shown on the map or
+  // routed to. It is left out and logged instead of breaking the feed:
+  // one bad row used to hide EVERY SOS from the officers.
+  const valid = rows.filter((r) => parseCoordinates(r.latitude, r.longitude));
+  for (const r of rows) {
+    if (valid.includes(r) || loggedInvalidSos.has(r.id)) continue;
+    loggedInvalidSos.add(r.id); // once per row, not on every 5 s poll
+    console.warn(`[sos] SOS #${r.id} has invalid coordinates (${r.latitude}, ${r.longitude}) - not shown to officers; closed as 'invalid' when that device next files an SOS`);
+  }
+
+  const zones = severeHazardZones(); // once per request, not per SOS
+  const data = valid.map((r) => {
+    const route = hospitalFor(r.latitude, r.longitude, zones);
     const { escalated, minutes_open } = computeEscalation(
       r.status,
       r.timestamp,
@@ -784,16 +980,18 @@ app.get("/api/sos", requireOfficerAuth, (req, res) => {
       note: r.note,
       status: r.status,
       timestamp: r.timestamp,
+      // "manual" = a point the person placed by hand on a map (approximate);
+      // the officer map and queue mark it. null = an SOS from before this
+      // was recorded.
+      location_source: r.location_source ?? null,
       escalated,
       minutes_open,
-      nearest_hospital: hospital.name,
-      hospital_distance_km: distance_km,
-      hospital_route_url: mapsLink(
-        r.latitude,
-        r.longitude,
-        hospital.latitude,
-        hospital.longitude,
-      ),
+      nearest_hospital: route.hospital,
+      hospital_distance_km: route.distance_km,
+      hospital_route_url: route.maps_url,
+      // why a farther hospital was chosen (nearer one is inside a hazard zone)
+      hospital_skipped: route.skipped_hospital,
+      hospital_in_hazard_zone: route.hospital_in_hazard_zone,
       responder_route_url: mapsLink(
         RESPONDER_BASE.latitude,
         RESPONDER_BASE.longitude,
@@ -807,6 +1005,7 @@ app.get("/api/sos", requireOfficerAuth, (req, res) => {
     success: true,
     count: data.length,
     escalated_count: data.filter((d) => d.escalated).length,
+    invalid_location_count: rows.length - valid.length,
     data,
   });
 });
@@ -817,15 +1016,42 @@ app.post("/api/sos/:id/resolve", requireOfficerAuth, (req, res) => {
   res.json({ status: "ok" });
 });
 
-// 7b. Bulk-resolve every currently open SOS at once - for when an officer
-// has finished handling everything and wants to clear the board in one
-// action, rather than clicking "Resolve" on each one individually.
+// 7b. Bulk-resolve the open SOS requests the officer is looking at - for
+// when everything on the board has been handled and they want to clear it
+// in one action, rather than clicking "Resolve" on each one individually.
+//
+// The body MUST list the ids the officer saw ({ ids: [12, 13] }). It used to
+// resolve every open row, so an SOS that arrived while the confirm dialog
+// was open (it blocks polling) or in the 5 s poll gap was closed unseen and
+// the citizen's page said "marked resolved" (B42). A request
+// without ids is refused, so an old page (the classic public/officer.html
+// still sends no body) cannot clear unseen requests either.
+const MAX_RESOLVE_ALL_IDS = 1000; // far above any real board; bounds the loop
+const resolveOpenSos = db.prepare(
+  "UPDATE sos_requests SET status='resolved' WHERE id=? AND status='open'",
+);
 app.post("/api/sos/resolve-all", requireOfficerAuth, (req, res) => {
-  const openOnes = selectOpenSos.all();
-  for (const sos of openOnes) {
-    updateSosStatus.run("resolved", sos.id);
+  const ids = req.body?.ids;
+  if (
+    !Array.isArray(ids) || ids.length === 0 || ids.length > MAX_RESOLVE_ALL_IDS ||
+    !ids.every((id) => Number.isSafeInteger(id) && id > 0)
+  ) {
+    return res.status(400).json({
+      error: `ids must be a list of 1-${MAX_RESOLVE_ALL_IDS} SOS ids (the requests shown to the officer)`,
+    });
   }
-  res.json({ status: "ok", resolved_count: openOnes.length });
+  // One transaction: all or nothing, and only rows that are still open
+  // count (a duplicate id or one another officer just resolved adds 0).
+  let resolved = 0;
+  db.exec("BEGIN");
+  try {
+    for (const id of new Set(ids)) resolved += Number(resolveOpenSos.run(id).changes);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  res.json({ status: "ok", resolved_count: resolved });
 });
 
 // 8. Hazard zones for the map - latest reading per node with MEDIUM+ severity
@@ -849,6 +1075,7 @@ app.get("/api/hazard-zones", requireOfficerForPending, (req, res) => {
       longitude: r.longitude,
       radius_m: HAZARD_RADIUS_M[r.severity] || 500,
       confirmed: r.status === "alert_dispatched",
+      ...hazardAge(r.timestamp),
     }));
   res.json({ success: true, zones });
 });
@@ -897,10 +1124,10 @@ app.get("/api/node-health", requireOfficerAuth, async (req, res) => {
 // HERE on the server - it never reaches the browser.
 const ADMIN_NODE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/; // same rule as backend_server.check_node_id
 
-function adminBackendHeaders(res) {
+function adminBackendHeaders(res, feature = "Node management") {
   if (OFFICER_API_KEY) return { "X-API-Key": OFFICER_API_KEY };
   res.status(503).json({
-    error: "Node management is switched off: set OFFICER_API_KEY in .env and restart both servers.",
+    error: `${feature} is switched off: set OFFICER_API_KEY in .env and restart both servers.`,
   });
   return null;
 }
@@ -912,6 +1139,12 @@ function sendAdminError(res, error) {
     return res.status(502).json({
       error: "Can't reach the AI backend (backend_server.py on port 8000) - start it, then try again.",
     });
+  }
+  // A 401 here is about the SERVER's key, not the admin's session - passed
+  // through, it bounced the admin between /admin.html and /login.html
+  // forever (B53).
+  if (upstreamAuthRejected(error)) {
+    return res.status(502).json({ error: UPSTREAM_AUTH_MESSAGE });
   }
   const detail = error.response.data && error.response.data.detail;
   let message = typeof detail === "string" ? detail : `Request failed (HTTP ${error.response.status})`;
@@ -958,30 +1191,65 @@ for (const [method, verb] of [["post", "created"], ["put", "updated"], ["delete"
   });
 }
 
+// Model card (admin page): the honest evaluation report that
+// ml/evaluate_models.py writes and the Python backend serves with the same
+// OFFICER_API_KEY as the node registry. Admin-only for the same reason the
+// backend gives: it is an engineering report on SYNTHETIC data, and a
+// number lifted out of it without the card's own banner reads like field
+// accuracy. Passed through unchanged - the page renders the banner and
+// provenance next to every figure.
+app.get("/api/admin/model-card", auth.requireAdmin, async (req, res) => {
+  const headers = adminBackendHeaders(res, "The model card");
+  if (!headers) return;
+  try {
+    const pythonResponse = await axios.get(`${PYTHON_BACKEND_URL}/api/model-card`, { headers });
+    const card = pythonResponse.data;
+    // A proxy or an old backend answering 200 with something else must not
+    // render as an empty card that looks like "no models".
+    if (!card || typeof card !== "object" || !Array.isArray(card.models)) {
+      return res.status(502).json({ error: "The AI backend sent something that is not a model card - restart backend_server.py." });
+    }
+    res.set("Cache-Control", "no-store");
+    res.json(card);
+  } catch (error) {
+    // FastAPI's own "Not Found" means a backend from before the model card
+    // existed; the card's 404 instead says how to generate it. Telling the
+    // two apart saves the admin re-running the script for nothing.
+    const detail = error.response && error.response.data && error.response.data.detail;
+    if (error.response && error.response.status === 404 && detail === "Not Found") {
+      return res.status(502).json({
+        error: "This AI backend has no model card endpoint - update and restart backend_server.py.",
+      });
+    }
+    sendAdminError(res, error);
+  }
+});
+
 // 9. Active hazards, numbered, for the dashboard list - location, AI risk
 // score, and a plain-language prediction of when it may reach critical level,
 // based on the eta_minutes/predicted_time the AI backend already computed.
 app.get("/api/hazards", (req, res) => {
   const rows = selectActiveHazards.all();
 
-  const hazards = rows.map((r, i) => ({
-    label: `Hazard ${i + 1}`,
-    node_id: r.node_id,
-    location: r.location || r.node_id,
-    hazard_type: r.hazard_type,
-    severity: r.severity,
-    risk_score: r.risk_score,
-    latitude: r.latitude,
-    longitude: r.longitude,
-    eta_minutes: r.eta_minutes,
-    predicted_time: r.predicted_time,
-    prediction_text: etaText(
-      r.hazard_type,
-      r.severity,
-      r.eta_minutes,
-      r.predicted_time,
-    ),
-  }));
+  const hazards = rows.map((r, i) => {
+    const age = hazardAge(r.timestamp);
+    return {
+      label: `Hazard ${i + 1}`,
+      node_id: r.node_id,
+      location: r.location || r.node_id,
+      hazard_type: r.hazard_type,
+      severity: r.severity,
+      risk_score: r.risk_score,
+      latitude: r.latitude,
+      longitude: r.longitude,
+      eta_minutes: r.eta_minutes,
+      predicted_time: r.predicted_time,
+      ...age,
+      prediction_text: age.stale
+        ? "No recent reading from this node - last known state only"
+        : etaText(r.hazard_type, r.severity, r.eta_minutes, r.predicted_time),
+    };
+  });
 
   res.json({ success: true, count: hazards.length, hazards });
 });
@@ -989,6 +1257,53 @@ app.get("/api/hazards", (req, res) => {
 // --- UPGRADE: crowdsourced hazard reports (citizen-submitted, with photo) ---
 // Public endpoint - any citizen can submit, no auth (same philosophy as
 // SOS submission: reporting a hazard should never be gated behind a login).
+// No page sends reports yet (API only); kept for the planned citizen
+// report form, but locked down because it is public (B38):
+//  - photos must BE a JPEG, PNG or WebP (checked on the decoded bytes, not
+//    on what the client claims) - an .html/.svg/.js "photo" used to be
+//    saved and served from this origin, i.e. stored XSS
+//  - at most CITIZEN_PHOTO_MAX_BYTES per photo, and all photos together at
+//    most CITIZEN_UPLOADS_MAX_MB (default 500) so the disk can't be filled
+const MAX_REPORT_DESCRIPTION = 1000;
+const CITIZEN_UPLOADS_QUOTA_BYTES =
+  (parseInt(process.env.CITIZEN_UPLOADS_MAX_MB || "500", 10) || 500) * 1024 * 1024;
+let citizenUploadsBytes = 0;
+try {
+  for (const f of fs.readdirSync(CITIZEN_UPLOADS_DIR)) {
+    citizenUploadsBytes += fs.statSync(path.join(CITIZEN_UPLOADS_DIR, f)).size;
+  }
+} catch (e) {
+  console.warn("[citizen-reports] could not measure citizen_uploads/:", e.message);
+}
+
+// Magic bytes of the three accepted formats -> file extension.
+function sniffImageType(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpg";
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
+  if (bytes.length >= 12 && bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP") return "webp";
+  return null;
+}
+const DECLARED_IMAGE_EXT = { jpeg: "jpg", jpg: "jpg", png: "png", webp: "webp" };
+
+// photo_base64: a data URL ("data:image/jpeg;base64,...") or raw base64.
+// Returns { bytes, ext } or { status, error }.
+function decodeCitizenPhoto(photoBase64) {
+  const matches = photoBase64.match(/^data:image\/([A-Za-z0-9.+-]+);base64,(.+)$/s);
+  const declared = matches ? DECLARED_IMAGE_EXT[matches[1].toLowerCase()] : null;
+  if (matches && !declared) {
+    return { status: 400, error: "photo must be a JPEG, PNG or WebP image" };
+  }
+  const bytes = Buffer.from(matches ? matches[2] : photoBase64, "base64");
+  if (bytes.length > CITIZEN_PHOTO_MAX_BYTES) {
+    return { status: 413, error: `photo is too large (max ${CITIZEN_PHOTO_MAX_BYTES >> 20} MB)` };
+  }
+  const ext = sniffImageType(bytes);
+  if (!ext || (declared && declared !== ext)) {
+    return { status: 400, error: "photo must be a JPEG, PNG or WebP image" };
+  }
+  return { bytes, ext };
+}
+
 app.post("/api/citizen-reports", (req, res) => {
   if (reportsPerNetwork(req.ip)) {
     return res.status(429).json({ error: "Too many reports from this network - please wait a few minutes. In danger? Call 112." });
@@ -1001,24 +1316,38 @@ app.post("/api/citizen-reports", (req, res) => {
       .json({ error: "valid numeric latitude and longitude are required" });
   }
   const { latitude, longitude } = coords;
+  if (description != null && typeof description !== "string") {
+    return res.status(400).json({ error: "description must be a string" });
+  }
+  if (photo_base64 != null && typeof photo_base64 !== "string") {
+    return res.status(400).json({ error: "photo_base64 must be a string" });
+  }
+
+  let photo = null;
+  if (photo_base64) {
+    photo = decodeCitizenPhoto(photo_base64);
+    if (photo.error) return res.status(photo.status).json({ error: photo.error });
+  }
 
   let photoPath = null;
-  if (photo_base64) {
-    try {
-      // Accepts a data URL ("data:image/jpeg;base64,...") or raw base64
-      const matches = photo_base64.match(/^data:image\/(\w+);base64,(.+)$/);
-      const ext = matches ? matches[1] : "jpg";
-      const data = matches ? matches[2] : photo_base64;
-      const filename = `report_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      fs.writeFileSync(
-        path.join(CITIZEN_UPLOADS_DIR, filename),
-        Buffer.from(data, "base64"),
-      );
-      photoPath = `/citizen_uploads/${filename}`;
-    } catch (e) {
-      console.error("Failed to save citizen report photo:", e.message);
-      // Continue without the photo rather than failing the whole report -
-      // the location + description are still valuable without it.
+  if (photo) {
+    if (citizenUploadsBytes + photo.bytes.length > CITIZEN_UPLOADS_QUOTA_BYTES) {
+      // A full disk would break SQLite writes and backups for EVERYTHING
+      // (SOS included), so photos stop at the quota; the report is kept.
+      console.error(`[citizen-reports] upload quota (${CITIZEN_UPLOADS_QUOTA_BYTES >> 20} MB) reached - photo not saved`);
+    } else {
+      try {
+        // Server-chosen name and extension: nothing from the client
+        // reaches the file name any more (B38).
+        const filename = `report_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${photo.ext}`;
+        fs.writeFileSync(path.join(CITIZEN_UPLOADS_DIR, filename), photo.bytes);
+        citizenUploadsBytes += photo.bytes.length;
+        photoPath = `/citizen_uploads/${filename}`;
+      } catch (e) {
+        console.error("Failed to save citizen report photo:", e.message);
+        // Continue without the photo rather than failing the whole report -
+        // the location + description are still valuable without it.
+      }
     }
   }
 
@@ -1026,7 +1355,7 @@ app.post("/api/citizen-reports", (req, res) => {
   const result = insertCitizenReport.run(
     latitude,
     longitude,
-    description || null,
+    description ? description.slice(0, MAX_REPORT_DESCRIPTION) : null,
     photoPath,
     timestamp,
   );
@@ -1056,7 +1385,13 @@ app.post("/api/citizen-reports/:id/review", requireOfficerAuth, (req, res) => {
 // Officer-only: trigger an immediate backup rather than waiting for the
 // next scheduled interval - useful right before a demo or a risky change.
 app.post("/api/admin/backup-now", requireOfficerAuth, (req, res) => {
-  const backupPath = backupDatabase();
+  let backupPath;
+  try {
+    backupPath = backupDatabase();
+  } catch (e) {
+    console.error("[backup] manual backup failed:", e.message);
+    return res.status(500).json({ error: `Backup failed: ${e.message}` });
+  }
   if (!backupPath) {
     return res
       .status(404)
@@ -1189,6 +1524,21 @@ async function sendWhatsAppTemplate(
   );
 }
 
+// " Nearest hospital: X (d km straight-line)." for a WhatsApp reply, or ""
+// when there is no hospital to name (hospitalFor() found none) - never
+// "null (null km)". Says why when a nearer hospital was skipped because it
+// is inside an active hazard zone (see nearestHospital).
+// HUMAN REVIEW: citizen-facing safety text.
+function hospitalLine(body) {
+  if (!body.hospital) return "";
+  let line = ` Nearest hospital: ${body.hospital} (${body.distance_km} km straight-line).`;
+  const s = body.skipped_hospital;
+  if (s) line += ` ${s.hospital} is closer but inside an active ${s.hazard_type} zone (${s.severity}).`;
+  const z = body.hospital_in_hazard_zone;
+  if (z) line += ` It is inside an active ${z.hazard_type} zone (${z.severity}) - call 112 before travelling.`;
+  return line;
+}
+
 // Extracts the sender phone + parsed message content from Meta's actual
 // webhook payload shape. Returns null if the payload isn't a real
 // inbound message (Meta also sends status/delivery-receipt webhooks on
@@ -1247,17 +1597,31 @@ const ALERT_OPT_OUT_WORDS = new Set(["STOP", "ALERTS OFF", "ALERT OFF", "UNSUBSC
 const SOS_WORDS = new Set(["SOS", "HELP", "EMERGENCY"]);
 const normalizeCommand = (text) => String(text || "").trim().toUpperCase().replace(/\s+/g, " ");
 
-// One-line advice per hazard for the template's {{4}} - consistent with
-// sample_sops/. Meta rejects template parameters with newlines/tabs.
-const HAZARD_ADVICE = {
-  flood: "Move to higher ground and avoid flooded roads and bridges.",
-  "gas leak": "Leave the area, avoid flames and electrical switches.",
-  fire: "Move away from the fire and follow official evacuation advice.",
-  "extreme heat": "Drink water often, stay out of the sun 12-3 pm, call 112 for heatstroke.",
-  landslide: "Move away from the slope and avoid hill roads nearby.",
-  "air pollution": "Limit outdoor activity; wear an N95 mask outdoors.",
-  "water quality degradation": "Do not drink untreated water from this source; boil water.",
-};
+// One-line advice per hazard for the template's {{4}}, from the advice
+// table the citizen SOS page also uses (data/hazard_advice.json, worded
+// from sample_sops/) - so WhatsApp and the page can't drift apart.
+// HUMAN REVIEW: safety-critical citizen advice; the Hindi lines (used when
+// the template language is Hindi) still need a native-speaker check.
+// A broken/missing file must not take the SOS server down with it: the
+// generic line is used instead, and the error is logged.
+const GENERIC_ADVICE = "Follow instructions from local authorities.";
+const WHATSAPP_ADVICE_LANG = /^hi/i.test(WHATSAPP_ALERT_TEMPLATE_LANG) ? "hi" : "en";
+function loadHazardAdvice() {
+  try {
+    const table = JSON.parse(fs.readFileSync(paths.HAZARD_ADVICE_FILE, "utf-8"));
+    const advice = Object.create(null); // a hazard_type like "constructor" must not hit Object.prototype
+    for (const [hazard, entry] of Object.entries(table.hazards || {})) {
+      const line = entry?.whatsapp?.[WHATSAPP_ADVICE_LANG] || entry?.whatsapp?.en;
+      if (typeof line === "string" && line.trim()) advice[hazard] = line;
+    }
+    const fallback = table.default?.whatsapp?.[WHATSAPP_ADVICE_LANG] || table.default?.whatsapp?.en || GENERIC_ADVICE;
+    return { advice, fallback };
+  } catch (e) {
+    console.error(`[advice] could not read ${paths.HAZARD_ADVICE_FILE}: ${e.message} - WhatsApp alerts use generic advice`);
+    return { advice: {}, fallback: GENERIC_ADVICE };
+  }
+}
+const { advice: HAZARD_ADVICE, fallback: HAZARD_ADVICE_FALLBACK } = loadHazardAdvice();
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS whatsapp_subscribers (
@@ -1363,7 +1727,7 @@ async function notifySubscribersOfAlert(alert) {
     alert.hazard_type,
     alert.severity,
     alert.location || alert.node_id,
-    HAZARD_ADVICE[alert.hazard_type] || "Follow instructions from local authorities.",
+    HAZARD_ADVICE[alert.hazard_type] || HAZARD_ADVICE_FALLBACK,
   ].map((p) => String(p).replace(/[\n\t]+/g, " ").replace(/ {4,}/g, " "));
 
   let notified = 0;
@@ -1394,10 +1758,24 @@ app.get("/api/whatsapp/webhook", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === WHATSAPP_VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
+  // B46: with no token configured, undefined === undefined passed this
+  // check and hub.challenge was echoed back as text/html - a reflected XSS
+  // link on our own origin. Now: a token must be configured and match
+  // (constant time), Meta's challenge is a number, and it goes back as
+  // plain text. Any one of the three stops the XSS.
+  // Lengths compared in BYTES: a same-length string with non-ASCII
+  // characters would make timingSafeEqual throw.
+  const given = Buffer.from(typeof token === "string" ? token : "");
+  const expected = Buffer.from(WHATSAPP_VERIFY_TOKEN || "");
+  const ok =
+    expected.length > 0 &&
+    mode === "subscribe" &&
+    given.length === expected.length &&
+    crypto.timingSafeEqual(given, expected);
+  if (ok && typeof challenge === "string" && /^\d{1,64}$/.test(challenge)) {
+    return res.status(200).type("text/plain").send(challenge);
   }
-  return res.status(403).send("Verification failed");
+  return res.status(403).type("text/plain").send("Verification failed");
 });
 
 // Actual incoming-message webhook. A citizen messaging your WhatsApp
@@ -1445,11 +1823,28 @@ app.post("/api/whatsapp/webhook", verifyMetaSignature, async (req, res) => {
   const deviceId = `whatsapp:${parsed.fromPhone}`;
 
   try {
+    // Coordinates are checked like the web SOS's (B47): a webhook (unsigned
+    // in dry-run mode) with latitude "x" used to be stored as an SOS, and
+    // that one row then broke the officer SOS feed for everyone.
+    let coords = null;
+    if (parsed.type === "location") {
+      coords = parseCoordinates(parsed.latitude, parsed.longitude);
+      if (!coords) {
+        console.warn(`[WhatsApp] location from ${parsed.fromPhone} has invalid coordinates - not stored`);
+        // NEEDS HUMAN REVIEW (citizen-facing safety text)
+        await sendWhatsAppText(
+          parsed.fromPhone,
+          "We could not read that location. Please share it again: tap the attachment icon -> Location -> Send your current location. In immediate danger, also call 112.",
+        );
+        return;
+      }
+    }
+
     if (parsed.type === "location" && isAwaitingAlertLocation(parsed.fromPhone)) {
       // Opt-in in progress (see "ALERTS ON" below): this location is for
       // alerts, not an SOS - and the reply says so, and how to turn it into
       // an SOS with one word, so nobody in danger is left without help.
-      activateAlertSubscription(parsed.fromPhone, parsed.latitude, parsed.longitude);
+      activateAlertSubscription(parsed.fromPhone, coords.latitude, coords.longitude);
       await sendWhatsAppText(
         parsed.fromPhone,
         "You will now get SANJEEVNI hazard alerts for this area. Reply STOP to unsubscribe.\n" +
@@ -1460,13 +1855,15 @@ app.post("/api/whatsapp/webhook", verifyMetaSignature, async (req, res) => {
       // number; otherwise ask for it. A shared location is still better -
       // the person may have moved since.
       const sub = selectSubscriber.get(parsed.fromPhone);
-      if (sub && sub.latitude != null && sub.longitude != null) {
-        const { httpStatus, body } = createSosRequest(deviceId, sub.latitude, sub.longitude,
-          "Reported via WhatsApp text SOS - location from the person's alert subscription, may be outdated");
+      const subCoords = sub ? parseCoordinates(sub.latitude, sub.longitude) : null;
+      if (subCoords) {
+        const { httpStatus, body } = createSosRequest(deviceId, subCoords.latitude, subCoords.longitude,
+          "Reported via WhatsApp text SOS - location from the person's alert subscription, may be outdated",
+          "whatsapp");
         await sendWhatsAppText(
           parsed.fromPhone,
           (httpStatus === 409 ? "Your SOS is already active." : "SOS received. Responders have been notified.") +
-            ` Nearest hospital: ${body.hospital} (${body.distance_km} km).\n` +
+            hospitalLine(body) + "\n" +
             "We used the location you shared for alerts. If you are somewhere else now, share your CURRENT location.",
         );
       } else {
@@ -1478,19 +1875,21 @@ app.post("/api/whatsapp/webhook", verifyMetaSignature, async (req, res) => {
     } else if (parsed.type === "location") {
       const { httpStatus, body } = createSosRequest(
         deviceId,
-        parsed.latitude,
-        parsed.longitude,
+        coords.latitude,
+        coords.longitude,
         "Reported via WhatsApp",
+        "whatsapp",
       );
       if (httpStatus === 409) {
         await sendWhatsAppText(
           parsed.fromPhone,
-          `Your SOS is already active. Nearest hospital: ${body.hospital} (${body.distance_km} km). Help is on the way.`,
+          `Your SOS is already active.${hospitalLine(body)} Help is on the way.`,
         );
       } else {
         await sendWhatsAppText(
           parsed.fromPhone,
-          `SOS received. Responders have been notified.\nNearest hospital: ${body.hospital} (${body.distance_km} km)\nDirections: ${body.maps_url}`,
+          `SOS received. Responders have been notified.\n${hospitalLine(body).trim()}` +
+            (body.maps_url ? `\nDirections: ${body.maps_url}` : ""),
         );
       }
     } else if (parsed.type === "text" && ALERT_OPT_IN_WORDS.has(normalizeCommand(parsed.text))) {
@@ -1517,6 +1916,7 @@ app.post("/api/whatsapp/webhook", verifyMetaSignature, async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
-  console.log("Node.js Orchestrator running on http://localhost:3000");
+const PORT = parseInt(process.env.SANJEEVNI_PORT || "3000", 10) || 3000;
+app.listen(PORT, () => {
+  console.log(`Node.js Orchestrator running on http://localhost:${PORT}`);
 });

@@ -1,36 +1,119 @@
 /* SANJEEVNI design tokens - same palette as the original pages, plus a
    dark theme. Components use these variables only (no raw colours), so
-   both themes stay consistent. */
+   both themes stay consistent.
+
+   Rules for this file:
+   - Never rename or remove a token: page modules depend on them.
+   - New tokens are additive. Spacing/radius/type scales below are the
+     preferred values for new or restyled components.
+   - Element defaults here are low-specificity (bare element selectors)
+     so any CSS-module class overrides them. */
 :root {
+  /* ---- brand ---- */
   --green-dark: #1b5e20;
   --green: #2e7d32;
   --green-mid: #43a047;
   --green-light: #e8f5e9;
   --green-lighter: #f1f8f2;
+  --on-brand: #ffffff; /* text/icons on the green brand surfaces */
 
+  /* ---- surfaces & text ---- */
   --page-bg: #f6f9f6;
   --surface: #ffffff;
+  --surface-2: #f1f8f2; /* subtle raised/inset areas (same as green-lighter) */
   --text: #1b1b1b;
   --text-muted: #5f6b60;
+  --heading: var(--green-dark); /* section headings on page/surface */
+  --link: var(--green);
+  --link-hover: var(--green-dark);
   --border: #dbe7dc;
+  --border-strong: #7d8f80; /* form-control outlines: >= 3:1 against surface */
   --input-bg: #ffffff;
   --shadow: 0 2px 8px rgba(27, 94, 32, 0.08);
   --shadow-hover: 0 6px 18px rgba(27, 94, 32, 0.18);
+  --shadow-sm: 0 1px 2px rgba(27, 94, 32, 0.08);
+  --shadow-lg: 0 12px 32px rgba(27, 94, 32, 0.14);
+  --shadow-overlay: 0 20px 48px rgba(0, 0, 0, 0.3);
+  --overlay: rgba(10, 20, 12, 0.6); /* modal backdrop */
 
-  --sev-medium: #e08a00;
+  /* ---- severity (text colours readable on --surface) ---- */
+  --sev-medium: #b45309;
   --sev-high: #d32f2f;
   --sev-low: var(--green);
+  --sev-critical: #b71c1c;
+  /* tinted backgrounds that pair with the text colours above */
+  --sev-low-bg: var(--green-light);
+  --sev-medium-bg: #fff4e0;
+  --sev-high-bg: #fdecea;
+  --sev-critical-bg: #fef2f2;
+  /* solid fills for badges/banners; always use --on-sev text on them */
+  --sev-medium-solid: #b45309;
+  --sev-high-solid: #c62828;
+  --sev-critical-solid: #8e1010;
+  --on-sev: #ffffff;
   --critical-bg: #fef2f2;
   --critical-text: #b91c1c;
+
+  /* ---- status / feedback ---- */
   --danger: #c62828;
   --danger-bg: #fdecea;
+  --warning-text: #8a5300;
+  --warning-bg: #fff4e0;
+  --success: var(--green);
+  --success-bg: var(--green-light);
   --info: #1a4f8b;
   --info-bg: #e8f1fd;
   --sos: #d90429;
   --focus: #1a73e8;
+  --focus-on-brand: #ffffff; /* focus ring on green/red/blue bars */
+  --focus-halo: color-mix(in srgb, var(--green-mid) 40%, transparent); /* text-field focus */
+  --toast-bg: #1b1b1b;
+  --toast-text: #ffffff;
 
+  /* ---- spacing scale (4px base) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ---- radius scale ---- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
   --radius: 12px;
-  --font: Arial, Helvetica, sans-serif;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  /* ---- typography ---- */
+  --font: "Segoe UI", system-ui, -apple-system, Roboto, "Noto Sans", Arial, Helvetica, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", "Courier New", monospace;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+  --leading-tight: 1.25;
+  --leading: 1.5;
+  --weight-medium: 600;
+  --weight-bold: 700;
+
+  /* ---- sizing / layering / motion ---- */
+  --control-h: 40px; /* staff-page inputs and buttons */
+  --tap-min: 44px; /* touch targets on the citizen page */
+  --content-max: 1280px;
+  --z-header: 100;
+  --z-toast: 3000;
+  --z-modal: 4000;
+  --z-skip: 5000;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 0.15s;
+
   color-scheme: light;
 }
 
@@ -38,31 +121,60 @@
   :root {
     --page-bg: #0f1511;
     --surface: #18211b;
+    --surface-2: #1a2a1e;
     --text: #e8efe9;
     --text-muted: #9fb0a2;
+    --heading: #a5d6a7;
+    --link: #81c784;
+    --link-hover: #a5d6a7;
     --border: #2b3a30;
+    --border-strong: #637a69;
     --input-bg: #111914;
     --green-light: #1f3324;
     --green-lighter: #1a2a1e;
     --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
     --shadow-hover: 0 6px 20px rgba(0, 0, 0, 0.5);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 14px 36px rgba(0, 0, 0, 0.55);
+    --shadow-overlay: 0 20px 48px rgba(0, 0, 0, 0.6);
+    --overlay: rgba(0, 0, 0, 0.7);
     --sev-medium: #ffb74d;
     --sev-high: #ff6b6b;
     --sev-low: #81c784;
+    --sev-critical: #ff5252;
+    --sev-medium-bg: #3a2a10;
+    --sev-high-bg: #3a1a1a;
+    --sev-critical-bg: #3a1a1a;
     --critical-bg: #3a1a1a;
     --critical-text: #ff8a80;
     --danger: #ff8a80;
     --danger-bg: #3a1a1a;
+    --warning-text: #ffb74d;
+    --warning-bg: #3a2a10;
+    --success: #81c784;
     --info: #9cc3f5;
     --info-bg: #15263b;
+    --focus: #8ab4f8;
+    --focus-halo: color-mix(in srgb, #81c784 45%, transparent);
+    --toast-bg: #e8efe9;
+    --toast-text: #0f1511;
     color-scheme: dark;
   }
 }
 
+/* ---------------------------------------------------------------------
+   Element defaults. Bare element selectors only (specificity 0,0,1), so
+   page modules always win.
+   ------------------------------------------------------------------ */
 *,
 *::before,
 *::after {
   box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 html,
@@ -73,18 +185,68 @@ body {
 
 body {
   font-family: var(--font);
+  line-height: var(--leading);
   background: var(--page-bg);
   color: var(--text);
+  overflow-wrap: break-word;
   -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  line-height: var(--leading-tight);
 }
 
 a {
   color: inherit;
+  text-underline-offset: 2px;
 }
 
+/* Form controls use the page font instead of the browser's UI font */
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+/* :where() keeps this at zero specificity so module cursors still win */
+:where(button:not(:disabled), [role="button"]:not([aria-disabled="true"])) {
+  cursor: pointer;
+}
+
+table {
+  border-collapse: collapse;
+}
+
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--green-mid) 35%, transparent);
+}
+/* ---------------------------------------------------------------------
+   Focus: one clear ring everywhere, keyboard only. Bars with a coloured
+   background (headers) switch the ring to --focus-on-brand.
+   ------------------------------------------------------------------ */
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
+}
+
+/* Programmatic focus targets (skip-link target, focused headings) are not
+   controls: no ring around the whole page when they receive focus. */
+main[tabindex="-1"]:focus,
+h1[tabindex="-1"]:focus,
+h2[tabindex="-1"]:focus,
+h3[tabindex="-1"]:focus {
+  outline: none;
 }
 
 /* "Skip to main content": hidden until a keyboard user tabs to it */
@@ -92,7 +254,7 @@ a {
   position: absolute;
   left: 8px;
   top: -60px;
-  z-index: 5000;
+  z-index: var(--z-skip);
   background: #fff;
   color: #1b5e20;
   padding: 10px 14px;
@@ -108,14 +270,81 @@ a {
   position: absolute;
   width: 1px;
   height: 1px;
+  padding: 0;
+  margin: -1px;
   overflow: hidden;
   clip: rect(0 0 0 0);
+  clip-path: inset(50%);
   white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------------
+   Toast (src/components/Toast.tsx). Lives here because Toast has no
+   module of its own and is portalled to <body>.
+   ------------------------------------------------------------------ */
+.app-toast {
+  position: fixed;
+  left: 50%;
+  top: var(--space-4);
+  transform: translateX(-50%);
+  z-index: var(--z-toast);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  width: max-content;
+  max-width: calc(100vw - 2 * var(--space-4));
+  background: var(--toast-bg);
+  color: var(--toast-text);
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-overlay);
+  font-size: var(--text-md);
+  line-height: 1.45;
+  animation: app-toast-in 0.2s var(--ease);
+}
+.app-toast-text {
+  padding-top: 2px;
+}
+.app-toast-close {
+  flex: none;
+  min-width: 32px;
+  min-height: 32px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  padding: 0 var(--space-2);
+}
+.app-toast-close:hover {
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+.app-toast-close:focus-visible {
+  outline-color: currentColor;
+}
+@keyframes app-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *,
+  *::before,
+  *::after {
     animation: none !important;
     transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Windows High Contrast / forced colours: keep focus rings visible even
+   where a module replaced the outline with a box-shadow */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 3px solid CanvasText;
   }
 }

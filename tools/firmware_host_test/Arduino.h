@@ -41,9 +41,24 @@ class String {
   }
 };
 
+// Everything printed is also kept in g_serialLog so tests can check that a
+// message was given; g_serialQuiet hides it from the console (the queue
+// tests "reboot" hundreds of times).
+inline std::string g_serialLog;
+inline bool g_serialQuiet = false;
 struct SerialStub {
-  void println(const char* s) { std::printf("%s\n", s); }
+  void println(const char* s) { emit(std::string(s) + "\n"); }
   template <typename... A>
-  void printf(const char* f, A... a) { std::printf(f, a...); }
+  void printf(const char* f, A... a) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), f, a...);
+    emit(buf);
+  }
+
+ private:
+  void emit(const std::string& s) {
+    g_serialLog += s;
+    if (!g_serialQuiet) std::fputs(s.c_str(), stdout);
+  }
 };
 inline SerialStub Serial;

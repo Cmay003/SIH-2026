@@ -1,11 +1,15 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import L from "leaflet";
+import { MapContainer, useMap } from "react-leaflet";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setUnauthorizedHandler } from "../api/client";
 import type { NodeConfig } from "../api/types";
 import { curveNumberHint, emptyNodeForm, validateNodeForm } from "../lib/nodes";
+import { PickPosition } from "../components/PickPosition";
 import { AdminPage } from "../pages/AdminPage";
 import { Providers } from "../Providers";
+import { MODEL_CARD } from "./fixtures/modelCard";
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -45,6 +49,7 @@ const baseRoutes = {
   "GET /api/auth/me": () => json(200, { user: { username: "admin1", role: "admin" }, idle_timeout_minutes: 60 }),
   "GET /api/admin/nodes": () => json(200, { nodes: NODES }),
   "GET /api/node-health": () => json(200, HEALTH),
+  "GET /api/admin/model-card": () => json(200, MODEL_CARD),
 };
 
 beforeEach(() => {
@@ -94,11 +99,23 @@ describe("validateNodeForm", () => {
   });
 });
 
-describe("AdminPage", () => {
+// Every keystroke re-renders the whole admin page (table, form and map).
+// Typed key by key, "adds a node" took about 5 s on an idle PC and hit the
+// global 15 s limit on a busy one (a full run failed there twice). The tests
+// use userEvent.setup({ delay: null }) (no timer between keys) and paste
+// field values: they check the request body and the validation messages,
+// not per-key behaviour. Idle it is now well under 1 s, but the page load
+// alone took 8 s with the Python suite running alongside, so the block gets
+// 30 s - headroom for a loaded PC, not the expected time.
+describe("AdminPage", { timeout: 30_000 }, () => {
+  // The first wait covers the whole page load (auth, nodes, health), which
+  // is slow on a loaded PC - the 1 s findBy default flaked there.
+  const PAGE_LOAD = { timeout: 5000 };
+
   it("lists the nodes with their live status", async () => {
     api(baseRoutes);
     renderPage();
-    const row04 = (await screen.findByRole("rowheader", { name: "NODE-04" })).closest("tr")!;
+    const row04 = (await screen.findByRole("rowheader", { name: "NODE-04" }, PAGE_LOAD)).closest("tr")!;
     expect(within(row04).getByText("Sector 4, Riverside")).toBeInTheDocument();
     expect(within(row04).getByText("5 s (default)")).toBeInTheDocument();
     expect(within(row04).getByText("Online")).toBeInTheDocument();
@@ -108,18 +125,25 @@ describe("AdminPage", () => {
   });
 
   it("adds a node and tells the admin how to give it a device key", async () => {
+    const user = userEvent.setup({ delay: null });
     const calls = api({ ...baseRoutes, "POST /api/admin/nodes/NODE-05": () => json(200, { status: "created", node_id: "NODE-05" }) });
     renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: "+ Add node" }));
-    await userEvent.type(screen.getByLabelText("Node ID"), "NODE-05");
-    await userEvent.type(screen.getByLabelText("Location"), "New Bridge");
-    await userEvent.type(screen.getByLabelText("Latitude"), "29.38");
-    await userEvent.type(screen.getByLabelText("Longitude"), "79.46");
-    await userEvent.selectOptions(screen.getByLabelText("Upstream node"), "NODE-04");
-    await userEvent.type(screen.getByLabelText("Reports every (seconds)"), "60");
-    await userEvent.click(screen.getByRole("button", { name: "Add node" }));
+    await user.click(await screen.findByRole("button", { name: "+ Add node" }, PAGE_LOAD));
+    // One paste per field instead of ~25 keystrokes, each a full re-render
+    // (this test alone took 15 s on a loaded PC when typed key by key).
+    const fill = async (label: string, text: string) => {
+      await user.click(screen.getByLabelText(label));
+      await user.paste(text);
+    };
+    await fill("Node ID", "NODE-05");
+    await fill("Location", "New Bridge");
+    await fill("Latitude", "29.38");
+    await fill("Longitude", "79.46");
+    await user.selectOptions(screen.getByLabelText("Upstream node"), "NODE-04");
+    await fill("Reports every (seconds)", "60");
+    await user.click(screen.getByRole("button", { name: "Add node" }));
 
-    expect(await screen.findByText(/node server\/device_keys\.js add node-05 --nodes NODE-05/)).toBeInTheDocument();
+    expect(await screen.findByText(/node server\/device_keys\.js add node-05 --nodes NODE-05/, {}, PAGE_LOAD)).toBeInTheDocument();
     const post = calls.find((c) => c.method === "POST")!;
     expect(post.path).toBe("/api/admin/nodes/NODE-05");
     expect(post.body).toEqual({ location: "New Bridge", land_use: "urban_low", curve_number: 80, latitude: 29.38,
@@ -127,11 +151,12 @@ describe("AdminPage", () => {
   });
 
   it("shows field errors and sends nothing when the form is invalid", async () => {
+    const user = userEvent.setup({ delay: null });
     const calls = api(baseRoutes);
     renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: "+ Add node" }));
-    await userEvent.type(screen.getByLabelText("Node ID"), "NODE-04");
-    await userEvent.click(screen.getByRole("button", { name: "Add node" }));
+    await user.click(await screen.findByRole("button", { name: "+ Add node" }, PAGE_LOAD));
+    await user.type(screen.getByLabelText("Node ID"), "NODE-04");
+    await user.click(screen.getByRole("button", { name: "Add node" }));
     expect(screen.getByText("NODE-04 already exists.")).toBeInTheDocument();
     expect(screen.getByLabelText("Node ID")).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByLabelText("Node ID")).toHaveFocus(); // first invalid field
@@ -140,28 +165,32 @@ describe("AdminPage", () => {
   });
 
   it("edits a node with PUT and shows the server's reason when it refuses", async () => {
+    const user = userEvent.setup({ delay: null });
     const calls = api({ ...baseRoutes,
       "PUT /api/admin/nodes/NODE-07": () => json(400, { error: "Upstream node 'X' does not exist" }) });
     renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: "Edit NODE-07" }));
+    await user.click(await screen.findByRole("button", { name: "Edit NODE-07" }, PAGE_LOAD));
     expect(screen.getByLabelText("Node ID")).toBeDisabled();
-    expect(screen.getByLabelText("Location")).toHaveValue("Hill Road");
-    await userEvent.clear(screen.getByLabelText("Location"));
-    await userEvent.type(screen.getByLabelText("Location"), "Hill Road (moved)");
-    await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    expect(await screen.findByText("Couldn't save: Upstream node 'X' does not exist")).toBeInTheDocument();
+    const location = screen.getByLabelText("Location");
+    expect(location).toHaveValue("Hill Road");
+    await user.clear(location); // clear() leaves the field focused
+    await user.paste("Hill Road (moved)");
+    expect(location).toHaveValue("Hill Road (moved)");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText("Couldn't save: Upstream node 'X' does not exist", {}, PAGE_LOAD)).toBeInTheDocument();
     expect(calls.find((c) => c.method === "PUT")!.body).toMatchObject({ location: "Hill Road (moved)", report_interval_seconds: 60 });
   });
 
   it("deletes only after confirmation and explains a refusal", async () => {
+    const user = userEvent.setup({ delay: null });
     const calls = api({ ...baseRoutes, "DELETE /api/admin/nodes/NODE-07": () =>
       json(409, { error: "Cannot delete 'NODE-07' - it's set as upstream_node for: ['NODE-04']. Update those nodes first." }) });
     const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
     renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: "Delete NODE-07" }));
+    await user.click(await screen.findByRole("button", { name: "Delete NODE-07" }, PAGE_LOAD));
     expect(calls.some((c) => c.method === "DELETE")).toBe(false);
-    await userEvent.click(screen.getByRole("button", { name: "Delete NODE-07" }));
-    expect(await screen.findByText(/Couldn't delete: Cannot delete 'NODE-07'/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Delete NODE-07" }));
+    expect(await screen.findByText(/Couldn't delete: Cannot delete 'NODE-07'/, {}, PAGE_LOAD)).toBeInTheDocument();
     expect(confirm).toHaveBeenCalledTimes(2);
   });
 
@@ -169,7 +198,37 @@ describe("AdminPage", () => {
     api({ ...baseRoutes, "GET /api/admin/nodes": () =>
       json(503, { error: "Node management is switched off: set OFFICER_API_KEY in .env and restart both servers." }) });
     renderPage();
-    expect(await screen.findByText(/set OFFICER_API_KEY in \.env/)).toBeInTheDocument();
+    expect(await screen.findByText(/set OFFICER_API_KEY in \.env/, {}, PAGE_LOAD)).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole("button", { name: "+ Add node" })).not.toBeInTheDocument());
+  });
+});
+
+describe("Position picker map", () => {
+  // B65: zoomed out, Leaflet shows the world several times side by side and
+  // a click on the copy to the east reports longitude + 360.
+  it("wraps a click on a repeated world copy back into -180..180", () => {
+    let map: L.Map | null = null;
+    function Grab() {
+      map = useMap();
+      return null;
+    }
+    const onPick = vi.fn();
+    render(
+      <MapContainer center={[29.3919, 79.4542]} zoom={2}>
+        <PickPosition onPick={onPick} />
+        <Grab />
+      </MapContainer>,
+    );
+    act(() => {
+      map!.fire("click", { latlng: L.latLng(29.3919, 439.4542) });
+    });
+    expect(onPick).toHaveBeenCalledTimes(1);
+    const [lat, lon] = onPick.mock.calls[0] as [number, number];
+    expect(lat).toBeCloseTo(29.3919, 6);
+    expect(lon).toBeCloseTo(79.4542, 6);
+    act(() => {
+      map!.fire("click", { latlng: L.latLng(-10, -280) }); // the copy to the west
+    });
+    expect((onPick.mock.calls[1] as [number, number])[1]).toBeCloseTo(80, 6);
   });
 });

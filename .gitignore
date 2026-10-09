@@ -63,3 +63,6 @@ tempCodeRunnerFile.*
 
 # Edge-model rebuild output (now in var/edge_ai_build; old location kept ignored)
 edge_ai_build/
+
+# Backups made by the edge-model rebuild steps (Copy-Item ... .bak)
+firmware/**/*.bak

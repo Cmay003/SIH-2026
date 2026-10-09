@@ -27,10 +27,18 @@ export default defineConfig({
     port: 5173,
     // `npm run dev`: the API (and its session cookie) come from server.js
     proxy: { "/api": "http://localhost:3000" },
+    // The SOS page bundles ../data/hazard_advice.json (one advice table
+    // shared with server.js); the dev server only serves files from the
+    // allowed folders, so that one data file is added explicitly.
+    fs: { allow: [root, fileURLToPath(new URL("../data/hazard_advice.json", import.meta.url))] },
   },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     css: true,
+    // Page tests that type into forms and run axe take 2-4 s; on a busy PC
+    // (a full run once took 82 s) a few hit the 5 s default and failed
+    // once at random. 15 s keeps them from flaking; real hangs still fail.
+    testTimeout: 15_000,
   },
 });

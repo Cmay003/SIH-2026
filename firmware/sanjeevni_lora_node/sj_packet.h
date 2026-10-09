@@ -10,7 +10,14 @@
 #include <string.h>
 
 #define SJ_MAGIC 0x53  // 'S'
-#define SJ_VERSION 1
+// 2: session widened from 16 to 32 bits (review B: a replacement board or
+// an erased NVS restarted the session at 1, so its reading_uids repeated
+// the old board's and the backend dropped them as duplicates - a 32-bit
+// session that starts at a random value makes that practically impossible).
+// The gateway still accepts and ACKs version-1 packets (sjReadingFromV1),
+// so nodes can be re-flashed one at a time after the gateway.
+#define SJ_VERSION 2
+#define SJ_VERSION_V1 1
 #define SJ_TYPE_READING 1
 #define SJ_TYPE_ACK 2
 #define SJ_NODE_ID_LEN 12           // "NODE-INDB" etc., NUL-padded
@@ -40,14 +47,14 @@ enum : uint16_t {
                          SJ_HAS_PM | SJ_HAS_PH | SJ_HAS_TURBIDITY,
 };
 
-// 54 bytes - well inside LoRa's 255-byte limit and short on air (~100 ms
+// 56 bytes - well inside LoRa's 255-byte limit and short on air (~100 ms
 // at SF7/125 kHz). Fixed-point integers instead of floats/JSON for size.
 struct __attribute__((packed)) SjReading {
   uint8_t magic;
   uint8_t version;
   uint8_t type;
   char node_id[SJ_NODE_ID_LEN];
-  uint16_t session;  // increments on every power-on/reset of the node
+  uint32_t session;  // random start per board, +1 on every power-on/reset (sj_session.h)
   uint32_t seq;      // increments per reading within a session
   uint32_t age_s;    // seconds between measurement and THIS transmission
   uint16_t flags;
@@ -72,9 +79,65 @@ struct __attribute__((packed)) SjAck {
   uint8_t version;
   uint8_t type;
   char node_id[SJ_NODE_ID_LEN];
+  uint32_t session;
+  uint32_t seq;
+};
+
+// ---- protocol version 1 (16-bit session), still understood ------------
+// A v1 reading is the v2 one with a 2-byte session: bytes 0..14 (header +
+// node id) and everything after the session are laid out the same.
+#define SJ_V1_READING_SIZE 54
+#define SJ_V1_SESSION_OFFSET 15  // offsetof(SjReading, session) in both versions
+
+struct __attribute__((packed)) SjAckV1 {
+  uint8_t magic;
+  uint8_t version;
+  uint8_t type;
+  char node_id[SJ_NODE_ID_LEN];
   uint16_t session;
   uint32_t seq;
 };
+
+inline bool sjIsValidReadingV1(const uint8_t* buf, size_t len) {
+  return len == SJ_V1_READING_SIZE && buf[0] == SJ_MAGIC && buf[1] == SJ_VERSION_V1 && buf[2] == SJ_TYPE_READING;
+}
+
+// Widens a v1 reading (54 bytes at `v1`) to the current layout. The
+// session keeps its value, so its reading_uid ("<session>-<seq>") is the
+// same string the old firmware produced - a resend is still a duplicate.
+inline SjReading sjReadingFromV1(const uint8_t* v1) {
+  SjReading r;
+  memcpy(&r, v1, SJ_V1_SESSION_OFFSET);
+  uint16_t s16;
+  memcpy(&s16, v1 + SJ_V1_SESSION_OFFSET, sizeof(s16));
+  r.session = s16;
+  memcpy((uint8_t*)&r + SJ_V1_SESSION_OFFSET + sizeof(uint32_t), v1 + SJ_V1_SESSION_OFFSET + sizeof(uint16_t),
+         SJ_V1_READING_SIZE - SJ_V1_SESSION_OFFSET - sizeof(uint16_t));
+  r.version = SJ_VERSION;
+  return r;
+}
+
+// Readings queued on flash by a v1 firmware keep their v1 bytes after an
+// update (the queue record size did not change: the 2 new bytes took the
+// old padding). Call after every peek: it converts such a record in place
+// and leaves current ones alone.
+inline void sjUpgradeQueuedReading(SjReading& r) {
+  if (r.magic != SJ_MAGIC || r.version != SJ_VERSION_V1) return;
+  uint8_t v1[SJ_V1_READING_SIZE];
+  memcpy(v1, &r, sizeof(v1));
+  r = sjReadingFromV1(v1);
+}
+
+inline SjAckV1 sjMakeAckV1(const SjReading& r) {
+  SjAckV1 a;
+  a.magic = SJ_MAGIC;
+  a.version = SJ_VERSION_V1;
+  a.type = SJ_TYPE_ACK;
+  memcpy(a.node_id, r.node_id, SJ_NODE_ID_LEN);
+  a.session = (uint16_t)r.session;
+  a.seq = r.seq;
+  return a;
+}
 
 inline bool sjIsValidReading(const uint8_t* buf, size_t len) {
   if (len != sizeof(SjReading)) return false;
@@ -151,7 +214,9 @@ inline void sjAppendJson(String& out, const SjReading& r, long ageSeconds, int s
   out += "{\"node_id\":\"";
   out += nodeId;
   out += "\",\"reading_uid\":\"";
-  out += String(r.session) + "-" + String(r.seq);
+  // Plain decimal: up to "4294967295-4294967295" (21 chars). The backend
+  // takes any string; it only has to be unique per node_id.
+  out += String((unsigned long)r.session) + "-" + String((unsigned long)r.seq);
   out += "\",\"link\":\"";
   out += link;
   out += "\",\"signal_strength_dbm\":";

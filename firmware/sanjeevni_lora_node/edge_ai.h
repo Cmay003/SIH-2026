@@ -18,8 +18,8 @@
 enum EdgeRiskLevel { EDGE_NORMAL = 0, EDGE_WATCH = 1, EDGE_URGENT = 2, EDGE_UNAVAILABLE = 255 };
 
 // From scaler_params.json at training time - must match the model.
-static const float EDGE_FEATURE_MEAN[5] = {1.9372822f, 30.2528999f, 60.0702352f, 527.8328722f, 0.0594403f};
-static const float EDGE_FEATURE_SCALE[5] = {0.9618157f, 7.8129314f, 23.1442541f, 215.4961791f, 0.1034814f};
+static const float EDGE_FEATURE_MEAN[5] = {2.2792535f, 31.1765541f, 62.0170003f, 498.4459163f, 0.0395000f};
+static const float EDGE_FEATURE_SCALE[5] = {0.7882857f, 7.1304561f, 17.8068433f, 185.9721442f, 0.1947813f};
 
 namespace sjedge {
 const tflite::Model* model = nullptr;

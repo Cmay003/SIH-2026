@@ -2,11 +2,18 @@
 Host-side checks for the Phase 2 firmware (no ESP32 needed):
   1. shared headers are identical in the node and gateway sketches
   2. packet layout, ACK matching and the LittleFS queue (compiled with g++
-     against small Arduino/LittleFS stand-ins)
+     against small Arduino/LittleFS stand-ins; queue_tests.h covers wrap,
+     reboots, flash wear per push, corruption, capacity/format changes and
+     a simulated power cut at every flash commit); protocol v1 packets and
+     queued v1 records, reading_uid session starts (sj_session.h), the
+     deep-sleep drain budget, the gateway's pop-after-upload rule and the
+     node's gas/PM warm-up gate (sj_warmup.h) against config.h's times
   3. the JSON the firmware sends is accepted by the backend's own
      pydantic models (ReadingBatch / RawReading in backend_server.py)
   4. the pins in both config.h files: no clashes, flash/input-only/ADC2
      misuse, or 5 V outputs reaching a 3.3 V pin (tools/wiring)
+  5. the firmware build tool's helpers (tools/firmware_build), e.g. a
+     var/ on another drive than the repo
 
 Run from the repo root:  venv/Scripts/python.exe tools/firmware_host_test/run_tests.py
 What this can't check: compiling against the real ESP32 core, RadioLib,
@@ -68,7 +75,7 @@ def main() -> int:
         full, core, tilt_only = batch.readings
         checks = {
             "12-char node id kept intact": full.node_id == "NODE-INDB-12",
-            "reading_uid = session-seq": full.reading_uid == "3-9",
+            "reading_uid = session-seq (32-bit session)": full.reading_uid == "3000000003-9",
             "fixed-point values decoded": (full.river_level_m, full.temp_c, full.soil_moisture_pct, full.water_ph)
             == (1.234, -1.5, 45.6, 6.12),
             "optional sensors present": None not in (full.tilt_angle_deg, full.pm25_ugm3, full.turbidity_ntu, full.battery_pct),
@@ -91,6 +98,14 @@ def main() -> int:
                             capture_output=True, text=True)
     print("   " + wiring.stdout.strip().replace("\n", "\n   "))
     ok &= wiring.returncode == 0
+
+    print("\n== 5. firmware build tool (tools/firmware_build/test_compile_variants.py) ==")
+    build_tool = subprocess.run(
+        [sys.executable, os.path.join(REPO, "tools", "firmware_build", "test_compile_variants.py"), "-v"],
+        capture_output=True, text=True, cwd=REPO,
+    )
+    print("   " + build_tool.stderr.strip().replace("\n", "\n   "))  # unittest reports on stderr
+    ok &= build_tool.returncode == 0
 
     print("\nALL PASSED" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1

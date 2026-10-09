@@ -4,10 +4,12 @@ import {
   cloneElement, useEffect, useId, useRef, useState, type FormEvent, type InputHTMLAttributes, type ReactElement,
   type ReactNode,
 } from "react";
-import { CircleMarker, MapContainer, TileLayer, Tooltip, useMap, useMapEvents } from "react-leaflet";
+import { CircleMarker, MapContainer, TileLayer, Tooltip, useMap } from "react-leaflet";
 import { ApiError, apiDelete, apiGet, apiPost, apiPut } from "../api/client";
 import type { AdminNodesResponse, NodeConfig, NodeHealth, NodeHealthResponse } from "../api/types";
 import { AppHeader } from "../components/AppHeader";
+import { ModelCardSection } from "../components/ModelCardSection";
+import { PickPosition } from "../components/PickPosition";
 import styles from "../components/Admin.module.css";
 import {
   curveNumberHint, DEFAULT_REPORT_INTERVAL_SECONDS, emptyNodeForm, formFromNode, LAND_USES, landUseLabel,
@@ -63,7 +65,11 @@ export function AdminPage() {
       <AppHeader />
       <main id="main" className={styles.main} tabIndex={-1}>
         <nav className={styles.crumbs} aria-label="Pages">
-          <a href="/">Dashboard</a> · <a href="/officer.html">Officer map</a>
+          <ul>
+            <li><a href="/">Dashboard</a></li>
+            <li><a href="/officer.html">Officer map</a></li>
+            <li><span aria-current="page">Sensor nodes</span></li>
+          </ul>
         </nav>
         <div className={styles.titleRow}>
           <h2>Sensor nodes{nodes.isSuccess ? ` (${ids.length})` : ""}</h2>
@@ -76,12 +82,13 @@ export function AdminPage() {
         <p className={styles.intro}>
           The AI only accepts readings from nodes listed here. Position, land use and the upstream link feed the flood
           model, the hospital routing and the public map, so changes take effect on the next reading.
+          How well the models themselves score is in the <a href="#model-card">model card</a> below.
         </p>
 
         <div role="status" aria-live="polite" className={notice ? styles.notice : undefined}>{notice}</div>
         {remove.isError && <div role="alert" className={styles.errorBox}>Couldn't delete: {remove.error.message}</div>}
         {nodes.isError && <div role="alert" className={styles.errorBox}>{loadErrorText(nodes.error)}</div>}
-        {nodes.isPending && <p>Loading nodes...</p>}
+        {nodes.isPending && <p className={styles.loading}>Loading nodes...</p>}
 
         {editing && nodes.isSuccess && (
           <NodeEditor
@@ -104,6 +111,8 @@ export function AdminPage() {
                      onEdit={(nodeId) => { setNotice(null); setEditing({ mode: "edit", nodeId }); }}
                      onDelete={onDelete} />
         )}
+
+        <ModelCardSection />
       </main>
     </>
   );
@@ -259,7 +268,8 @@ function NodeEditor({ editing, registry, onCancel, onSaved }: {
         <div className={styles.mapBox}>
           <p id="node-map-help" className={styles.hint}>Click the map to set the position. Grey dots are the other nodes.</p>
           <div className={styles.map} role="region" aria-label="Position picker map (the latitude and longitude fields do the same)">
-            <MapContainer center={hasPosition ? [lat, lon] : DEFAULT_CENTER} zoom={13} className={styles.map}>
+            {/* worldCopyJump: panning across the date line returns to the main world copy */}
+            <MapContainer center={hasPosition ? [lat, lon] : DEFAULT_CENTER} zoom={13} className={styles.map} worldCopyJump>
               <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
               {Object.entries(registry).filter(([id]) => id !== nodeId).map(([id, n]) => (
                 <CircleMarker key={id} center={[n.latitude, n.longitude]} radius={6}
@@ -310,11 +320,6 @@ function Field({ id, label, error, hint, children }: {
       {hint && <div id={hintId} className={styles.hint}>{hint}</div>}
     </div>
   );
-}
-
-function PickPosition({ onPick }: { onPick: (lat: number, lon: number) => void }) {
-  useMapEvents({ click: (e) => onPick(e.latlng.lat, e.latlng.lng) });
-  return null;
 }
 
 /** Pan to a position typed into the fields (clicks are already in view) */

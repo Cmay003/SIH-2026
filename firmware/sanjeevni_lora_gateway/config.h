@@ -23,7 +23,13 @@
 
 // ---- Queue (LittleFS) -----------------------------------------------
 // Readings are acknowledged to nodes only AFTER they are saved here, then
-// forwarded to the backend. 4000 x ~64 B = ~256 KB.
+// forwarded to the backend. 4000 x (64 B + 4 B CRC) = ~272 KB in 67
+// small segment files (sj_file_queue.h). Changing this on a gateway that
+// still holds readings is safe: the next boot moves them to the new size
+// (newest kept if smaller), which briefly needs free flash for a second
+// copy. Without that room (e.g. a much larger capacity on a full queue)
+// the queue keeps the old size and its readings, and the move is retried
+// at the next boot.
 #define QUEUE_CAPACITY 4000
 
 // ---- Backhaul -------------------------------------------------------
@@ -32,6 +38,14 @@
 #define ENABLE_NBIOT 1
 
 #define FORWARD_RETRY_INTERVAL_MS 15000UL
+// Uploads run in their own FreeRTOS task so the LoRa radio is served
+// during a request. 12 KB: the TLS handshake ran in Arduino's 8 KB loop
+// task before; the rest is margin.
+#define FORWARD_TASK_STACK_BYTES 12288
+// How long a received packet waits for the queue while the forwarding task
+// reads or pops a batch. Kept well under the node's ACK timeout - a packet
+// not ACKed in time is simply resent by the node.
+#define QUEUE_LOCK_WAIT_MS 500
 #define WIFI_MAX_BATCH 20  // readings per HTTPS request
 // SIM7020 sends the body hex-encoded inside one AT command, so keep NB-IoT
 // requests small. Raise only after testing larger bodies on your module.

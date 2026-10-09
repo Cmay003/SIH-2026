@@ -1,9 +1,35 @@
+/* Officer map: full-screen Leaflet map + side panel (bottom sheet on phones). */
+
 .page {
   position: relative;
   height: 100vh;
   height: 100dvh;
+  overflow: hidden;
+
+  /* Local colours for this page (status chips etc.), dark values below */
+  --ok-text: var(--green-dark);
+  --ok-bg: var(--green-light);
+  --warn-text: #7a4a00;
+  --warn-bg: #fff3dc;
+  --offline-text: #3f4a44;
+  --offline-bg: #eceff1;
+  --panel-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+}
+@media (prefers-color-scheme: dark) {
+  .page {
+    --ok-text: #a5d6a7;
+    --warn-text: #ffcc80;
+    --warn-bg: #3a2c12;
+    --offline-text: #c3ccc5;
+    --offline-bg: #2a312c;
+    --panel-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+  }
 }
 
+.mapRegion {
+  position: absolute;
+  inset: 0;
+}
 .map {
   height: 100%;
   width: 100%;
@@ -12,71 +38,189 @@
 /* ---- side panel ---- */
 .panel {
   position: absolute;
-  top: 10px;
-  right: 10px;
+  top: 12px;
+  right: 12px;
   z-index: 1000;
-  width: 290px;
-  max-height: calc(100% - 20px);
-  overflow-y: auto;
+  width: clamp(300px, 27vw, 370px);
+  /* stops above the map attribution in the bottom-right corner */
+  max-height: calc(100% - 48px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--surface);
   color: var(--text);
-  padding: 12px 16px 14px;
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  box-shadow: var(--panel-shadow);
   font-size: 14px;
+  line-height: 1.4;
 }
-.panel h1 {
-  margin: 0 0 8px;
-  font-size: 18px;
+
+.panelHeader {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 8px 12px;
+  background: var(--green-dark);
+  color: #fff;
 }
-.chipRow {
-  margin-bottom: 10px;
+.title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font-size: 17px;
+  letter-spacing: 0.2px;
 }
-.count {
-  font-weight: bold;
-  color: var(--sev-high);
+.titleText {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.allClear {
-  margin-top: 8px;
-  background: var(--green-light);
-  color: var(--green-dark);
-  font-weight: bold;
-  padding: 8px 10px;
-  border-radius: 8px;
-}
-@media (prefers-color-scheme: dark) {
-  .allClear {
-    color: #a5d6a7;
-  }
-}
-.resolveAll {
-  margin-top: 8px;
-  width: 100%;
+.headerCount {
+  flex: none;
   background: var(--sos);
   color: #fff;
-  border: none;
-  padding: 9px 10px;
+  font-weight: bold;
+  font-size: 12.5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+.collapse {
+  flex: none;
+  min-height: 34px;
+  padding: 4px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  background: transparent;
+  color: #fff;
   border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
   font-weight: bold;
   cursor: pointer;
 }
-.resolveAll:disabled {
-  background: #9aa1ab;
-  cursor: progress;
+.collapse:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.collapse:focus-visible {
+  outline-color: #fff;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable; /* no layout shift when the list starts/stops scrolling */
+  padding: 10px 14px 14px;
+}
+.body[hidden] {
+  display: none;
+}
+
+.toolsRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.loadError {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-weight: bold;
 }
 
 .section {
-  margin-top: 12px;
+  margin-top: 14px;
   border-top: 1px solid var(--border);
-  padding-top: 10px;
+  padding-top: 12px;
 }
 .sectionTitle {
+  margin: 0 0 8px;
+  font-size: 12.5px;
   font-weight: bold;
-  font-size: 14px;
-  margin: 0 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+.titleCount {
+  color: var(--text);
+}
+.muted {
+  margin: 0;
+  color: var(--text-muted);
+}
+.ok {
+  color: var(--ok-text);
+  font-weight: bold;
 }
 
-/* ---- SOS queue (keyboard / screen-reader path to every SOS) ---- */
+/* ---- SOS summary + queue ---- */
+.sosSummary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.sosHeadline {
+  margin: 0;
+  font-size: 15px;
+  font-weight: bold;
+}
+.count {
+  font-size: 18px;
+  font-weight: bold;
+  color: var(--sev-high);
+}
+.escalatedPill {
+  background: var(--sos);
+  color: #fff;
+  font-weight: bold;
+  font-size: 12.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+/* Bulk action: deliberately quieter than the per-request buttons */
+.resolveAll {
+  margin-left: auto;
+  min-height: 34px;
+  padding: 5px 11px;
+  border: 1.5px solid var(--sev-high);
+  background: transparent;
+  color: var(--sev-high);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: bold;
+  cursor: pointer;
+}
+.resolveAll:hover:not(:disabled) {
+  background: var(--critical-bg);
+}
+.resolveAll:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+.allClear {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+  font-weight: bold;
+  padding: 9px 11px;
+  border-radius: 8px;
+}
+
+.queueHint {
+  margin: 8px 0 6px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
 .queue {
   list-style: none;
   margin: 0;
@@ -84,98 +228,327 @@
   display: grid;
   gap: 8px;
 }
-.queue li {
+.sosCard {
   border: 1px solid var(--border);
-  border-left: 4px solid var(--sos);
-  border-radius: 8px;
-  padding: 7px 9px;
+  border-left: 5px solid var(--sev-medium);
+  border-radius: 10px;
+  padding: 9px 10px 10px;
+  background: var(--surface);
 }
-.queueEscalated {
+.sosCardEscalated {
+  border-left-color: var(--sos);
   background: var(--critical-bg);
 }
+.sosCardHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.sosId {
+  font-size: 15px;
+}
+.escalatedBadge {
+  background: var(--sos);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.manualBadge {
+  /* SOS point placed by hand on a map (no device location) - approximate */
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  border: 1px solid currentColor;
+  font-size: 11.5px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.queueManual {
+  margin: 6px 0 4px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--warning-text);
+}
+.wait {
+  margin-left: auto;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.waitValue {
+  font-size: 15px;
+  font-weight: bold;
+  color: var(--text);
+}
+.sosCardEscalated .waitValue {
+  color: var(--critical-text);
+}
 .queueNote {
-  margin: 3px 0;
+  margin: 6px 0 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--green-lighter);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .queueMeta {
+  margin-top: 4px;
   font-size: 12.5px;
   color: var(--text-muted);
 }
 .queueActions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
-  margin-top: 6px;
-  align-items: center;
+  margin-top: 8px;
 }
-.queueActions button,
-.queueActions a {
-  font-size: 12.5px;
-  font-weight: bold;
-  border-radius: 6px;
-  padding: 5px 9px;
+.actionBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 5px 6px;
   border: 1px solid var(--border);
+  border-radius: 8px;
   background: var(--surface);
   color: var(--text);
-  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: bold;
+  line-height: 1.2;
+  text-align: center;
   text-decoration: none;
+  cursor: pointer;
 }
-.queueActions button:last-child {
-  background: #2e7d32;
-  border-color: #2e7d32;
+.actionBtn:hover:not(:disabled) {
+  border-color: var(--green);
+  background: var(--green-lighter);
+}
+.actionPrimary,
+.actionPrimary:hover:not(:disabled) {
+  background: var(--green);
+  border-color: var(--green);
   color: #fff;
 }
-.queueActions button:disabled {
-  opacity: 0.7;
+.actionPrimary:hover:not(:disabled) {
+  background: var(--green-dark);
+}
+.actionBtn:disabled {
+  opacity: 0.6;
   cursor: progress;
 }
-.nodeRow {
-  padding: 5px 0;
+
+/* ---- hazard zone list ---- */
+.zoneList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.zoneBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.zoneBtn:hover {
+  border-color: var(--green);
+  background: var(--green-lighter);
+}
+.zoneIcon {
+  flex: none;
+  font-size: 20px;
+  line-height: 1;
+}
+.zoneText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.zoneName {
+  font-weight: bold;
+  overflow-wrap: anywhere;
+}
+.zoneMeta {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.sevChip {
+  flex: none;
+  font-size: 11.5px;
+  font-weight: bold;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--offline-bg);
+  color: var(--offline-text);
+}
+.sev_CRITICAL,
+.sev_HIGH {
+  background: var(--critical-bg);
+  color: var(--critical-text);
+}
+.sev_MEDIUM {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+.sev_LOW {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+}
+
+/* ---- node health ---- */
+.nodeSummary {
+  margin: 0 0 6px;
+  font-weight: bold;
+}
+.nodeList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.nodeItem {
+  padding: 7px 0;
   border-bottom: 1px dashed var(--border);
 }
-.nodeRow:last-child {
+.nodeItem:last-child {
   border-bottom: none;
 }
-.dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  margin-right: 6px;
+.nodeHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.nodeLocation {
+  font-size: 13px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.statusChip {
+  font-size: 11.5px;
+  font-weight: bold;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.chip_ok {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+}
+.chip_warning {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+.chip_critical {
+  background: var(--critical-bg);
+  color: var(--critical-text);
+}
+.chip_offline {
+  background: var(--offline-bg);
+  color: var(--offline-text);
+}
+.issueList {
+  list-style: none;
+  margin: 3px 0 0;
+  padding: 0;
 }
 .issue_critical {
   font-size: 12.5px;
-  color: var(--sev-high);
+  color: var(--critical-text);
   font-weight: bold;
-  margin-left: 16px;
 }
 .issue_warning {
   font-size: 12.5px;
-  color: var(--sev-medium);
-  margin-left: 16px;
+  color: var(--warn-text);
 }
-.ok {
-  color: var(--green);
+/* the same issue classes also appear inside the (always light) node popups */
+.popup .issue_critical {
+  color: #b91c1c;
+}
+.popup .issue_warning {
+  color: #7a4a00;
 }
 
+/* ---- legend ---- */
 .legend {
   font-size: 13px;
-  line-height: 1.7;
+}
+.legendSummary {
+  font-size: 12.5px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 0;
+}
+.legendSub {
+  margin: 10px 0 4px;
+  font-weight: bold;
+}
+.legendList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 3px;
+}
+.iconGrid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.legendIcon {
+  display: inline-block;
+  width: 20px;
+  margin-right: 6px;
+  text-align: center;
 }
 .swatch {
   display: inline-block;
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
   border-radius: 50%;
-  margin-right: 6px;
-  vertical-align: -1px;
+  margin: 0 10px 0 4px;
+  vertical-align: -2px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+}
+.swatchMedium {
+  background: orange;
+}
+.swatchHigh {
+  background: red;
 }
 .swatchPending {
   composes: swatch;
   border: 2px dashed orange;
-  width: 11px;
-  height: 11px;
+}
+.nodeOk {
+  background: #2e7d32;
+}
+.nodeWarning {
+  background: #f2a900;
+}
+.nodeCritical {
+  background: #d90429;
+}
+.nodeOffline {
+  background: #9aa1ab;
 }
 
 /* ---- popups (Leaflet renders them light on any theme) ---- */
@@ -187,8 +560,29 @@
 .popup a {
   display: block;
   margin-top: 4px;
-  color: #1a73e8;
+  color: #1557b0;
   font-weight: bold;
+}
+.popupHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.popupSev {
+  font-size: 11.5px;
+  font-weight: bold;
+  padding: 1px 7px;
+  border-radius: 4px;
+  color: #1b1b1b;
+}
+.popupSev.iconHigh {
+  background: #b71c1c;
+  color: #fff;
+}
+.pendingNote {
+  color: #7a4a00;
 }
 .note {
   margin: 4px 0;
@@ -197,6 +591,15 @@
   border-radius: 6px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.manualLocation {
+  /* Leaflet popups are always white, so fixed colours (amber on cream, 7:1) */
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: #fff4e0;
+  color: #7a4a00;
+  border-radius: 6px;
+  font-weight: 600;
 }
 .escalated {
   background: #d90429;
@@ -208,11 +611,13 @@
 }
 .resolveBtn {
   margin-top: 8px;
-  background: #4caf50;
+  min-height: 34px;
+  background: #2e7d32;
   color: #fff;
   border: none;
-  padding: 6px 10px;
+  padding: 6px 12px;
   border-radius: 6px;
+  font-weight: bold;
   cursor: pointer;
 }
 .resolveBtn:disabled {
@@ -220,14 +625,18 @@
   cursor: progress;
 }
 .errorText {
-  color: #c62828;
+  color: var(--danger);
   margin-top: 4px;
+  font-weight: bold;
+}
+.popup .errorText {
+  color: #c62828;
 }
 .insights h4 {
   margin: 10px 0 2px;
   font-size: 13.5px;
 }
-.muted {
+.popup .muted {
   color: #5f6b60;
 }
 
@@ -282,6 +691,23 @@
   line-height: 1;
   filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
 }
+/* "?" on the pin of an SOS whose point was placed by hand (approximate) */
+.sosManualBadge {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  right: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #7a4a00;
+  color: #fff;
+  border: 2px solid #fff;
+  font-size: 12px;
+  font-weight: bold;
+  line-height: 14px;
+  text-align: center;
+}
 @keyframes sosPulse {
   0% {
     transform: scale(0.5);
@@ -303,36 +729,55 @@
     stroke-opacity: 0;
   }
 }
-
-/* ---- phones: panel becomes a collapsible top sheet ---- */
-.collapse {
-  display: none;
-}
-@media (max-width: 600px) {
-  .panel {
-    top: 0;
-    right: 0;
-    left: 0;
-    width: auto;
-    border-radius: 0 0 var(--radius) var(--radius);
-    max-height: 45vh;
-    padding: 8px 12px;
+@media (prefers-reduced-motion: reduce) {
+  .sosPulse,
+  .focusRing {
+    animation: none;
   }
-  .panel h1 {
+}
+
+/* ---- phones: map on top, panel becomes a bottom sheet below it ---- */
+@media (max-width: 640px) {
+  .page {
+    display: flex;
+    flex-direction: column;
+  }
+  .mapRegion {
+    position: relative;
+    inset: auto;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  .panel {
+    position: relative;
+    top: auto;
+    right: auto;
+    flex: none;
+    width: 100%;
+    max-height: 55vh;
+    max-height: 55dvh;
+    border-width: 1px 0 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+    box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.2);
+  }
+  .panelHeader {
+    padding: 6px 10px 6px 12px;
+  }
+  .title {
     font-size: 15px;
   }
-  .collapse {
-    display: inline-block;
-    float: right;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-    border-radius: 6px;
-    padding: 2px 8px;
-    font-size: 12px;
-    cursor: pointer;
+  .body {
+    padding: 8px 12px 12px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
-  .collapsed .body {
-    display: none;
+}
+
+/* very narrow phones: stack the three SOS actions in two rows */
+@media (max-width: 380px) {
+  .queueActions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .actionPrimary {
+    grid-column: 1 / -1;
   }
 }

@@ -11,23 +11,34 @@ const CONNECTION_TEXT: Record<ConnectionState, string> = {
   disconnected: "Backend not connected",
 };
 
+/**
+ * Green page header for the staff pages.
+ * Layout (wraps by width): brand | connection status | extra controls + user chip.
+ * `children` go in the controls slot on the right (e.g. the alarm sound toggle).
+ */
 export function AppHeader({ connection, children }: { connection?: ConnectionState; children?: ReactNode }) {
   return (
     <header className={styles.header}>
-      <div className={styles.userSlot}>
-        <UserChip />
-      </div>
-      <div className={styles.brand}>
-        <Logo />
-        <h1>SANJEEVNI</h1>
-      </div>
-      {connection && (
-        <div className={styles.status} role="status" aria-live="polite">
-          <span className={`${styles.dot} ${styles[connection]}`} aria-hidden="true" />
-          {CONNECTION_TEXT[connection]}
+      <div className={styles.inner}>
+        <div className={styles.brand}>
+          <Logo size={40} decorative className={styles.logo} />
+          <div className={styles.brandText}>
+            <h1>SANJEEVNI</h1>
+            <p className={styles.tagline}>Disaster monitoring &amp; response</p>
+          </div>
         </div>
-      )}
-      {children}
+        {connection && (
+          <div className={`${styles.status} ${connection === "disconnected" ? styles.statusDown : ""}`}
+               role="status" aria-live="polite">
+            <span className={`${styles.dot} ${styles[connection]}`} aria-hidden="true" />
+            {CONNECTION_TEXT[connection]}
+          </div>
+        )}
+        <div className={styles.controls}>
+          {children}
+          <UserChip />
+        </div>
+      </div>
     </header>
   );
 }
@@ -39,8 +50,10 @@ export function UserChip({ variant = "onBrand" }: { variant?: "onBrand" | "light
   const { username, role } = me.data.user;
   return (
     <div className={`${styles.chip} ${variant === "light" ? styles.chipLight : ""}`}>
-      <span className={styles.name}>{username}</span>
-      <span className={styles.role}>{role}</span>
+      <span className={styles.who}>
+        <span className={styles.name}>{username}</span>
+        <span className={styles.role}>{role}</span>
+      </span>
       {role === "admin" && window.location.pathname !== "/admin.html" && (
         <a className={styles.adminLink} href="/admin.html">Manage nodes</a>
       )}

@@ -47,7 +47,8 @@ class HazardConfirmer:
     reading of each hazard waits for one corroborating reading again."""
 
     def __init__(self):
-        self._recent: dict[str, deque] = {}  # node_id -> deque[(datetime, hazard_type)]
+        # node_id -> deque[(datetime, hazard_type, simulated)]
+        self._recent: dict[str, deque] = {}
 
     def neighbours(self, node_id: str, registry: dict) -> list[str]:
         """Nodes close enough, or hydrologically linked, to corroborate."""
@@ -55,7 +56,8 @@ class HazardConfirmer:
         if not cfg:
             return []
         result = []
-        for other_id, other in registry.items():
+        # Snapshot: an admin edit can reload the registry while we loop.
+        for other_id, other in list(registry.items()):
             if other_id == node_id:
                 continue
             linked = cfg.get("upstream_node") == other_id or other.get("upstream_node") == node_id
@@ -68,31 +70,40 @@ class HazardConfirmer:
                 result.append(other_id)
         return result
 
-    def _seen_recently(self, node_id: str, hazard_type: str, now: datetime) -> bool:
+    def _seen_recently(self, node_id: str, hazard_type: str, now: datetime, simulated: bool) -> bool:
+        """A simulated assessment never counts as evidence for a REAL one.
+        The documented demo mixes real hardware with simulation.js on
+        nearby nodes; without this check a scripted simulator event
+        confirmed a single glitchy real reading, which then reached the
+        public map and real WhatsApp subscribers. A real assessment may
+        still corroborate a simulated one: real evidence is real, and
+        simulated alerts never reach real people anyway."""
         window_start = now - timedelta(minutes=CONFIRM_WINDOW_MINUTES)
         return any(
-            window_start <= ts <= now and h == hazard_type
-            for ts, h in self._recent.get(node_id, ())
+            window_start <= ts <= now and h == hazard_type and (simulated or not was_simulated)
+            for ts, h, was_simulated in self._recent.get(node_id, ())
         )
 
-    def assess(self, node_id: str, hazard_type: str, severity: str, now: datetime, registry: dict):
+    def assess(self, node_id: str, hazard_type: str, severity: str, now: datetime, registry: dict,
+               simulated: bool = False):
         """Returns (confirmed, basis) for this assessment and records it.
         basis is "persistent", "neighbour:<node_id>", or None when
         unconfirmed. Non-elevated severities return (False, None) and are
-        not recorded."""
+        not recorded. `simulated` marks simulator traffic, which can never
+        confirm a real assessment (see _seen_recently)."""
         if severity not in ELEVATED_SEVERITIES:
             return False, None
 
         basis = None
-        if self._seen_recently(node_id, hazard_type, now):
+        if self._seen_recently(node_id, hazard_type, now, simulated):
             basis = "persistent"
         else:
             for other_id in self.neighbours(node_id, registry):
-                if self._seen_recently(other_id, hazard_type, now):
+                if self._seen_recently(other_id, hazard_type, now, simulated):
                     basis = f"neighbour:{other_id}"
                     break
 
         self._recent.setdefault(node_id, deque(maxlen=_ASSESSMENT_HISTORY)).append(
-            (now, hazard_type)
+            (now, hazard_type, bool(simulated))
         )
         return basis is not None, basis

@@ -43,6 +43,24 @@ describe("api client", () => {
     expect(onUnauthorized).toHaveBeenCalledTimes(1); // not once per poll
   });
 
+  it("redirects on the session-ended code too", async () => {
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    mockFetch(401, { error: "Session gone", code: "login_required" });
+    await expect(apiGet("/api/sos")).rejects.toBeInstanceOf(ApiError);
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not redirect for a 401 that is not about the session (B53 redirect loop)", async () => {
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    mockFetch(401, { detail: "Unauthorized - valid X-API-Key header required" });
+    await expect(apiGet("/api/admin/nodes")).rejects.toMatchObject({
+      status: 401, message: "Unauthorized - valid X-API-Key header required",
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
   it("does not redirect for a failed login (shows the message instead)", async () => {
     const onUnauthorized = vi.fn();
     setUnauthorizedHandler(onUnauthorized);

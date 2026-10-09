@@ -58,7 +58,7 @@ export function LoginPage() {
     <div className={styles.page}>
       <aside className={styles.brand}>
         <div className={styles.logo}>
-          <Logo size={52} />
+          <Logo size={52} decorative />
           <div>
             <h1>SANJEEVNI</h1>
             <small>Disaster monitoring &amp; response</small>
@@ -97,13 +97,14 @@ export function LoginPage() {
               <div className={styles.inputWrap}>
                 <input id="password" ref={passwordRef} type={showPassword ? "text" : "password"}
                        autoComplete="current-password" required value={password} aria-invalid={invalid.password}
+                       aria-describedby={capsLock ? "caps-lock" : undefined}
                        onChange={(e) => setPassword(e.target.value)} onKeyUp={onPasswordKey} onKeyDown={onPasswordKey} />
-                <button type="button" className={styles.togglePw} aria-controls="password" aria-pressed={showPassword}
+                <button type="button" className={styles.togglePw} aria-controls="password"
                         onClick={() => { setShowPassword((v) => !v); passwordRef.current?.focus(); }}>
                   {showPassword ? "Hide" : "Show"}
                 </button>
               </div>
-              {capsLock && <div className={styles.caps}>Caps Lock is on</div>}
+              {capsLock && <div id="caps-lock" className={styles.caps}>Caps Lock is on</div>}
             </div>
             <button type="submit" className={styles.submit} disabled={status !== "idle"}>
               {status === "submitting" && <span className={styles.spinner} aria-hidden="true" />}

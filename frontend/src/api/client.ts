@@ -1,6 +1,6 @@
 // Fetch wrapper for the SANJEEVNI API (same origin; the session cookie is
-// sent automatically). A 401 from any data endpoint means the session
-// ended: send the user to the login page and back here afterwards - the
+// sent automatically). A "login_required" 401 from a data endpoint means
+// the session ended: send the user to the login page and back here afterwards - the
 // same behaviour public/auth-ui.js gives the old pages.
 
 export class ApiError extends Error {
@@ -36,7 +36,12 @@ async function request<T>(method: "GET" | "POST" | "PUT" | "DELETE", path: strin
   });
   const data: unknown = await res.json().catch(() => null);
 
-  if (res.status === 401 && !path.startsWith("/api/auth/") && !redirecting) {
+  // Only auth.js's "session ended" 401 sends the user to sign in. Any other
+  // 401 (another service refusing a key) would bounce a signed-in user
+  // between this page and /login.html forever (B53) - show it as an error.
+  const reply = (data ?? {}) as { code?: unknown; error?: unknown };
+  const sessionEnded = reply.code === "login_required" || reply.error === "Login required";
+  if (res.status === 401 && sessionEnded && !path.startsWith("/api/auth/") && !redirecting) {
     redirecting = true;
     onUnauthorized();
   }

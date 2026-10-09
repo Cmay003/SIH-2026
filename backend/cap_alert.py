@@ -20,8 +20,10 @@ CAP v1.2 spec: https://docs.oasis-open.org/emergency/cap/v1.2/CAP-v1.2-os.html
 """
 
 import os
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
@@ -66,6 +68,53 @@ HAZARD_TO_CAP = {
 # is left out entirely when unset instead of emitting an empty element.
 CAP_WEB_URL = os.environ.get("CAP_WEB_URL")
 
+# CAP <status> vocabulary (spec 3.2.1). "Exercise" is what a simulated
+# (demo / drill) alert must carry - "Actual" tells every downstream
+# consumer it is a real public warning.
+CAP_STATUSES = ("Actual", "Exercise", "System", "Test", "Draft")
+
+# Alert-zone radius by severity - MUST match server.js HAZARD_RADIUS_M,
+# which draws the zone on the map and sets the WhatsApp reach. Before this
+# every CAP circle was 1 km, so a CRITICAL flood's CAP area was half the
+# zone citizens were shown. Unknown severities get the smallest zone, as
+# server.js does.
+CAP_RADIUS_M = {"MEDIUM": 500, "HIGH": 1000, "CRITICAL": 2000}
+CAP_DEFAULT_RADIUS_M = 500
+
+# How long an alert stays in force (<expires> = <sent> + this). Readings
+# arrive every few seconds, so a hazard that persists produces fresh
+# alerts long before this runs out; 6 h matches the flood model's rain
+# forecast horizon. Without <expires>, a three-day-old alert fetched now
+# looked current to a consumer.
+CAP_VALIDITY_HOURS = 6
+
+# CAP 1.2 (3.2.1, identifier): no spaces, commas or the restricted
+# characters < and &. Anything outside this set in a node_id becomes "_".
+_IDENTIFIER_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def cap_datetime(dt: datetime) -> str:
+    """CAP 1.2 date-time: YYYY-MM-DDThh:mm:ss with an explicit offset, no
+    fractional seconds (the XSD rejects them). UTC must be written
+    "-00:00" (spec 3.3.2) - isoformat() writes "+00:00". A naive datetime
+    is taken to be UTC, which is how the backend stores reading times."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + "-00:00"
+
+
+def cap_identifier(node_id: str, reading_id: Optional[int]) -> str:
+    """Stable per alert: the same stored reading always yields the same
+    identifier, so a consumer polling /api/alerts/{id}/cap sees one alert,
+    not a "new" one per download. Without a reading id (an ad-hoc message
+    that was never stored) there is nothing stable to derive it from, so a
+    random one is used as before."""
+    if reading_id is None:
+        return str(uuid.uuid4())
+    safe_node = _IDENTIFIER_UNSAFE.sub("_", str(node_id)) or "node"
+    return f"sanjeevni-{safe_node}-{int(reading_id)}"
+
 
 def generate_cap_alert(
     hazard_type: str,
@@ -77,21 +126,36 @@ def generate_cap_alert(
     node_id: str,
     risk_score: float,
     severity_source: str = "ml_model",
-    radius_m: float = 1000,
+    radius_m: Optional[float] = None,
     sender: str = "sanjeevni-system@example.org",
+    reading_id: Optional[int] = None,
+    sent_at: Optional[datetime] = None,
+    status: str = "Actual",
 ) -> str:
     """Returns a complete, spec-compliant CAP v1.2 XML string for one
     hazard alert. Never raises on bad input types it can coerce; raises
     only on a genuinely unmapped severity/hazard_type, since sending a
     malformed or silently-wrong-severity CAP alert is worse than failing
-    loudly during development."""
+    loudly during development.
+
+    reading_id / sent_at: the stored alert's id and the time its reading
+    was taken. Pass both for a stored alert, so repeated exports of it are
+    the SAME CAP message (same identifier, same <sent>); sent_at falls back
+    to now only for a message that has no stored time.
+    radius_m: defaults to the severity's zone (CAP_RADIUS_M).
+    status: "Exercise" for simulated alerts - see CAP_STATUSES."""
     if severity not in SEVERITY_TO_CAP:
         raise ValueError(f"Unknown severity '{severity}' - cannot map to CAP vocabulary")
+    if status not in CAP_STATUSES:
+        raise ValueError(f"Unknown CAP status '{status}' - must be one of {CAP_STATUSES}")
 
-    # CAP 1.2's XSD only accepts YYYY-MM-DDThh:mm:ss+hh:mm - isoformat()'s
-    # microseconds made every alert fail schema validation.
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    identifier = str(uuid.uuid4())
+    sent = sent_at if sent_at is not None else datetime.now(timezone.utc)
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    expires = sent + timedelta(hours=CAP_VALIDITY_HOURS)
+    identifier = cap_identifier(node_id, reading_id)
+    if radius_m is None:
+        radius_m = CAP_RADIUS_M.get(severity, CAP_DEFAULT_RADIUS_M)
     cap_event, cap_category = HAZARD_TO_CAP.get(
         hazard_type, ("Other Hazard Warning", "Other")
     )
@@ -101,10 +165,21 @@ def generate_cap_alert(
     alert = Element("alert", xmlns=CAP_NAMESPACE)
     SubElement(alert, "identifier").text = identifier
     SubElement(alert, "sender").text = sender
-    SubElement(alert, "sent").text = now.isoformat()
-    SubElement(alert, "status").text = "Actual"
+    SubElement(alert, "sent").text = cap_datetime(sent)
+    SubElement(alert, "status").text = status
     SubElement(alert, "msgType").text = "Alert"
     SubElement(alert, "scope").text = "Public"
+    if status != "Actual":
+        # <note> follows <scope> in CAP's element order. Says in plain
+        # words why this is not a real warning, for consumers that only
+        # show text and drop <status>.
+        # HUMAN REVIEW: public-facing wording - confirm with the alerting
+        # authority before any real CAP feed carries it.
+        SubElement(alert, "note").text = (
+            "Generated from SANJEEVNI simulator data - not a real event."
+            if status == "Exercise"
+            else f"Non-operational CAP message (status {status})."
+        )
 
     info = SubElement(alert, "info")
     SubElement(info, "category").text = cap_category
@@ -112,6 +187,8 @@ def generate_cap_alert(
     SubElement(info, "urgency").text = "Immediate" if severity in ("HIGH", "CRITICAL") else "Expected"
     SubElement(info, "severity").text = cap_severity
     SubElement(info, "certainty").text = cap_certainty
+    # <expires> sits between <certainty> and <senderName> in CAP's order.
+    SubElement(info, "expires").text = cap_datetime(expires)
     SubElement(info, "senderName").text = "SANJEEVNI Disaster Rescue System"
     SubElement(info, "headline").text = f"{cap_event}: {location}"
     SubElement(info, "description").text = message

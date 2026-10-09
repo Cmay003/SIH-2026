@@ -304,11 +304,23 @@
   }
   window.resolveSos = resolveSos;
 
+  // ids of the SOS requests currently drawn on the map. "Resolve All" sends
+  // exactly these: server.js refuses a request without ids (B42), so an SOS
+  // that arrived after the last refresh - one this officer has not seen -
+  // stays open instead of being closed unseen.
+  let shownSosIds = [];
+
   async function resolveAllSos() {
-    if (!confirm("Mark ALL open SOS requests as resolved? This cannot be undone.")) return;
+    if (!shownSosIds.length) return;
+    if (!confirm(`Mark the ${shownSosIds.length} SOS request(s) shown on the map as resolved? This cannot be undone.`)) return;
     resolveAllBtn.disabled = true;
     try {
-      await fetch("/api/sos/resolve-all", { method: "POST", headers: officerAuthHeaders() });
+      const res = await fetch("/api/sos/resolve-all", {
+        method: "POST",
+        headers: { ...officerAuthHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: shownSosIds }),
+      });
+      if (!res.ok) alert("Could not resolve the SOS requests - refresh the page and try again.");
     } finally {
       resolveAllBtn.disabled = false;
       loadSos();
@@ -340,6 +352,7 @@
       }
 
       sosLayer.clearLayers();
+      shownSosIds = data.data.map((s) => Number(s.id)).filter((id) => Number.isSafeInteger(id) && id > 0);
       data.data.forEach((s) => {
         const marker = L.marker([s.latitude, s.longitude], { icon: sosIcon() });
 
@@ -353,6 +366,7 @@
           <div class="sos-popup">
             ${escalationBanner}
             <strong>SOS #${sosId}</strong> - ${escapeHtml(time)}<br>
+            ${s.location_source === "manual" ? "<em>Location set by hand on a map - approximate, confirm it with the caller.</em><br>" : ""}
             ${s.note ? escapeHtml(s.note) + "<br>" : ""}
             Nearest hospital: <strong>${escapeHtml(s.nearest_hospital)}</strong> (${Number(s.hospital_distance_km)} km)
             <a href="${escapeHtml(s.responder_route_url)}" target="_blank" rel="noopener">Route to this person</a>

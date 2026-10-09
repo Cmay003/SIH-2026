@@ -13,13 +13,17 @@ import paths
 RNG = np.random.default_rng(7)
 
 
-def generate_sensor_stream(n_normal=2000, n_anomalies=100):
+def generate_sensor_stream(n_normal=2000, n_anomalies=100, rng=None):
+    # rng: ml/evaluate_models.py passes its own generator for a held-out
+    # stream (and default_rng(7) to rebuild the exact training stream).
+    # The default keeps the module RNG, so training is unchanged.
+    rng = RNG if rng is None else rng
     t = np.arange(n_normal)
-    river_level = 1.8 + 0.3 * np.sin(t / 200) + RNG.normal(0, 0.05, n_normal)
-    temp = 27 + 3 * np.sin(t / 300) + RNG.normal(0, 0.5, n_normal)
-    humidity = 60 + 10 * np.sin(t / 250 + 1) + RNG.normal(0, 1.5, n_normal)
-    gas_ppm = 400 + RNG.normal(0, 15, n_normal)
-    flame_reading = RNG.normal(0, 0.02, n_normal)
+    river_level = 1.8 + 0.3 * np.sin(t / 200) + rng.normal(0, 0.05, n_normal)
+    temp = 27 + 3 * np.sin(t / 300) + rng.normal(0, 0.5, n_normal)
+    humidity = 60 + 10 * np.sin(t / 250 + 1) + rng.normal(0, 1.5, n_normal)
+    gas_ppm = 400 + rng.normal(0, 15, n_normal)
+    flame_reading = rng.normal(0, 0.02, n_normal)
 
     normal = pd.DataFrame(
         {
@@ -34,19 +38,19 @@ def generate_sensor_stream(n_normal=2000, n_anomalies=100):
 
     anomaly_rows = []
     for _ in range(n_anomalies):
-        kind = RNG.choice(["spike", "dropout", "stuck", "drift"])
-        row = normal.sample(1, random_state=RNG.integers(0, 1_000_000)).iloc[0].copy()
+        kind = rng.choice(["spike", "dropout", "stuck", "drift"])
+        row = normal.sample(1, random_state=rng.integers(0, 1_000_000)).iloc[0].copy()
         if kind == "spike":
-            col = RNG.choice(["river_level_m", "temp_c", "gas_ppm", "flame_reading"])
-            row[col] = row[col] * RNG.uniform(3, 8)
+            col = rng.choice(["river_level_m", "temp_c", "gas_ppm", "flame_reading"])
+            row[col] = row[col] * rng.uniform(3, 8)
         elif kind == "dropout":
             row[["river_level_m", "temp_c", "humidity_pct", "gas_ppm"]] = 0
         elif kind == "stuck":
             row["humidity_pct"] = 0
             row["gas_ppm"] = row["gas_ppm"] * 4
         elif kind == "drift":
-            row["temp_c"] += RNG.uniform(15, 25)
-            row["gas_ppm"] += RNG.uniform(300, 600)
+            row["temp_c"] += rng.uniform(15, 25)
+            row["gas_ppm"] += rng.uniform(300, 600)
         row["is_anomaly"] = 1
         anomaly_rows.append(row)
 

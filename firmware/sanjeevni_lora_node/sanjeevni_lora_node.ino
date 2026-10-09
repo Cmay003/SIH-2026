@@ -8,6 +8,9 @@
  * Every reading to send goes into a LittleFS queue first and is removed
  * only after the gateway (LoRa) or backend (WiFi) acknowledges it - so
  * readings survive link outages and reboots (store-and-forward).
+ * MQ135 gas and PMS5003 PM values are left out (and can't trigger the
+ * local alert) until MQ135_WARMUP_S / PMS5003_WARMUP_S after each boot:
+ * a cold heater / fan gives false values (sj_warmup.h).
  *
  * DEEP_SLEEP_ENABLED 1 (config.h, battery nodes without MQ135/PMS5003):
  * each wake measures once, queues, sends, and sleeps again - every
@@ -31,12 +34,15 @@
  */
 #include <Arduino.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 #include <sys/time.h>
 #include "config.h"
 #include "sj_packet.h"
 #include "sj_file_queue.h"
 #include "sj_sleep.h"
+#include "sj_session.h"
 #include "sj_selftest.h"
+#include "sj_warmup.h"
 #include "sensors.h"
 #include "edge_ai.h"
 
@@ -59,7 +65,7 @@ struct QueuedReading {
 };
 
 static SjFileQueue<QueuedReading> queue;
-static uint16_t session = 0;  // bumped on every power-on, persisted in NVS
+static uint32_t session = 0;  // random start per board, +1 every power-on, persisted in NVS (sj_session.h)
 static uint32_t seq = 0;
 
 static uint32_t lastSampleMs = 0;
@@ -87,6 +93,12 @@ static uint32_t deviceSeconds() {
   gettimeofday(&tv, nullptr);
   return (uint32_t)tv.tv_sec;
 }
+
+// Seconds since this boot, for the gas/PM warm-up (sj_warmup.h) and the
+// self-test. The 64-bit esp_timer restarts at every reset - right, because
+// a reset is when the warm-up starts. millis() / 1000 would wrap after
+// 49.7 days and switch the gas/PM values off again for minutes.
+static uint32_t uptimeSeconds() { return (uint32_t)(esp_timer_get_time() / 1000000LL); }
 
 // =====================================================================
 // Reading
@@ -126,10 +138,10 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
   }
 #endif
 #if ENABLE_GAS
+  // Still read during the warm-up, so a missing sensor is reported at once;
+  // the value itself is only used after MQ135_WARMUP_S (sj_warmup.h).
   if (readGasPpm(gasPpm)) {
-    r.flags |= SJ_HAS_GAS;
-    r.gas_ppm = sjClampU16(gasPpm);
-    localAlert |= gasPpm >= LOCAL_GAS_LIMIT_PPM;
+    localAlert |= sjAddGasValue(r, gasPpm, uptimeSeconds(), MQ135_WARMUP_S, LOCAL_GAS_LIMIT_PPM);
   } else {
     Serial.println("[sensor] MQ135: no signal");
   }
@@ -164,11 +176,9 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
 #endif
 #if ENABLE_PMS5003
   uint16_t pm25, pm10;
-  if (readPm(pm25, pm10)) {
-    r.flags |= SJ_HAS_PM;
-    r.pm25 = pm25;
-    r.pm10 = pm10;
-    localAlert |= pm25 >= LOCAL_PM25_LIMIT;
+  if (readPm(pm25, pm10)) {  // left out until PMS5003_WARMUP_S (sj_warmup.h)
+    localAlert |=
+        sjAddPmValues(r, pm25, pm10, uptimeSeconds(), PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT);
   }
 #endif
 #if ENABLE_PH
@@ -204,15 +214,22 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
 }
 
 static void printReading(const SjReading& r, EdgeRiskLevel edge, bool localAlert) {
-  Serial.printf("[%s #%u-%u]", NODE_ID, r.session, r.seq);
+  Serial.printf("[%s #%lu-%lu]", NODE_ID, (unsigned long)r.session, (unsigned long)r.seq);
   if (r.flags & SJ_HAS_WATER) Serial.printf(" water=%.3fm", r.water_level_mm / 1000.0f);
   if (r.flags & SJ_HAS_DHT) Serial.printf(" temp=%.1fC hum=%.0f%%", r.temp_c_x100 / 100.0f, r.humidity_x100 / 100.0f);
   if (r.flags & SJ_HAS_GAS) Serial.printf(" gas=%uppm", r.gas_ppm);
+#if ENABLE_GAS
+  // says why gas is missing in the first minutes (not sent, not alerting)
+  else if (sjWarmingUp(uptimeSeconds(), MQ135_WARMUP_S)) Serial.print(" gas=warming-up");
+#endif
   if (r.flags & SJ_HAS_FLAME) Serial.printf(" flame=%d", (r.flags & SJ_FLAME_DETECTED) ? 1 : 0);
   if (r.flags & SJ_HAS_RAIN) Serial.printf(" rain=%.2fmm", r.rain_mm_x100 / 100.0f);
   if (r.flags & SJ_HAS_SOIL) Serial.printf(" soil=%.0f%%", r.soil_moisture_x10 / 10.0f);
   if (r.flags & SJ_HAS_TILT) Serial.printf(" tilt=%.2fdeg vib=%.3fg", r.tilt_deg_x100 / 100.0f, r.vibration_g_x1000 / 1000.0f);
   if (r.flags & SJ_HAS_PM) Serial.printf(" pm2.5=%u pm10=%u", r.pm25, r.pm10);
+#if ENABLE_PMS5003
+  else if (sjWarmingUp(uptimeSeconds(), PMS5003_WARMUP_S)) Serial.print(" pm=warming-up");
+#endif
   if (r.flags & SJ_HAS_PH) Serial.printf(" pH=%.2f", r.ph_x100 / 100.0f);
   if (r.flags & SJ_HAS_TURBIDITY) Serial.printf(" turb=%.0fNTU", r.turbidity_ntu_x10 / 10.0f);
   if (r.flags & SJ_HAS_BATTERY) Serial.printf(" batt=%.0f%%", r.battery_x10 / 10.0f);
@@ -249,6 +266,7 @@ static bool setupTransport() {
 // after saving the reading to its own flash queue).
 static bool sendOne(QueuedReading& q) {
   SjReading r = q.reading;
+  sjUpgradeQueuedReading(r);  // queued by a v1 firmware before an update
   r.age_s = (r.session == session) ? deviceSeconds() - q.takenAtS : SJ_AGE_UNKNOWN;
   if (radio.transmit((uint8_t*)&r, sizeof(r)) != RADIOLIB_ERR_NONE) return false;
 
@@ -272,7 +290,16 @@ static bool sendOne(QueuedReading& q) {
 static bool flushQueue() {
   for (int sent = 0; sent < MAX_SENDS_PER_FLUSH && queue.count() > 0; sent++) {
     QueuedReading q;
-    if (!queue.peek(0, q)) break;
+    uint32_t before = queue.count();
+    if (!queue.peek(0, q)) {
+      // peek() rebuilt the queue or skipped the unreadable oldest record:
+      // carry on with the new oldest.
+      if (queue.count() != before) continue;
+      // Nothing changed (flash failing): back off instead of retrying on
+      // every loop() pass.
+      nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
+      return false;
+    }
     if (!sendOne(q)) {
 #if DEEP_SLEEP_ENABLED
       Serial.printf("[lora] no ACK - %u reading(s) kept in queue for the next wake\n", queue.count());
@@ -289,6 +316,17 @@ static bool flushQueue() {
 }
 
 static bool waitForLink() { return true; }  // LoRa needs no connection
+
+// 32 bits of radio noise for a fresh session (sj_session.h): the ESP32's
+// own RNG is only fully random while WiFi/BT is on, which a LoRa node never
+// turns on. RadioLib reads the SX1278's wideband RSSI LSBs.
+static uint32_t transportEntropy() {
+  if (loraBeginState != RADIOLIB_ERR_NONE) return 0;
+  uint32_t v = 0;
+  for (int i = 0; i < 4; i++) v = (v << 8) | radio.randomByte();
+  radio.standby();
+  return v;
+}
 static void transportSleep() { radio.sleep(); }  // SX1278 sleep: ~1 uA instead of ~1.6 mA standby
 
 #elif TRANSPORT == TRANSPORT_WIFI
@@ -299,6 +337,8 @@ static bool setupTransport() {
   return true;
 }
 
+static bool singleMode = false;  // a refused batch is resent one reading at a time
+
 // Posts up to `n` oldest readings as one batch. Backend answers per
 // reading; any HTTP 200 means every reading in the batch is final
 // (stored, duplicate or rejected) and can leave the queue.
@@ -307,7 +347,14 @@ static int postBatch(uint32_t n) {
   uint32_t now = deviceSeconds();
   for (uint32_t i = 0; i < n; i++) {
     QueuedReading q;
-    if (!queue.peek(i, q)) return -1;
+    if (!queue.peek(i, q)) {
+      // If the queue could not rebuild itself (flash full or failing) the
+      // bad record is still there, and only peek(0) can skip it without a
+      // copy: go one at a time until it is the oldest. -1 = retry later.
+      singleMode = true;
+      return -1;
+    }
+    sjUpgradeQueuedReading(q.reading);  // queued by a v1 firmware before an update
     long age = (q.reading.session == session) ? (long)(now - q.takenAtS) : -1;
     if (i) body += ",";
     sjAppendJson(body, q.reading, age, WiFi.RSSI(), "wifi");
@@ -327,39 +374,41 @@ static int postBatch(uint32_t n) {
   return code;
 }
 
-static bool singleMode = false;  // a refused batch is resent one reading at a time
-
+// Sends ONE batch (up to MAX_SENDS_PER_FLUSH readings), like the LoRa
+// flushQueue(). Callers repeat it: loop() on its next pass (nextFlushMs is
+// left alone after a success), a deep-sleep wake via sjDrainWithinBudget()
+// until DEEP_SLEEP_MAX_AWAKE_MS. It used to loop until the queue was empty,
+// which kept a battery node awake for minutes on a backlog (review B).
 // false = not connected / the backend didn't take them (readings stay queued)
 static bool flushQueue() {
   if (WiFi.status() != WL_CONNECTED) {
     nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
     return false;
   }
-  while (queue.count() > 0) {
-    uint32_t n = singleMode ? 1 : min<uint32_t>(queue.count(), MAX_SENDS_PER_FLUSH);
-    int code = postBatch(n);
-    switch (sjUploadAction(code, n)) {  // shared rule, see sj_packet.h
-      case SJ_UPLOAD_DONE:
-        queue.pop(n);
-        singleMode = false;
-        break;
-      case SJ_UPLOAD_SPLIT:
-        singleMode = true;
-        break;
-      case SJ_UPLOAD_DROP_ONE:
-        Serial.printf("[wifi] backend rejected a reading as invalid (HTTP %d) - dropping it\n", code);
-        queue.pop(1);
-        singleMode = false;
-        break;
-      case SJ_UPLOAD_RETRY:
-        if (code == 401 || code == 403) {
-          Serial.printf("[wifi] HTTP %d: DEVICE_KEY in secrets.h is missing, wrong, revoked or not allowed for %s\n", code, NODE_ID);
-        } else {
-          Serial.printf("[wifi] send failed (HTTP %d) - %u reading(s) kept in queue\n", code, queue.count());
-        }
-        nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
-        return false;
-    }
+  if (queue.count() == 0) return true;
+  uint32_t n = singleMode ? 1 : min<uint32_t>(queue.count(), MAX_SENDS_PER_FLUSH);
+  int code = postBatch(n);
+  switch (sjUploadAction(code, n)) {  // shared rule, see sj_packet.h
+    case SJ_UPLOAD_DONE:
+      queue.pop(n);
+      singleMode = false;
+      break;
+    case SJ_UPLOAD_SPLIT:
+      singleMode = true;  // the next call sends one reading at a time
+      break;
+    case SJ_UPLOAD_DROP_ONE:
+      Serial.printf("[wifi] backend rejected a reading as invalid (HTTP %d) - dropping it\n", code);
+      queue.pop(1);
+      singleMode = false;
+      break;
+    case SJ_UPLOAD_RETRY:
+      if (code == 401 || code == 403) {
+        Serial.printf("[wifi] HTTP %d: DEVICE_KEY in secrets.h is missing, wrong, revoked or not allowed for %s\n", code, NODE_ID);
+      } else {
+        Serial.printf("[wifi] send failed (HTTP %d) - %u reading(s) kept in queue\n", code, queue.count());
+      }
+      nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
+      return false;
   }
   return true;
 }
@@ -380,6 +429,19 @@ static bool waitForLink() {
 static void transportSleep() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+}
+
+// setupTransport() has switched the WiFi radio on, and with it the ESP32's
+// RNG is fully random (ESP-IDF: true random while WiFi/BT is enabled).
+static uint32_t transportEntropy() { return esp_random(); }
+#endif
+
+#if DEEP_SLEEP_ENABLED
+// Sends what the link takes within `budgetMs` from `startMs`, one batch
+// per flushQueue() call (sj_sleep.h).
+static void drainQueueWithin(uint32_t startMs, uint32_t budgetMs) {
+  sjDrainWithinBudget([] { return queue.count() > 0; }, [] { return flushQueue(); }, [] { return (uint32_t)millis(); },
+                      startMs, budgetMs);
 }
 #endif
 
@@ -410,7 +472,7 @@ static void selfTestOff(const char* name, const char* flag) { Serial.printf("  -
 
 static void runSelfTest() {
   memset(&selfTestTally, 0, sizeof(selfTestTally));
-  uint32_t uptimeS = millis() / 1000;
+  uint32_t uptimeS = uptimeSeconds();  // same clock as the gas/PM warm-up gate
   Serial.printf("\n=== SELF-TEST %s (up %lus) ===\n", NODE_ID, (unsigned long)uptimeS);
 
 #if ENABLE_WATER_LEVEL
@@ -439,7 +501,8 @@ static void runSelfTest() {
   {
     float pinMv = analogReadMilliVolts(MQ135_PIN);
     float rs = mq135ResistanceKohm(pinMv);
-    selfTestLine("MQ135 gas", sjCheckMq135(pinMv, MQ135_ADC_DIVIDER_RATIO, rs, rs > 0 ? mq135Ppm(rs) : 0, uptimeS),
+    selfTestLine("MQ135 gas",
+                 sjCheckMq135(pinMv, MQ135_ADC_DIVIDER_RATIO, rs, rs > 0 ? mq135Ppm(rs) : 0, uptimeS, MQ135_WARMUP_S),
                  selfTestHint("AO via 10k/10k divider to GPIO%d (MQ135_ADC_DIVIDER_RATIO %.1f), VCC 5 V", MQ135_PIN,
                               MQ135_ADC_DIVIDER_RATIO));
   }
@@ -500,7 +563,8 @@ static void runSelfTest() {
       delay(20);
     }
     pollPms5003();
-    selfTestLine("PMS5003", sjCheckPms(sjPmEverSeen, millis() - sjPmLastFrameMs, sjPm25, sjPm10, uptimeS),
+    selfTestLine("PMS5003",
+                 sjCheckPms(sjPmEverSeen, millis() - sjPmLastFrameMs, sjPm25, sjPm10, uptimeS, PMS5003_WARMUP_S),
                  selfTestHint("PMS TX to GPIO%d, VCC 5 V, GND; the fan should be audible", PMS_RX_PIN));
   }
 #else
@@ -563,7 +627,7 @@ static void handleSerial() {
     case 'r': Serial.printf("[mq135] R0 for clean air = %.2f kOhm -> MQ135_R0_KOHM\n", calibrateMq135R0Kohm()); break;
     case 's': Serial.printf("[soil] %u mV (dry -> SOIL_DRY_MV, in water -> SOIL_WET_MV)\n", readSoilMillivolts()); break;
     case 'p': Serial.printf("[ph] %.0f mV (in pH7 -> PH_MV_AT_7, in pH4 -> PH_MV_AT_4)\n", readPhMillivolts()); break;
-    case 'q': Serial.printf("[queue] %u waiting, %u dropped (overflow) since queue creation\n", queue.count(), queue.dropped()); break;
+    case 'q': Serial.printf("[queue] %u waiting, %u dropped (overflow or unreadable) since queue creation\n", queue.count(), queue.dropped()); break;
     case 'c': queue.clear(); Serial.println("[queue] cleared"); break;
   }
 }
@@ -653,10 +717,7 @@ static void runSleepCycle() {
     Serial.println("[sensor] nothing could be measured - no reading this wake");
   }
   printReading(r, edge, localAlert);
-  if (waitForLink()) {
-    while (queue.count() > 0 && millis() < DEEP_SLEEP_MAX_AWAKE_MS && flushQueue()) {
-    }
-  }
+  if (waitForLink()) drainQueueWithin(0, DEEP_SLEEP_MAX_AWAKE_MS);  // millis() counts from this wake
   sleepUntilNextMeasurement();
 }
 #endif
@@ -680,12 +741,7 @@ void setup() {
     session = sleepState.session;
     seq = sleepState.seq;
     pendingRainMm = sleepState.pendingRainMm;
-  } else {
-    session = sjPrefs.getUShort("session", 0) + 1;  // new session every power-on -> unique reading_uid
-    sjPrefs.putUShort("session", session);
-    sjSleepStateReset(sleepState, session);
   }
-  Serial.printf("[boot] session %u%s\n", session, resumedFromSleep ? " (woke from deep sleep)" : "");
 
   queueOk = queue.begin("/node_queue.bin", "/node_queue.hdr", QUEUE_CAPACITY);
   if (!queueOk) {
@@ -695,6 +751,18 @@ void setup() {
   edgeOk = setupEdgeAI();
   Serial.println(edgeOk ? "[edge] model ready" : "[edge] model unavailable - sending without edge verdict");
   setupTransport();  // LoRa: result kept in loraBeginState for the self-test
+  if (!resumedFromSleep) {
+    // New session every power-on -> unique reading_uid, also across board
+    // swaps and NVS erases (sj_session.h). After setupTransport() so the
+    // radio's noise is available. "sess32" is new: a board updated from the
+    // 16-bit counter ("session") also gets a random start, away from 1, 2, 3.
+    bool stored = sjPrefs.isKey("sess32");
+    uint32_t fresh = stored ? 0 : sjFreshSession(ESP.getEfuseMac(), esp_random(), transportEntropy());
+    session = sjNextSession(stored, sjPrefs.getULong("sess32", 0), fresh);
+    sjPrefs.putULong("sess32", session);
+    sjSleepStateReset(sleepState, session);
+  }
+  Serial.printf("[boot] session %lu%s\n", (unsigned long)session, resumedFromSleep ? " (woke from deep sleep)" : "");
 #if DEEP_SLEEP_ENABLED
   if (resumedFromSleep) runSleepCycle();  // never returns
 #endif
@@ -749,7 +817,7 @@ void loop() {
   // send what is queued, then start the measure-and-sleep cycle.
   if (millis() >= DEEP_SLEEP_SETUP_WINDOW_MS && millis() - lastSerialMs >= DEEP_SLEEP_SETUP_WINDOW_MS) {
     Serial.println("[sleep] setup window over - starting the deep-sleep cycle");
-    if (queue.count() > 0) flushQueue();
+    drainQueueWithin(millis(), DEEP_SLEEP_MAX_AWAKE_MS);
     sleepUntilNextMeasurement();
   }
 #endif

@@ -412,7 +412,10 @@
             <strong id="nearestHospName">--</strong>
           </p>
           <p class="muted" style="margin: 0 0 12px">
-            <span id="nearestHospDist">--</span> km away (driving route)
+            <!-- straight-line ("as the crow flies") from server.js, same wording as
+                 the React SOS page - the road route is usually longer.
+                 HUMAN REVIEW: citizen-facing text. -->
+            <span id="nearestHospDist">--</span> km away (straight-line distance; the road route may be longer)
           </p>
           <a
             id="nearestHospLink"
@@ -664,7 +667,7 @@
         }
       }
 
-      // Looks up the nearest hospital + driving route for the user's own
+      // Looks up the nearest hospital + directions link for the user's own
       // location and shows it proactively to everyone who opens the
       // portal - not just people who have already pressed SOS.
       async function refreshNearestHospital() {

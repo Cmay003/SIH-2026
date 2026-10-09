@@ -46,6 +46,12 @@ inline SjCheckResult sjResult(SjCheck status, const char* fmt, ...) {
 // this floor" - sensors.h uses the same constant to leave such values out.
 #define SJ_ADC_FLOOR_MV 200.0f
 
+// Power-on warm-up of the MQ135 heater and the PMS5003 fan: ONE rule for
+// both the self-test (WAIT) and takeReading() (value left out of the
+// reading and the local alert - sj_warmup.h), so WAIT always means "not
+// sent yet". The times are MQ135_WARMUP_S / PMS5003_WARMUP_S in config.h.
+inline bool sjWarmingUp(uint32_t uptimeS, uint32_t warmupS) { return uptimeS < warmupS; }
+
 // ---------------------------------------------------------------------
 // HC-SR04: `echoes` of `pings` answered; min / median / max distance (cm)
 // of the answered ones. readWaterLevelM() needs 3 of 5.
@@ -80,11 +86,10 @@ inline SjCheckResult sjCheckDht(bool ok, float tempC, float humidityPct) {
 
 // ---------------------------------------------------------------------
 // MQ135: millivolts at the ESP32 pin, the divider ratio, the computed
-// resistance / ppm, and seconds since power-on (heater warm-up).
+// resistance / ppm, seconds since boot and MQ135_WARMUP_S (heater warm-up).
 // ---------------------------------------------------------------------
-#define SJ_MQ135_WARMUP_S 120
-
-inline SjCheckResult sjCheckMq135(float pinMv, float dividerRatio, float rsKohm, float ppm, uint32_t uptimeS) {
+inline SjCheckResult sjCheckMq135(float pinMv, float dividerRatio, float rsKohm, float ppm, uint32_t uptimeS,
+                                  uint32_t warmupS) {
   float aoV = pinMv * dividerRatio / 1000.0f;
   // readGasPpm() drops the value when Rs <= 0 (AO at/above MQ135_VCC) -
   // a clipped pin with a 2:1 divider always lands here, so check it first.
@@ -99,9 +104,9 @@ inline SjCheckResult sjCheckMq135(float pinMv, float dividerRatio, float rsKohm,
   // sensor from clean air with a small load resistor.
   if (pinMv <= SJ_ADC_FLOOR_MV)
     return sjResult(SJ_CHECK_WARN, "pin at the ADC floor (%.0f mV) - unpowered, or RL too small for clean air", pinMv);
-  if (uptimeS < SJ_MQ135_WARMUP_S)
-    return sjResult(SJ_CHECK_WAIT, "heater warming up (%us of %us) - %.0f ppm not valid yet", (unsigned)uptimeS,
-                    (unsigned)SJ_MQ135_WARMUP_S, ppm);
+  if (sjWarmingUp(uptimeS, warmupS))
+    return sjResult(SJ_CHECK_WAIT, "heater warming up (%us of %us) - %.0f ppm not sent yet", (unsigned)uptimeS,
+                    (unsigned)warmupS, ppm);
   if (ppm < 10.0f || ppm > 10000.0f)
     return sjResult(SJ_CHECK_WARN, "%.0f ppm is implausible - calibrate R0 with 'r' in clean air", ppm);
   return sjResult(SJ_CHECK_OK, "AO %.2f V, Rs %.1f kOhm -> %.0f ppm", aoV, rsKohm, ppm);
@@ -169,17 +174,17 @@ inline SjCheckResult sjCheckMpu(bool initialised, bool acksNow, int whoAmI, bool
 }
 
 // ---------------------------------------------------------------------
-// PMS5003 (readPm() needs a valid frame within the last 10 s)
+// PMS5003 (readPm() needs a valid frame within the last 10 s; nothing is
+// sent before PMS5003_WARMUP_S)
 // ---------------------------------------------------------------------
-#define SJ_PMS_WARMUP_S 30
-
-inline SjCheckResult sjCheckPms(bool everSeen, uint32_t frameAgeMs, uint16_t pm25, uint16_t pm10, uint32_t uptimeS) {
+inline SjCheckResult sjCheckPms(bool everSeen, uint32_t frameAgeMs, uint16_t pm25, uint16_t pm10, uint32_t uptimeS,
+                                uint32_t warmupS) {
   if (!everSeen) return sjResult(SJ_CHECK_FAIL, "no valid frame received");
   if (frameAgeMs > 10000)
     return sjResult(SJ_CHECK_FAIL, "last frame %us ago - sensor stopped sending", (unsigned)(frameAgeMs / 1000));
-  if (uptimeS < SJ_PMS_WARMUP_S)
-    return sjResult(SJ_CHECK_WAIT, "fan settling (%us of %us) - PM2.5 %u, PM10 %u", (unsigned)uptimeS,
-                    (unsigned)SJ_PMS_WARMUP_S, pm25, pm10);
+  if (sjWarmingUp(uptimeS, warmupS))
+    return sjResult(SJ_CHECK_WAIT, "fan settling (%us of %us) - PM2.5 %u, PM10 %u not sent yet", (unsigned)uptimeS,
+                    (unsigned)warmupS, pm25, pm10);
   if (pm25 > pm10) return sjResult(SJ_CHECK_WARN, "PM2.5 %u > PM10 %u - impossible, bad frames?", pm25, pm10);
   return sjResult(SJ_CHECK_OK, "PM2.5 %u, PM10 %u ug/m3", pm25, pm10);
 }

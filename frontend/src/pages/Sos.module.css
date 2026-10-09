@@ -1,5 +1,7 @@
-/* Citizen page keeps its own blue, high-contrast look (always light, for
-   readability outdoors), scoped to .page so staff pages are unaffected. */
+/* Citizen page keeps its own blue, high-contrast look, scoped to .page so
+   staff pages are unaffected. Light by default (readability outdoors); a
+   dark variant follows the phone's dark-mode setting (night use, OLED
+   battery) with the same contrast targets (text >= 4.5:1, outlines >= 3:1). */
 .page {
   --blue: #1d4ed8;
   --blue-dark: #1e3a8a;
@@ -14,11 +16,43 @@
   --bad: #dc2626;
   --halo: #fbdada;
   --off: #9aa1ab;
+  --sos-fill: #dc2626; /* SOS button / spinner fill (white text on it) */
+  --field-bg: #ffffff;
+  --field-border: #868e9c;
+  --status-ink: #374151;
+  --modal-bg: #ffffff;
   min-height: 100vh;
+  min-height: 100dvh;
   background: var(--bg);
   color: var(--ink);
   font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  line-height: 1.4;
   color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  .page {
+    --bg: #0b1220;
+    --card: #111a2e;
+    --box: #1a2540;
+    --ink: #e5e7eb;
+    --muted: #9ca3af;
+    --ring: #26324a;
+    --ok: #4ade80;
+    --warn: #fb923c;
+    --bad: #f87171;
+    --halo: rgba(220, 38, 38, 0.3);
+    --off: #4b5563;
+    --field-bg: #0b1220;
+    --field-border: #6b7a8f;
+    --status-ink: #d1d5db;
+    --modal-bg: #111a2e;
+    color-scheme: dark;
+  }
+}
+
+/* Keyboard focus ring stays visible on the blue bar */
+.topbar :focus-visible {
+  outline-color: #fff;
 }
 
 .topbar {
@@ -41,9 +75,11 @@
   background: rgba(255, 255, 255, 0.15);
   color: #fff;
   border: 1px solid rgba(255, 255, 255, 0.4);
-  border-radius: 6px;
+  border-radius: 8px;
+  min-height: 44px;
+  min-width: 44px;
   padding: 6px 14px;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
   cursor: pointer;
 }
@@ -55,6 +91,12 @@
   font-weight: 700;
   letter-spacing: 3px;
   margin-top: 6px;
+}
+/* The wide tracking is meant for the uppercase Latin "USER PORTAL". In Devanagari it
+   splits up syllables and conjuncts (र्ट), so turn it off for Hindi. This depends on
+   SosPage setting document.documentElement.lang. */
+.portalLabel:lang(hi) {
+  letter-spacing: normal;
 }
 .connStatus {
   font-size: 13.5px;
@@ -107,11 +149,14 @@
   border-radius: 10px;
   padding: 14px 16px;
   font-size: 14px;
-  color: #374151;
+  color: var(--status-ink);
 }
 
 .btnPrimary {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
   background: var(--blue);
   color: #fff;
   border: none;
@@ -124,7 +169,7 @@
   text-decoration: none;
   margin-top: 10px;
 }
-.btnPrimary:hover {
+.btnPrimary:hover:not(:disabled) {
   background: var(--blue-dark);
 }
 .btnPrimary:disabled {
@@ -133,6 +178,83 @@
 }
 .locateHead .btnPrimary {
   margin-top: 0;
+}
+
+/* "Set my location on a map" - a secondary action: the device location
+   stays the first choice, so this must not look like the main button */
+.btnSecondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  margin-top: 12px;
+  padding: 10px 18px;
+  border-radius: 8px;
+  border: 2px solid var(--blue);
+  background: transparent;
+  color: var(--blue);
+  font-size: 14.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+@media (prefers-color-scheme: dark) {
+  .btnSecondary {
+    border-color: #93c5fd;
+    color: #93c5fd;
+  }
+}
+.manualBox {
+  margin-top: 16px;
+  border-top: 1px solid var(--ring);
+  padding-top: 14px;
+}
+.manualTitle {
+  margin: 0;
+  font-size: 17px;
+}
+.manualMapWrap {
+  margin-top: 10px;
+}
+.manualMap {
+  height: 300px;
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--field-border);
+}
+.manualFields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+  margin-top: 12px;
+}
+.manualFields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.manualFields input {
+  width: 11em;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  font-size: 16px; /* 16px stops iOS zooming the page on focus */
+  font-family: inherit;
+  color: var(--ink);
+  background: var(--field-bg);
+  border: 1px solid var(--field-border);
+  border-radius: 8px;
+}
+.manualFields .btnPrimary {
+  margin-top: 0;
+}
+.fieldError {
+  margin: 8px 0 0;
+  color: var(--bad);
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .gridRow {
@@ -181,6 +303,41 @@
 .CRITICAL {
   color: var(--bad);
 }
+.unknown {
+  color: var(--muted);
+}
+
+/* Hazard + what to do now (advice from data/hazard_advice.json) */
+.hazardName {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 700;
+}
+.adviceHead {
+  margin: 8px 0 2px;
+  font-size: 14px;
+  font-weight: 700;
+}
+.adviceList {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 15px;
+  text-align: left; /* the card centres text on phones; a list reads better left-aligned */
+}
+.adviceList li {
+  margin: 4px 0;
+}
+
+/* Why a farther hospital is shown (nearer one inside a hazard zone) */
+.zoneNote {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  font-size: 14px;
+  font-weight: 600;
+}
 
 .scoreRing {
   flex: 0 0 auto;
@@ -216,7 +373,7 @@
   height: 130px;
   border-radius: 50%;
   border: none;
-  background: var(--bad);
+  background: var(--sos-fill);
   color: #fff;
   font-size: 20px;
   font-weight: 800;
@@ -247,14 +404,18 @@
 .noteWrap textarea {
   width: 100%;
   resize: vertical;
-  min-height: 70px;
-  border: 1px solid #d7dbe3;
+  min-height: 88px;
+  border: 1px solid var(--field-border);
   border-radius: 10px;
-  padding: 12px 52px 12px 14px;
-  font-size: 14px;
+  padding: 12px 60px 12px 14px;
+  font-size: 16px; /* 16px stops iOS zooming the page on focus */
   font-family: inherit;
   color: var(--ink);
-  background: #fff;
+  background: var(--field-bg);
+}
+.noteWrap textarea::placeholder {
+  color: var(--muted);
+  opacity: 1;
 }
 .voiceBtn {
   position: absolute;
@@ -263,14 +424,14 @@
   border: none;
   background: var(--blue);
   color: #fff;
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   border-radius: 50%;
   cursor: pointer;
-  font-size: 16px;
+  font-size: 18px;
 }
 .listening {
-  background: #d90429;
+  background: var(--sos-fill);
 }
 .sendStatus {
   margin-top: 10px;
@@ -292,6 +453,14 @@
   margin: 4px 0;
   font-size: 14px;
 }
+.resultCard .earlierLocation {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  font-weight: 600;
+}
 
 @media (max-width: 640px) {
   .locateHead {
@@ -305,6 +474,28 @@
     top: 10px;
     right: 10px;
   }
+  .main {
+    padding: 16px 16px 48px;
+  }
+  .card {
+    padding: 20px 18px;
+  }
+}
+
+/* Narrow phones: the language button gets its own row so it can't sit on
+   top of the title */
+@media (max-width: 480px) {
+  .topbar {
+    padding-top: 12px;
+  }
+  .langToggle {
+    position: static;
+    display: block;
+    margin: 0 0 8px auto;
+  }
+  .topbar h1 {
+    font-size: 26px;
+  }
 }
 
 .modalBackdrop {
@@ -317,7 +508,8 @@
   z-index: 1000;
 }
 .modalBox {
-  background: #fff;
+  background: var(--modal-bg);
+  color: var(--ink);
   border-radius: 14px;
   padding: 32px 36px;
   text-align: center;
@@ -334,12 +526,20 @@
   height: 40px;
   margin: 0 auto;
   border: 4px solid var(--ring);
-  border-top-color: var(--bad);
+  border-top-color: var(--sos-fill);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* Dark theme: a softer card shadow (declared last so it wins over .card) */
+@media (prefers-color-scheme: dark) {
+  .card,
+  .modalBox {
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
   }
 }

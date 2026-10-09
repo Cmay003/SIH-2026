@@ -62,14 +62,39 @@
 #define SENSOR_POWER_ON HIGH
 #define SENSOR_WARMUP_MS 2000  // DHT22 needs ~1-2 s after power-up
 
+// ---- Gas / PM warm-up after a power-on or reset ----------------------
+// Until this long after boot the value is left OUT of every reading (its
+// flag unset, as for an absent sensor), it does not trigger the local
+// alert, and the self-test shows WAIT (sj_warmup.h). A cold MQ135 heater
+// reads far too high, which would otherwise report a false gas leak after
+// every power cut. The cost: a real leak in this window is not reported by
+// the MQ135 (the flame sensor still works). Counted from every reset, not
+// only a power loss - a little conservative after a watchdog reset.
+//  - MQ135: the Hanwei MQ-135 datasheet only gives "Preheat time: Over 24
+//    hour" (its burn-in for rated accuracy - calibrate R0 with 'r' after
+//    that). It gives NO figure for re-warming after a short power cut, so
+//    180 s is an engineering estimate. TUNE IN THE FIELD: power-cycle the
+//    node, watch the self-test's MQ135 line ('t') until the ppm settles.
+//  - PMS5003: Plantower PMS5003 datasheet PTQ3004-2015 V1.0 (2019-07-31):
+//    "Stable data should be got at least 30 seconds after the sensor
+//    wakeup from the sleep mode because of the fan's performance." Applied
+//    to power-on too (the fan starts from rest either way); keep >= 30.
+#define MQ135_WARMUP_S 180
+#define PMS5003_WARMUP_S 30
+static_assert(PMS5003_WARMUP_S >= 30, "PMS5003_WARMUP_S: the datasheet asks for at least 30 s");
+
 // ---- Self-test --------------------------------------------------------
 // 1 = run the sensor/radio self-test once after every power-on or reset
 // (never on a deep-sleep wake). Send 't' on Serial to run it any time.
 #define SELF_TEST_ON_POWER_ON 1
 
 // ---- Queue (LittleFS) -----------------------------------------------
-// 2000 x ~58 B = ~116 KB. At one report a minute that is ~33 hours of
-// outage before the oldest readings start being overwritten.
+// 2000 x (60 B + 4 B CRC) = 128 KB in 32 small segment files
+// (sj_file_queue.h). At one report a minute that is ~33 hours of outage
+// before the oldest readings start being overwritten. Changing this with
+// readings still queued is safe: the next boot moves them to the new size.
+// The move needs free flash for a second copy; without that room the
+// queue keeps the old size and its readings until the next boot retries.
 #define QUEUE_CAPACITY 2000
 
 // ---- LoRa SX1278 (433 MHz, e.g. Ai-Thinker Ra-02) -------------------
@@ -201,7 +226,11 @@ static_assert(DEEP_SLEEP_ELEVATED_INTERVAL_S >= 10 && DEEP_SLEEP_ELEVATED_INTERV
 #define LOCAL_GAS_LIMIT_PPM 800.0f      // = backend GAS_LEAK_THRESHOLD_PPM
 #define LOCAL_WATER_FRACTION_LIMIT 0.4f  // of mount height = backend bench MEDIUM threshold
 #define LOCAL_TILT_LIMIT_DEG 5.0f
-#define LOCAL_PM25_LIMIT 60.0f          // CPCB "moderate" upper bound
+// PM limits sit on the same CPCB NAQI boundary, the top of "Satisfactory"
+// (PM2.5 31-60, PM10 51-100 ug/m3, 24-h); the backend rates anything
+// above it MEDIUM or worse (PM25_BAND_TOPS / PM10_BAND_TOPS).
+#define LOCAL_PM25_LIMIT 60.0f          // CPCB "Satisfactory" upper bound
+#define LOCAL_PM10_LIMIT 100.0f         // CPCB "Satisfactory" upper bound
 
 // ---- Edge AI --------------------------------------------------------
 // Bench tank vs river scale - see edgeModelRiverLevelM() in edge_ai.h.

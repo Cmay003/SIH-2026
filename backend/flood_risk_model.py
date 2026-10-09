@@ -23,8 +23,12 @@ def scs_cn_runoff(rainfall_mm: np.ndarray, curve_number: np.ndarray) -> np.ndarr
     return np.clip(runoff, 0, None)
 
 
-def generate_synthetic_data(n=6000) -> pd.DataFrame:
-    land_use = RNG.choice(
+def generate_synthetic_data(n=6000, rng=None) -> pd.DataFrame:
+    # rng: ml/evaluate_models.py passes its own generator to draw an
+    # independent held-out sample. The default keeps the module RNG, so
+    # train_models.py still gets exactly the rows it always trained on.
+    rng = RNG if rng is None else rng
+    land_use = rng.choice(
         ["forest", "agricultural", "urban_low", "urban_high"],
         size=n,
         p=[0.25, 0.35, 0.25, 0.15],
@@ -35,19 +39,19 @@ def generate_synthetic_data(n=6000) -> pd.DataFrame:
         "urban_low": (75, 85),
         "urban_high": (85, 96),
     }
-    curve_number = np.array([RNG.uniform(*cn_lookup[lu]) for lu in land_use])
+    curve_number = np.array([rng.uniform(*cn_lookup[lu]) for lu in land_use])
 
-    rainfall_24h_mm = RNG.gamma(shape=2.0, scale=20.0, size=n)
-    rainfall_intensity_mm_hr = rainfall_24h_mm / RNG.uniform(6, 24, n)
+    rainfall_24h_mm = rng.gamma(shape=2.0, scale=20.0, size=n)
+    rainfall_intensity_mm_hr = rainfall_24h_mm / rng.uniform(6, 24, n)
 
     runoff_mm = scs_cn_runoff(rainfall_24h_mm, curve_number)
 
-    river_level_m = 1.5 + 0.01 * runoff_mm + RNG.normal(0, 0.3, n)
+    river_level_m = 1.5 + 0.01 * runoff_mm + rng.normal(0, 0.3, n)
     river_level_m = np.clip(river_level_m, 0.2, None)
-    river_level_rate_m_per_hr = 0.02 * runoff_mm / 6 + RNG.normal(0, 0.05, n)
+    river_level_rate_m_per_hr = 0.02 * runoff_mm / 6 + rng.normal(0, 0.05, n)
 
-    upstream_level_m = river_level_m * RNG.uniform(0.8, 1.1, n) + RNG.normal(0, 0.2, n)
-    soil_saturation = np.clip(RNG.beta(2, 3, n) + 0.002 * rainfall_24h_mm, 0, 1)
+    upstream_level_m = river_level_m * rng.uniform(0.8, 1.1, n) + rng.normal(0, 0.2, n)
+    soil_saturation = np.clip(rng.beta(2, 3, n) + 0.002 * rainfall_24h_mm, 0, 1)
 
     # Forecasted rain for the next 6 hours (from a weather API - Open-Meteo,
     # see backend_server.py: fetch_rainfall_forecast). A leading indicator,
@@ -56,7 +60,7 @@ def generate_synthetic_data(n=6000) -> pd.DataFrame:
     # instantly) plus its own independent noise, since a forecast is never
     # a perfect readout of the actual 24h rainfall.
     forecast_rainfall_6h_mm = np.clip(
-        0.25 * rainfall_24h_mm * RNG.uniform(0.4, 1.6, n) + RNG.gamma(1.0, 8.0, n),
+        0.25 * rainfall_24h_mm * rng.uniform(0.4, 1.6, n) + rng.gamma(1.0, 8.0, n),
         0,
         None,
     )
@@ -84,7 +88,7 @@ def generate_synthetic_data(n=6000) -> pd.DataFrame:
         + 0.12 * df.soil_saturation
         + 0.15 * (df.forecast_rainfall_6h_mm / df.forecast_rainfall_6h_mm.max())
     )
-    risk_signal += RNG.normal(0, 0.05, n)
+    risk_signal += rng.normal(0, 0.05, n)
     threshold = np.quantile(risk_signal, 0.85)
     df["flood_event"] = (risk_signal > threshold).astype(int)
 

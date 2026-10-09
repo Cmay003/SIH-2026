@@ -36,9 +36,19 @@ switch (command) {
       console.error(`--kind must be one of: ${KINDS.join(", ")}`);
       process.exit(1);
     }
-    if (db.prepare("SELECT 1 FROM device_keys WHERE name = ?").get(name)) {
+    const existing = db.prepare("SELECT id, active FROM device_keys WHERE name = ?").get(name);
+    if (existing && existing.active) {
       console.error(`A key named '${name}' already exists (revoke it first to replace it).`);
       process.exit(1);
+    }
+    if (existing) {
+      // Revoked key with this name: the documented rotation (revoke, then
+      // add the same name) failed on the UNIQUE name (B58). Rename the old
+      // row instead of deleting it, so `list` still shows the revoked key;
+      // the row id keeps the new name unique however often it rotates.
+      const archived = `${name}.revoked-${existing.id}`;
+      db.prepare("UPDATE device_keys SET name = ? WHERE id = ?").run(archived, existing.id);
+      console.log(`Old revoked key renamed to '${archived}'.`);
     }
     if (kind === "device" && nodes === "*") {
       console.warn("Note: this key may report for ANY node. Limit it with --nodes NODE-04,... if you can.");

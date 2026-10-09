@@ -24,6 +24,8 @@ module.exports = {
   BACKUPS_DIR: path.join(VAR_DIR, "backups"),
   CITIZEN_UPLOADS_DIR: path.join(VAR_DIR, "citizen_uploads"),
   HOSPITALS_FILE: path.join(ROOT, "data", "hospitals.json"),
+  // Citizen advice per hazard, EN/HI - also bundled into the SOS page
+  HAZARD_ADVICE_FILE: path.join(ROOT, "data", "hazard_advice.json"),
   PUBLIC_DIR: path.join(ROOT, "public"),
   REACT_DIR: path.join(ROOT, "frontend", "dist"),
 };

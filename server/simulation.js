@@ -14,6 +14,14 @@
  * Run alongside a real ESP32: skip the node ID the hardware uses, e.g.
  *   node server/simulation.js --skip NODE-04
  *
+ * To try it without touching the normal stack's database, run a second
+ * stack on a COPY of var/ and spare ports (see README, "Testing beside a
+ * running copy"):
+ *   set SANJEEVNI_VAR_DIR=C:\tmp\var_copy                     (both windows)
+ *   venv\Scripts\python.exe -m uvicorn backend_server:app --app-dir backend --host 127.0.0.1 --port 8765
+ *   set SANJEEVNI_PORT=3765& set SANJEEVNI_BACKEND_URL=http://127.0.0.1:8765& node server/server.js
+ *   node server/simulation.js --server http://localhost:3765 --key <key from the copy's DB>
+ *
  * Options (all optional):
  *   --nodes NODE-04,NODE-07     simulate only these nodes (default: all in NODE_PROFILES)
  *   --skip NODE-04              ...or all except these (your real hardware)
@@ -36,6 +44,10 @@
  *   --key <device key>          or SANJEEVNI_INGEST_KEY in the environment / .env
  *                               (create: node server/device_keys.js add simulator --kind simulator)
  *   --seed 42                   repeatable runs
+ *   --scenario judges           the scripted judge demo instead (tools/demo/run_demo.js):
+ *                               preflight, 2 h history back-fill, then cued steps
+ *                               (pending -> confirmed -> siren -> fault -> SOS -> outage).
+ *                               Its options: node tools/demo/run_demo.js --help
  *   --help
  */
 
@@ -71,6 +83,15 @@ const EVENTS = {
   water: { needs: "ph", readings: 6 },
   sensor_fault: { needs: "water", readings: 1 },
 };
+
+// Rain is simulated as a RATE (mm per hour) times the real time since the
+// node's previous reading. It used to be a fixed amount per reading, and the
+// backend sums readings over real time (rain in the last 1 h / 24 h), so the
+// rain rate grew with fewer nodes or a shorter --interval: one node at 3 s
+// made "drizzle" ~6 mm/h (144 mm/day, IMD "very heavy rain") and the flood
+// model scored a calm river MEDIUM (B66).
+const DRIZZLE_MM_PER_HR = [0, 0.4]; // background drizzle: at most ~10 mm/day
+const FLOOD_RAIN_MM_PER_HR = [60, 100]; // cloudburst-level rain during a flood event
 
 // ---------------------------------------------------------------------
 function parseArgs(argv) {
@@ -144,8 +165,23 @@ function fail(message) {
 const keyProblemHint =
   "device key missing/invalid/not allowed. Create one: node server/device_keys.js add simulator --kind simulator, " +
   "then set SANJEEVNI_INGEST_KEY (env or .env) or pass --key";
-const opts = parseArgs(process.argv.slice(2));
-if (!opts.key) {
+// Run as a script: parse the command line and start sending. Required (by
+// tools/demo/simulation.test.js): default options, nothing is sent, so the
+// reading generator can be tested without a server.
+const isMain = require.main === module;
+// --scenario hands the whole command line to the scripted demo, which has
+// its own options. It runs at the END of this file, once module.exports is
+// complete: run_demo.js requires this file, and while this file is still
+// executing that require would return a half-built exports object.
+const scenarioArgs = isMain ? scenarioHandoff(process.argv.slice(2)) : null;
+function scenarioHandoff(argv) {
+  const i = argv.indexOf("--scenario");
+  if (i < 0) return null;
+  if (argv[i + 1] !== "judges") fail("--scenario: the only scenario is 'judges' (node tools/demo/run_demo.js --help)");
+  return [...argv.slice(0, i), ...argv.slice(i + 2)];
+}
+const opts = parseArgs(isMain && !scenarioArgs ? process.argv.slice(2) : []);
+if (isMain && !scenarioArgs && !opts.key) {
   console.warn(`No device key set - the server will refuse readings.
   ${keyProblemHint}
 `);
@@ -153,6 +189,10 @@ if (!opts.key) {
 
 // Seedable PRNG (mulberry32) so a demo run can be repeated exactly.
 let rngState = (opts.seed ?? Date.now()) >>> 0;
+// The scripted demo sets its --seed after requiring this file.
+function reseed(seed) {
+  rngState = seed >>> 0;
+}
 function random() {
   rngState = (rngState + 0x6d2b79f5) >>> 0;
   let t = rngState;
@@ -173,10 +213,24 @@ const startedAt = Date.now();
 // Random per run: "epoch % 65536" could repeat across runs, and the backend
 // then dropped the new run's readings as duplicates (review R27).
 const session = require("crypto").randomBytes(4).toString("hex");
+// Every setInterval firing in main(), INCLUDING the ones skipped because a
+// slow send was still running. Declared before the state below is built
+// (initialState reads it). Tests and run_demo.js never call noteClockTick,
+// so for them it stays 0 and the rain cap is the plain 2 x interval x nodes.
+let clockTicks = 0;
+function noteClockTick() {
+  clockTicks++;
+}
 const state = {};
-for (const node of opts.nodes) {
-  state[node] = {
+function initialState(now = Date.now()) {
+  return {
     seq: 0,
+    lastAt: now, // when this node last took a reading (rain is a rate x elapsed time)
+    // clockTicks at this node's last reading: ticks that fired since then are
+    // real time that passed, even if a slow backend made the loop skip them.
+    // (clockTicks, not 0: a node set up later must not inherit earlier ticks.)
+    lastClock: clockTicks,
+    rainCarry: 0, // rain below the reporting resolution, kept for the next reading
     battery: between(65, 95),
     soil: between(30, 45),
     // River level as a slowly drifting state (B33): it used to be a fresh
@@ -186,7 +240,36 @@ for (const node of opts.nodes) {
     level: null,
     tiltBase: between(0.2, 0.6),
     event: null, // { type, step, delay }
+    // Scripted conditions (tools/demo/run_demo.js): { label, level, rainMmPerHr }.
+    // While set, the river sits at `level` (plus sensor noise) and rain falls
+    // at that rate - the judge demo needs exact levels on cue, not a random event.
+    script: null,
   };
+}
+for (const node of opts.nodes) state[node] = initialState();
+
+// Hours of rain one reading may cover. Readings normally come every
+// interval x nodes seconds; a much longer gap means the simulator itself was
+// paused (laptop asleep, debugger), and a flood rate over that gap would
+// dump hundreds of mm into one reading.
+// But a slow (healthy) backend also stretches the gap: the loop in main()
+// skips ticks while a send is running, so one node's readings can come
+// several ticks apart. A cap on the NOMINAL gap then silently dropped up to
+// half the rain (a flood read ~30-50 mm/h instead of 60-100). Skipped ticks
+// still fired, so they count as elapsed time; a pause fires no ticks at all
+// (Node does not replay missed setInterval ticks), so it stays capped.
+const maxRainGapHr = (s) => (2 * opts.interval * Math.max(opts.nodes.length, clockTicks - s.lastClock)) / 3600;
+
+// What the rain gauge reports for mm that fell since the last reading.
+// Reported in 0.001 mm steps (like the old 3-decimal rounding), but the
+// remainder is carried to the next reading instead of thrown away: at a
+// short interval the drizzle per reading is far below 0.001 mm and rounding
+// would silently turn it into no rain at all.
+function gaugeReading(s, mm) {
+  const total = s.rainCarry + mm;
+  const reported = Math.floor(total * 1000 + 1e-9) / 1000;
+  s.rainCarry = total - reported;
+  return round(reported, 3);
 }
 
 let tick = 0;
@@ -215,9 +298,15 @@ function maybeStartEvent() {
   }
 }
 
-function makeReading(node) {
+function makeReading(node, now = Date.now()) {
   const s = state[node];
   const has = (module) => NODE_PROFILES[node].includes(module);
+  // Rain is worked out here, when the reading is TAKEN - not when a lora
+  // backlog is uploaded - so an outage does not count the same gap twice.
+  const dtHr = Math.min(Math.max(0, now - s.lastAt) / 3.6e6, maxRainGapHr(s));
+  s.lastAt = now;
+  s.lastClock = clockTicks;
+  let rainMmPerHr = between(...DRIZZLE_MM_PER_HR);
   s.battery = Math.max(0, s.battery - between(0.02, 0.08));
   if (s.level === null) s.level = s.baseLevel;
   // drift back toward the normal level (a flood recedes), plus slow wander
@@ -231,9 +320,7 @@ function makeReading(node) {
     humidity_pct: round(between(45, 75), 2),
     gas_ppm: round(between(380, 420), 1),
     flame_reading: round(between(0, 0.05), 3),
-    // rain SINCE THE PREVIOUS READING (each node reports every
-    // interval x nodes seconds): light drizzle by default
-    rainfall_mm_since_last: has("rain") ? round(between(0, 0.01), 3) : 0,
+    // rainfall_mm_since_last is set after the event code (it is a rate x time)
   };
   // (core values are generated for every node so the event code below
   // stays simple; the ones this node has no sensor for are removed at the end)
@@ -259,7 +346,7 @@ function makeReading(node) {
     label = ev.type;
     switch (ev.type) {
       case "flood":
-        r.rainfall_mm_since_last = round(between(0.15, 0.25), 3); // ~60-100 mm/hr
+        rainMmPerHr = between(...FLOOD_RAIN_MM_PER_HR);
         s.level = Math.max(s.level, lerp(2.4, 4.0, f)); // the river itself rises (then recedes)
         r.river_level_m = round(s.level + between(-0.01, 0.01), 3);
         if (has("soil")) s.soil = Math.min(95, s.soil + 6);
@@ -290,12 +377,23 @@ function makeReading(node) {
         break;
       case "sensor_fault":
         r.river_level_m = 14.2; // implausible single spike
-        r.rainfall_mm_since_last = 0;
+        rainMmPerHr = 0; // no rain to corroborate it
         break;
     }
     ev.step++;
     if (ev.step >= EVENTS[ev.type].readings) s.event = null;
+  } else if (s.script) {
+    label = s.script.label || "scripted";
+    if (s.script.level != null) {
+      s.level = s.script.level;
+      r.river_level_m = round(s.level + between(-0.01, 0.01), 3);
+    }
+    if (s.script.rainMmPerHr != null) rainMmPerHr = s.script.rainMmPerHr;
   }
+  // Rain SINCE THE PREVIOUS READING - only from a node with a rain gauge.
+  // A flood event used to send rain from gauge-less nodes (NODE-INDB), which
+  // the backend logged as real rain and fed into its soil proxy (B67).
+  r.rainfall_mm_since_last = has("rain") ? gaugeReading(s, rainMmPerHr * dtHr) : 0;
   // soil dries slowly between rain events
   if (has("soil")) {
     s.soil = round(Math.max(20, s.soil - 0.05 + r.rainfall_mm_since_last * 2), 1);
@@ -424,21 +522,35 @@ async function step() {
   if (!down) await flushBacklog();
 }
 
-console.log(
-  `SANJEEVNI simulator: nodes ${opts.nodes.join(", ")} | mode ${opts.mode}` +
-    (opts.outage ? ` | ${opts.outage}s uplink outage every ${opts.outageEvery}s` : "") +
-    ` | every ${opts.interval}s | events: ${opts.events.join(", ")}` +
-    (opts.seed != null ? ` | seed ${opts.seed}` : ""),
-);
-for (const node of opts.nodes) console.log(`  ${node}: ${NODE_PROFILES[node].join(", ")}`);
+function main() {
+  console.log(
+    `SANJEEVNI simulator: nodes ${opts.nodes.join(", ")} | mode ${opts.mode}` +
+      (opts.outage ? ` | ${opts.outage}s uplink outage every ${opts.outageEvery}s` : "") +
+      ` | every ${opts.interval}s | events: ${opts.events.join(", ")}` +
+      (opts.seed != null ? ` | seed ${opts.seed}` : ""),
+  );
+  for (const node of opts.nodes) console.log(`  ${node}: ${NODE_PROFILES[node].join(", ")}`);
 
-let running = false;
-setInterval(async () => {
-  if (running) return; // a slow server must not cause overlapping sends
-  running = true;
-  try {
-    await step();
-  } finally {
-    running = false;
-  }
-}, opts.interval * 1000);
+  let running = false;
+  setInterval(async () => {
+    noteClockTick(); // counted even when skipped below: see maxRainGapHr
+    if (running) return; // a slow server must not cause overlapping sends
+    running = true;
+    try {
+      await step();
+    } finally {
+      running = false;
+    }
+  }, opts.interval * 1000);
+}
+
+if (isMain && !scenarioArgs) main();
+
+// For tests (tools/demo/simulation.test.js) and the scripted judge demo
+// (tools/demo/run_demo.js): the reading generator and its state.
+module.exports = {
+  NODE_PROFILES, EVENTS, DRIZZLE_MM_PER_HR, FLOOD_RAIN_MM_PER_HR, DOWNSTREAM_OF, opts, state, session,
+  initialState, makeReading, reseed, noteClockTick,
+};
+
+if (scenarioArgs) require("../tools/demo/run_demo.js").main(scenarioArgs);

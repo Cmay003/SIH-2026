@@ -1,26 +1,34 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-const style: CSSProperties = {
-  position: "fixed",
-  left: "50%",
-  top: 16,
-  transform: "translateX(-50%)",
-  zIndex: 3000,
-  background: "#1b1b1b",
-  color: "#fff",
-  padding: "10px 16px",
-  borderRadius: 10,
-  boxShadow: "0 6px 20px rgba(0,0,0,.25)",
-  maxWidth: "calc(100vw - 32px)",
-};
-
+/**
+ * Short message at the top of the page (styles: .app-toast in global.css).
+ * Closes itself after `ms`, but the timer waits while the pointer or
+ * keyboard focus is on it, and it can be dismissed at once (WCAG 2.2.1).
+ */
 export function Toast({ message, onDone, ms = 6000 }: { message: string; onDone: () => void; ms?: number }) {
+  const [paused, setPaused] = useState(false);
+  // Callers often pass a new arrow function each render (the dashboard
+  // re-renders on every 2 s poll). Keep the latest one in a ref so a
+  // re-render doesn't restart the timer and keep the toast up forever.
+  const onDoneRef = useRef(onDone);
   useEffect(() => {
-    const t = setTimeout(onDone, ms);
+    onDoneRef.current = onDone;
+  }, [onDone]);
+  useEffect(() => {
+    if (paused) return;
+    const t = setTimeout(() => onDoneRef.current(), ms);
     return () => clearTimeout(t);
-  }, [onDone, ms]);
-  return createPortal(<div role="status" style={style}>{message}</div>, document.body);
+  }, [ms, paused]);
+  return createPortal(
+    <div className="app-toast"
+         onMouseEnter={() => setPaused(true)} onMouseLeave={() => setPaused(false)}
+         onFocus={() => setPaused(true)} onBlur={() => setPaused(false)}>
+      <div role="status" className="app-toast-text">{message}</div>
+      <button type="button" className="app-toast-close" onClick={onDone}>Dismiss</button>
+    </div>,
+    document.body,
+  );
 }
 
 /** server.js sends users without the role back to /?denied=officer (or =admin) */

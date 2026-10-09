@@ -17,8 +17,8 @@ Solar ESP32 sensor nodes detect hazards on the device, talk to a gateway over Lo
 | Edge AI | int8 TensorFlow Lite Micro model on the ESP32 (NORMAL / WATCH / URGENT); node sends at once when elevated, otherwise a heartbeat every minute |
 | Offline / outages | Node and gateway keep readings in a flash queue until acknowledged (store-and-forward); readings carry their age so late uploads keep correct timestamps; duplicates are ignored |
 | Officers | Live map: hazard zones, SOS requests (with triage queue and routes), sensor node health and missing-node alerts, river-level forecast (LSTM vs straight-line), Sentinel-1 radar cross-check |
-| Citizens | SOS page (English / Hindi, voice note, nearest hospital), WhatsApp SOS (share a location, or text SOS / HELP / EMERGENCY after sharing one) and opt-in hazard alerts (`ALERTS ON` / `STOP`), CAP 1.2 alert export (NDMA SACHET-compatible format) |
-| Administration | Node registry page: add, edit or remove sensor nodes (position on a map, land use, upstream node, report interval) with live status — admin role only, every change logged |
+| Citizens | SOS page (English / Hindi, voice note; inside a confirmed hazard zone: the hazard, its severity and 2-3 things to do now; nearest hospital outside any HIGH/CRITICAL zone, by straight-line distance; if location is denied, unavailable or slow, the person can tap their position on a map or type coordinates, and officers see that SOS marked "set by hand"), WhatsApp SOS (share a location, or text SOS / HELP / EMERGENCY after sharing one) and opt-in hazard alerts (`ALERTS ON` / `STOP`), CAP 1.2 alert export (NDMA SACHET-compatible format) |
+| Administration | Node registry page: add, edit or remove sensor nodes (position on a map, land use, upstream node, report interval) with live status — admin role only, every change logged. **Model card** on the same page: each model's purpose, training/test data (labelled SYNTHETIC), results vs a simple baseline, false-alarm and miss rates, calibration and limitations (generate it with `venv\Scripts\python.exe ml\evaluate_models.py`) |
 | Security | Staff login (scrypt-hashed passwords, roles, lockout), device keys for sensor ingestion, strict Content-Security-Policy on the React pages |
 
 ## Architecture
@@ -64,18 +64,30 @@ node server\device_keys.js add simulator --kind simulator   # put the printed ke
 venv\Scripts\python.exe -m uvicorn backend_server:app --app-dir backend --host 127.0.0.1 --port 8000
 node server\server.js
 node server\simulation.js            # optional fake sensor network; --help for options
+
+# Scripted judge demo (SIMULATED data, PASS/FAIL checkpoint after each cue). --fresh runs on a
+# temporary copy of var\ with its own servers on ports 3100/8100 and never writes the real database.
+node server\simulation.js --scenario judges --fresh
 ```
 
-Open <http://localhost:3000/> (dashboard), `/officer.html` (officer map), `/sos.html` (citizen page, public), `/admin.html` (node registry — admin accounts only: `node server\create_user.js add <name> admin`; needs `OFFICER_API_KEY` in `.env`). React pages are served by default; `FRONTEND=classic` serves the original HTML pages instead.
+Open <http://localhost:3000/> (dashboard), `/officer.html` (officer map), `/sos.html` (citizen page, public), `/admin.html` (node registry and model card — admin accounts only: `node server\create_user.js add <name> admin`; needs `OFFICER_API_KEY` in `.env`). React pages are served by default; `FRONTEND=classic` serves the original HTML pages instead.
+
+**Emergency alarm (control room):** the dashboard and officer map pop up a full-screen alert and sound a siren for every confirmed HIGH/CRITICAL hazard until someone presses *Acknowledge* (an acknowledged hazard stays quiet unless it escalates to CRITICAL or has been gone for 10 minutes). Browsers only allow sound after one click on the page, so click the page once after opening it (the header shows "Click to enable sound" until then). Keep the alarm screen in its own browser window or on its own monitor rather than in a background tab, and in Chrome add the site under *Settings > Performance > Memory Saver > Always keep these sites active*: a discarded tab cannot alarm at all.
 
 ### Optional `.env` settings
 `OFFICER_API_KEY` (API access for scripts), `WHATSAPP_ACCESS_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID` / `WHATSAPP_VERIFY_TOKEN` / `WHATSAPP_ALERT_TEMPLATE` (without them WhatsApp runs in dry-run mode and only logs), `CDSE_CLIENT_ID` / `CDSE_CLIENT_SECRET` (Sentinel-1), `CAP_WEB_URL`, `SANJEEVNI_INGEST_KEY` (simulator).
 
 `WHATSAPP_APP_SECRET` is **required once WhatsApp is live**: incoming webhooks must carry Meta's `X-Hub-Signature-256`, and without the secret live webhooks are refused (dry-run mode accepts them unsigned for testing).
 
-Tuning (defaults are fine): `SANJEEVNI_BENCH_MODE=1` (tabletop rig only — tiny water-level thresholds), `SANJEEVNI_BENCH_MOUNT_M` (bench sensor height, default 0.0234 m), `SANJEEVNI_MAX_RIVER_LEVEL_M` (above this a reading is treated as a sensor fault, default 10), `SANJEEVNI_MAX_RIVER_RATE_M_PER_HR` (rise/fall rates are capped at this, default 5).
+Tuning (defaults are fine): `SANJEEVNI_BENCH_MODE=1` (tabletop rig only — tiny water-level thresholds), `SANJEEVNI_BENCH_MOUNT_M` (bench sensor height, default 0.0234 m), `SANJEEVNI_MAX_RIVER_LEVEL_M` (above this a reading is treated as a sensor fault, default 10), `SANJEEVNI_MAX_RIVER_RATE_M_PER_HR` (rise/fall rates are capped at this, default 5), `STALE_HAZARD_MINUTES` (web server: a hazard whose node has sent nothing for this long is shown as stale and does not sound the alarm, default 30).
 
-Abuse limits: an SOS is limited to 5 per hour per device and 30 per 10 minutes per network (the 429 message points people to 112); reports to 20 per 10 minutes per network.
+`WHATSAPP_VERIFY_TOKEN` must be set before Meta's one-time webhook verification can succeed: without it the verification GET is always refused.
+
+Abuse limits: an SOS is limited to 5 per hour per device and 30 per 10 minutes per network (the 429 message points people to 112); reports to 20 per 10 minutes per network. Request bodies are capped at 1 MB, except `POST /api/citizen-reports` (3 MB). A report photo must be a JPEG, PNG or WebP, which the server checks from the decoded bytes, at most 2 MB. All photos together are capped at `CITIZEN_UPLOADS_MAX_MB` (default 500); past that, reports are saved without the photo. Files under `/citizen_uploads/` are served with a sandbox CSP, so they can never run script. The web SOS endpoints refuse `whatsapp:` device IDs, which belong to SOS requests that come in through WhatsApp.
+
+Testing beside a running copy: `SANJEEVNI_PORT` (web server port, default 3000), `SANJEEVNI_BACKEND_URL` (default `http://127.0.0.1:8000`) and `SANJEEVNI_VAR_DIR` (database + uploads folder) let a second server run on a copy of the data.
+
+**Device keys:** to replace a leaked key, run `node server\device_keys.js revoke node-04` and then `... add node-04 --nodes NODE-04`. The old row is kept as `node-04.revoked-<id>`. A gateway's key must list **every** node it can hear in `--nodes`. If a batch contains only readings the key may not send, the server answers 403 and the device keeps those readings queued. In a mixed batch, the readings the key may not send are only logged (`[ingest] rejected reading ...`) and then dropped.
 
 ## Hardware
 
@@ -98,6 +110,7 @@ venv\Scripts\python.exe -m unittest discover -s tests -v       # confirmation ru
 venv\Scripts\python.exe tools\firmware_host_test\run_tests.py   # firmware logic on a PC, JSON accepted by the backend, wiring checks
 venv\Scripts\python.exe tools\firmware_build\compile_variants.py --cli <path>\arduino-cli.exe  # ESP32 compile: node (always-on, deep sleep LoRa/WiFi, tilt-only), gateway; deep sleep + MQ135 must be refused
 npm test --prefix frontend; npm run typecheck --prefix frontend # React: components, logic, axe accessibility checks
+node --test tools\demo\simulation.test.js tools\demo\run_demo.test.js   # simulator rain model + judge demo (name the files; a folder is not accepted)
 ```
 
 ## Known limitations
@@ -107,6 +120,8 @@ npm test --prefix frontend; npm run typecheck --prefix frontend # React: compone
 - Sentinel-1 revisits every 6–12 days: the satellite check corroborates after the fact, it does not trigger alerts.
 - WhatsApp alerts need a Meta Business account and an approved message template.
 - Sample SOPs in `data/sample_sops/` contain only general public guidance — replace them with the district's official SOPs.
+- Citizen advice (`data/hazard_advice.json`, used by the SOS page and WhatsApp alerts) is worded from those sample SOPs; its Hindi text still needs a native speaker's review. Hospital distances are straight-line, not road distance.
+- A hand-placed SOS location (`location_source: "manual"`) is only as good as the person's tap, and the map stays blank offline (typed coordinates still work). The device location always comes first and replaces a hand-placed point whenever it works. The classic `public/` pages neither send nor show this flag.
 
 ## Project layout
 
@@ -120,7 +135,8 @@ server/      Node web server (server.js: pages, login, SOS, WhatsApp, device-key
              simulation.js; paths.js = Node twin of backend/paths.py
 frontend/    React + TypeScript pages (Vite)     public/   original HTML pages (fallback)
 firmware/    ESP32 sketches (node, gateway, legacy)
-data/        hospitals.json, sample_sops/, training-CSV templates
+data/        hospitals.json, sample_sops/, hazard_advice.json (EN/HI citizen advice),
+             training-CSV templates
 docs/        wiring diagram (generated)          tests/, tools/   test suites, wiring generator,
                                                  ESP32 variant compiler
 var/         runtime data, git-ignored: sanjeevni.db, models/, chroma_db/, backups/,
@@ -130,6 +146,12 @@ var/         runtime data, git-ignored: sanjeevni.db, models/, chroma_db/, backu
 ## Team
 
 Team V.A.S.H.I.K.A.R.A.N (Team ID 153384) — Smart India Hackathon 2026. Repository: Cmay003/SIH-2026.
+
+## Data sources
+
+- Rain forecast (`forecast_rainfall_6h_mm`) and terrain elevation (used to derive each node's SCS curve number): [Weather data by Open-Meteo.com](https://open-meteo.com/), under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The backend changes the data: it sums the hourly forecast and turns elevation samples into a slope-adjusted curve number.
+- Elevation behind Open-Meteo's Elevation API: Copernicus DEM GLO-90 (2021 release), DOI [10.5270/ESA-c5d3d65](https://doi.org/10.5270/ESA-c5d3d65). Produced using Copernicus WorldDEM-90 © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018, provided under COPERNICUS by the European Union and ESA; all rights reserved.
+- Sentinel-1 radar flood cross-check: Copernicus Data Space Ecosystem (see `backend/satellite_check.py`).
 
 ## License
 

@@ -28,6 +28,9 @@ SOPS_DIR = os.path.join(DATA_DIR, "sample_sops")
 VAR_DIR = os.environ.get("SANJEEVNI_VAR_DIR") or os.path.join(ROOT, "var")
 DB_PATH = os.path.join(VAR_DIR, "sanjeevni.db")
 MODELS_DIR = os.path.join(VAR_DIR, "models")
+# Written by ml/evaluate_models.py, served by GET /api/model-card (Python
+# only - server.js just proxies the endpoint, so paths.js needs no twin).
+MODEL_CARD_PATH = os.path.join(MODELS_DIR, "model_card.json")
 CHROMA_DIR = os.path.join(VAR_DIR, "chroma_db")
 EDGE_BUILD_DIR = os.path.join(VAR_DIR, "edge_ai_build")
 CHARTS_DIR = VAR_DIR  # feature_importance.png etc. from the demo scripts

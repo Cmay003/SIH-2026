@@ -13,13 +13,14 @@
 #include <stdint.h>
 #include <string.h>
 
-#define SJ_SLEEP_MAGIC 0x534A5331u  // "SJS1" - bump if SjSleepState changes
+#define SJ_SLEEP_MAGIC 0x534A5332u  // "SJS2" (session became 32-bit) - bump if SjSleepState changes
 
 struct SjSleepState {
   uint32_t magic;
-  uint16_t session;       // kept across wakes: reading_uid stays session-seq
+  uint32_t session;       // kept across wakes: reading_uid stays session-seq
   uint8_t elevated;       // last reading was elevated -> short sleep
   uint8_t rainWakeOff;    // rain pin stuck low: don't wake on it this cycle
+  uint8_t reserved[2];    // explicit padding, so the checksum covers no garbage
   uint32_t seq;           // last sequence number used
   uint32_t nextWakeS;     // when the next MEASUREMENT is due (sjClock seconds)
   float pendingRainMm;    // rain since the last QUEUED reading
@@ -47,7 +48,7 @@ inline void sjSleepStateSeal(SjSleepState& s) {
   s.check = sjSleepChecksum(s);
 }
 
-inline void sjSleepStateReset(SjSleepState& s, uint16_t session) {
+inline void sjSleepStateReset(SjSleepState& s, uint32_t session) {
   memset(&s, 0, sizeof(s));
   s.session = session;
   sjSleepStateSeal(s);
@@ -70,4 +71,23 @@ inline uint32_t sjRemainingS(uint32_t nowS, uint32_t nextWakeS) {
 // a second or two).
 inline bool sjRainWakeShouldResleep(uint32_t nowS, uint32_t nextWakeS, uint32_t slackS) {
   return sjRemainingS(nowS, nextWakeS) > slackS;
+}
+
+// Sends a backlog one flush (= one batch) at a time until the queue is
+// empty, a flush fails, or `budgetMs` has passed since `startMs` - so a
+// battery node never stays awake much past its budget: at most one batch
+// (one request's timeout) over it. Each flush must send ONE batch only;
+// the WiFi flushQueue() used to drain the whole queue inside a single
+// call, so a 2000-reading backlog kept a deep-sleep node awake for
+// minutes despite DEEP_SLEEP_MAX_AWAKE_MS (review B). Returns how many
+// flushes ran.
+template <typename HasMore, typename FlushOnce, typename NowMs>
+inline uint32_t sjDrainWithinBudget(HasMore hasMore, FlushOnce flushOnce, NowMs nowMs, uint32_t startMs,
+                                    uint32_t budgetMs) {
+  uint32_t flushes = 0;
+  while (hasMore() && (uint32_t)(nowMs() - startMs) < budgetMs) {
+    flushes++;
+    if (!flushOnce()) break;
+  }
+  return flushes;
 }

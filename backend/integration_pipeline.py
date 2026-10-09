@@ -66,22 +66,108 @@ print(f"[pipeline] bench mode {'ON - tabletop thresholds active' if HARDWARE_TES
 # fault, full stop - checked BEFORE the anomaly model, because Isolation
 # Forest scores every value beyond its training range about the same, so a
 # 14 m "river" could slip through as a flood (B32).
+#
+# The firmware sends gas_ppm through sjClampU16, so a pegged MQ135 (Rs near
+# 0 in a big leak - or a shorted pin) arrives as exactly 65535. That is a
+# SATURATED-HIGH reading, not an impossible one: calling it a sensor fault
+# hid the largest leaks of all. Anything above GAS_SATURATED_PPM is beyond
+# the MQ135's calibrated range, so it is classified as a (very high) gas
+# reading and flagged "saturated"; only values the firmware cannot send at
+# all (> 65535) are impossible. A shorted pin that reads 65535 is still
+# held back from the public by the multi-node cross-check
+# (hazard_confirmation.py), so this trades no extra public false alarms.
+GAS_FIRMWARE_CLAMP_PPM = 65535.0
+GAS_SATURATED_PPM = 50000.0
 PHYSICAL_LIMITS = {
     "river_level_m": (0.0, float(os.environ.get("SANJEEVNI_MAX_RIVER_LEVEL_M", "10"))),
     "temp_c": (-40.0, 70.0),
     "humidity_pct": (0.0, 100.0),
-    "gas_ppm": (0.0, 50000.0),
+    "gas_ppm": (0.0, GAS_FIRMWARE_CLAMP_PPM),
     "flame_reading": (0.0, 1.0),
 }
+# Rain gauge range check. Rain arrives as mm since the previous report, so
+# the believable maximum depends on how long ago that report was: the
+# firmware keeps adding to pendingRainMm across intervals when a queue push
+# fails, so one report can legitimately carry several intervals' rain.
+# A cap in mm/h, scaled by the time since the previous reading, allows
+# that; a flat cap would either reject a real catch-up report or let a
+# 300 mm glitch through. One impossible value used to land in the rain log
+# and raise a landslide WATCH that re-scored itself for up to 24 h.
+# Kept OUT of the pydantic model on purpose: a Field limit would 422 the
+# whole /api/ingest/batch and the node would retry it forever (review R7).
+RAIN_MAX_MM_PER_HR = 300.0       # about the 1 h world record; no gauge reports more
+RAIN_MAX_MM_PER_READING = 400.0  # hard cap, even after a long gap
+RAIN_MIN_GAP_HOURS = 1 / 6       # floor, so a 5 s interval still allows a real burst
+
+
+def rain_reading_plausible(mm, hours_since_prev) -> bool:
+    """False when `mm` (rain since the previous report) is more than any
+    working gauge could have caught in `hours_since_prev` hours (None = no
+    previous reading known). Negative is always a fault; None (no value)
+    is not."""
+    if mm is None:
+        return True
+    if mm < 0:
+        return False
+    hours = RAIN_MIN_GAP_HOURS if hours_since_prev is None else max(RAIN_MIN_GAP_HOURS, hours_since_prev)
+    return mm <= min(RAIN_MAX_MM_PER_READING, RAIN_MAX_MM_PER_HR * hours)
+
+
+# Values the backend derives FROM a sensor field. When the field is a fault
+# its derived values are garbage too (a 14 m spike makes a huge "rise"
+# rate, which alone could pass is_flood_signature), so they go with it.
+DERIVED_FROM = {
+    "river_level_m": ("river_level_rate_m_per_hr",),
+    "gas_ppm": ("gas_ppm_rate_per_hr",),
+}
+
+
+def implausible_fields(reading: dict) -> list[str]:
+    """Every field outside what a working sensor can report."""
+    return [
+        field
+        for field, (low, high) in PHYSICAL_LIMITS.items()
+        if reading.get(field) is not None and not (low <= reading[field] <= high)
+    ]
 
 
 def physically_implausible(reading: dict) -> str | None:
     """Name of the first field outside what a working sensor can report."""
-    for field, (low, high) in PHYSICAL_LIMITS.items():
-        value = reading.get(field)
-        if value is not None and not (low <= value <= high):
-            return field
-    return None
+    faults = implausible_fields(reading)
+    return faults[0] if faults else None
+
+
+def drop_implausible_fields(reading: dict) -> tuple[dict, list[str]]:
+    """(copy of reading with every faulty field - and what was derived from
+    it - set to None, list of faulty fields). Modular nodes treat each
+    sensor independently (P2.7), so one bad channel removes only that
+    channel: suppressing the WHOLE reading let a floating MQ135 pin hide a
+    real flood on the same node (B32 fix was too broad).
+
+    Faults the caller already found are in reading["sensor_faults"]: a
+    check that needs context this dict lacks (rain_reading_plausible needs
+    the time since the previous reading) is done in derive_features, and
+    reported here the same way as a PHYSICAL_LIMITS fault."""
+    faults = implausible_fields(reading)
+    for field in reading.get("sensor_faults") or ():
+        if field not in faults:
+            faults.append(field)
+    if not faults:
+        return reading, []
+    clean = dict(reading)
+    for field in faults:
+        clean[field] = None
+        for derived in DERIVED_FROM.get(field, ()):
+            if derived in clean:
+                clean[derived] = None
+    return clean, faults
+
+
+def saturated_fields(reading: dict) -> list[str]:
+    """Sensors pinned at (or near) the top of their range - see
+    GAS_SATURATED_PPM. The true value is at least this high."""
+    gas = reading.get("gas_ppm")
+    return ["gas_ppm"] if gas is not None and gas >= GAS_SATURATED_PPM else []
 
 
 # A flood announces itself physically: the water rises fast WHILE it rains
@@ -151,6 +237,20 @@ def is_hazard_signature(reading: dict) -> bool:
         if result["severity"] in ("MEDIUM", "HIGH", "CRITICAL"):
             return True
     return False
+
+
+# One line added to a landslide alert saying WHY it fired, so a reader
+# can tell a rain WATCH (nothing has moved yet) from measured movement.
+# SAFETY-CRITICAL TEXT - shown to officers and, once confirmed, sent to
+# citizens: needs human review (wording, and a Hindi version) before
+# field use.
+LANDSLIDE_TRIGGER_TEXT = {
+    "rain": "Trigger: rainfall is above the landslide warning threshold for this slope. "
+            "No ground movement has been measured yet.",
+    "tilt": "Trigger: ground tilt or vibration measured at the sensor.",
+    "both": "Trigger: rainfall is above the landslide warning threshold AND ground "
+            "movement has been measured at the sensor.",
+}
 
 
 def train_flood_model():
@@ -332,16 +432,49 @@ def process_reading(
     rag_collection,
     rag_embedder,
 ):
-    impossible_field = physically_implausible(reading)
-    if impossible_field:
-        return {
-            "status": "suppressed",
-            "reason": f"physically_impossible_{impossible_field}",
-            "hazard_type": "sensor_fault",
-            "risk_score": 0.0,
-            "severity": "N/A",
-        }
+    # Faulty fields are dropped BEFORE the anomaly model (B32: Isolation
+    # Forest scores every value beyond its training range about the same,
+    # so a 14 m "river" could slip through as a flood) - but only those
+    # fields; the node's other sensors are still classified.
+    clean, sensor_faults = drop_implausible_fields(reading)
+    result = _classify_reading(
+        clean, anomaly_model, anomaly_scaler, flood_model, flood_feature_cols,
+        rag_collection, rag_embedder,
+    )
+    if sensor_faults:
+        if result["status"] != "alert_dispatched":
+            # Nothing else on the node is elevated: report the reading as
+            # the sensor fault it is (as before), so maintainers see it and
+            # the river forecast keeps skipping it.
+            return {
+                "status": "suppressed",
+                "reason": "physically_impossible_" + ",".join(sensor_faults),
+                "hazard_type": "sensor_fault",
+                "risk_score": 0.0,
+                "severity": "N/A",
+                "sensor_faults": sensor_faults,
+                "hazard_scores": result.get("hazard_scores", {}),
+            }
+        result["sensor_faults"] = sensor_faults
+    saturated = saturated_fields(clean)
+    if saturated:
+        result["saturated_sensors"] = saturated
+    return result
 
+
+def _classify_reading(
+    reading: dict,
+    anomaly_model,
+    anomaly_scaler,
+    flood_model,
+    flood_feature_cols,
+    rag_collection,
+    rag_embedder,
+):
+    """process_reading() minus the physical range check. `reading` must
+    already have its faulty fields set to None."""
+    # check_anomaly skips the Isolation Forest when any of its five inputs
+    # is missing - which includes a field just dropped as faulty.
     is_anomaly, anomaly_score = check_anomaly(reading, anomaly_model, anomaly_scaler)
     hazard_signature = is_hazard_signature(reading)
 
@@ -395,9 +528,10 @@ def process_reading(
         flood_explanation = explain_flood_risk(reading, flood_model, flood_feature_cols)
 
     for hazard_type, result in classify_all_hazards(reading).items():
+        # Keep any extra detail a classifier adds (air pollution's
+        # responsible_pollutant) so it reaches hazard_scores / the API.
         candidates[hazard_type] = {
-            "risk_score": result["risk_score"],
-            "severity": result["severity"],
+            **result,
             "severity_source": "threshold_classifier",
         }
 
@@ -426,6 +560,12 @@ def process_reading(
     severity = winner["severity"]
     severity_source = winner["severity_source"]
     explanation = flood_explanation if hazard_type == "flood" else []
+    # What raised a landslide result ("rain" / "tilt" / "both") - lifted
+    # to the top level so the map popup, CAP and the WhatsApp gate can
+    # tell an early rain WATCH from measured ground movement without
+    # digging into hazard_scores.
+    trigger = winner.get("trigger")
+    extra = {"trigger": trigger} if trigger else {}
 
     if severity == "LOW":
         return {
@@ -436,6 +576,7 @@ def process_reading(
             "severity_source": severity_source,
             "explanation": explanation,
             "hazard_scores": candidates,
+            **extra,
         }
 
     message = generate_alert_message(
@@ -445,6 +586,7 @@ def process_reading(
         collection=rag_collection,
         embedder=rag_embedder,
         use_llm=False,  # flip to True once ANTHROPIC_API_KEY is set
+        detail=LANDSLIDE_TRIGGER_TEXT.get(trigger) if hazard_type == "landslide" else None,
     )
     return {
         "status": "alert_dispatched",
@@ -455,6 +597,7 @@ def process_reading(
         "message": message,
         "explanation": explanation,
         "hazard_scores": candidates,
+        **extra,
     }
 
 

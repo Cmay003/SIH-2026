@@ -1,8 +1,12 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import L from "leaflet";
+import { useRef } from "react";
+import { MapContainer } from "react-leaflet";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setUnauthorizedHandler } from "../api/client";
-import type { HazardZone } from "../api/types";
+import type { HazardZone, SosRequest } from "../api/types";
+import { FocusOnNode, SosMarkers, sosZIndexOffset, type FocusRequest } from "../components/officerMap";
 import { evaluateArea, sosGate } from "../lib/sos";
 import { OfficerPage } from "../pages/OfficerPage";
 import { SosPage } from "../pages/SosPage";
@@ -118,6 +122,127 @@ describe("Citizen SOS page", () => {
     expect(await screen.findByText(/Tap SOS if you need emergency help/)).toBeInTheDocument();
   });
 
+  it("shows UNKNOWN (not 'LOW RISK / 0') while the location is unknown", async () => {
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      geolocation: {
+        getCurrentPosition: (_ok: PositionCallback, err: PositionErrorCallback) =>
+          err({ code: 1, message: "User denied Geolocation" } as GeolocationPositionError),
+      },
+    });
+    routeFetch({
+      "/api/status": () => json(200, { ok: true }),
+      "/api/hazard-zones": () => json(200, { success: true, zones: [zone({ severity: "CRITICAL" })] }),
+    });
+    renderSos();
+    expect(await screen.findByText("UNKNOWN")).toBeInTheDocument();
+    expect(await screen.findByText(/Share your location to check the hazard level/)).toBeInTheDocument();
+    expect(screen.queryByText("LOW RISK")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "SOS" })).toBeDisabled();
+  });
+
+  // B54: a fresh fix that times out used to cancel the SOS, although a
+  // position from moments earlier was already known.
+  describe("when the confirming location fix fails", () => {
+    const first = { latitude: 29.3919, longitude: 79.4542 };
+    /** getCurrentPosition answers from this list in order; the last answer repeats */
+    function scriptedGeolocation(answers: ({ coords: typeof first } | { code: number; message: string })[]) {
+      const calls: PositionOptions[] = [];
+      vi.stubGlobal("navigator", {
+        ...navigator,
+        geolocation: {
+          getCurrentPosition: (ok: PositionCallback, err: PositionErrorCallback, options: PositionOptions) => {
+            const answer = answers[Math.min(calls.length, answers.length - 1)];
+            calls.push(options);
+            if ("coords" in answer) ok({ coords: answer.coords } as GeolocationPosition);
+            else err(answer as GeolocationPositionError);
+          },
+        },
+      });
+      return calls;
+    }
+    function sosRoutes() {
+      const posted: Record<string, unknown>[] = [];
+      routeFetch({
+        "/api/status": () => json(200, { ok: true }),
+        "/api/hazard-zones": () => json(200, { success: true, zones: [zone()] }),
+        "/api/nearest-hospital": () => json(200, { hospital: "District Hospital", distance_km: 1.2, maps_url: "https://maps.example/a" }),
+        "/api/sos": (init) => {
+          posted.push(JSON.parse(String(init?.body)));
+          return json(201, { status: "received", sos_id: 7, hospital: "District Hospital", distance_km: 1.2, maps_url: "https://maps.example/a" });
+        },
+      });
+      const fetchSpy = vi.mocked(globalThis.fetch);
+      const original = fetchSpy.getMockImplementation()!;
+      fetchSpy.mockImplementation(async (input, init) =>
+        String(input).startsWith("/api/sos/device/") ? json(200, { active: posted.length > 0, sos_id: 7,
+          hospital: "District Hospital", distance_km: 1.2, maps_url: "https://maps.example/a" }) : original(input, init));
+      return posted;
+    }
+
+    it("sends the SOS with the earlier position when both fresh fixes time out", async () => {
+      const calls = scriptedGeolocation([{ coords: first }, { code: 3, message: "Timeout expired" }]);
+      const posted = sosRoutes();
+      renderSos();
+      const sos = await screen.findByRole("button", { name: "SOS" });
+      await waitFor(() => expect(sos).toBeEnabled());
+      await userEvent.click(sos);
+
+      expect(await screen.findByText("Help is on the way")).toBeInTheDocument();
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject(first);
+      // precise fix, then a quick coarse one, before falling back
+      expect(calls.slice(1)).toEqual([
+        expect.objectContaining({ enableHighAccuracy: true }),
+        expect.objectContaining({ enableHighAccuracy: false, maximumAge: 60_000 }),
+      ]);
+      expect(screen.getByText(/location found earlier \(29\.3919, 79\.4542\) was sent/)).toBeInTheDocument();
+      expect(screen.queryByText(/enable location access/)).not.toBeInTheDocument();
+    });
+
+    it("uses the quick coarse fix when only the precise one times out", async () => {
+      const moved = { latitude: 29.4, longitude: 79.46 };
+      scriptedGeolocation([{ coords: first }, { code: 3, message: "Timeout expired" }, { coords: moved }]);
+      const posted = sosRoutes();
+      renderSos();
+      const sos = await screen.findByRole("button", { name: "SOS" });
+      await waitFor(() => expect(sos).toBeEnabled());
+      await userEvent.click(sos);
+
+      expect(await screen.findByText("Help is on the way")).toBeInTheDocument();
+      expect(posted[0]).toMatchObject(moved);
+      expect(screen.queryByText(/location found earlier/)).not.toBeInTheDocument();
+    });
+
+    it("does not ask again after a refusal, and still sends with the earlier position", async () => {
+      const calls = scriptedGeolocation([{ coords: first }, { code: 1, message: "User denied Geolocation" }]);
+      const posted = sosRoutes();
+      renderSos();
+      const sos = await screen.findByRole("button", { name: "SOS" });
+      await waitFor(() => expect(sos).toBeEnabled());
+      await userEvent.click(sos);
+
+      expect(await screen.findByText("Help is on the way")).toBeInTheDocument();
+      expect(posted[0]).toMatchObject(first);
+      expect(calls).toHaveLength(2); // no coarse retry: a refusal won't change
+    });
+  });
+
+  it("only a refusal asks the user to enable location access", async () => {
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      geolocation: {
+        getCurrentPosition: (_ok: PositionCallback, err: PositionErrorCallback) =>
+          err({ code: 3, message: "Timeout expired" } as GeolocationPositionError),
+      },
+    });
+    routeFetch({ "/api/status": () => json(200, { ok: true }), "/api/hazard-zones": () => json(200, { success: true, zones: [] }) });
+    renderSos();
+    await userEvent.click(screen.getByRole("button", { name: "Get My Location" }));
+    expect(await screen.findByText(/Could not get location: Timeout expired\. Please try again/)).toBeInTheDocument();
+    expect(screen.queryByText(/enable location access/)).not.toBeInTheDocument();
+  });
+
   it("switches to Hindi and remembers the choice", async () => {
     mockGeolocation();
     routeFetch({ "/api/status": () => json(200, { ok: true }), "/api/hazard-zones": () => json(200, { success: true, zones: [] }) });
@@ -128,7 +253,27 @@ describe("Citizen SOS page", () => {
   });
 });
 
-describe("Officer page", () => {
+const sosRow = (id: number) => ({
+  id, device_id: `dev-${id}`, latitude: 29.39, longitude: 79.45, note: null, status: "open",
+  timestamp: new Date().toISOString(), escalated: false, minutes_open: 3, nearest_hospital: "H",
+  hospital_distance_km: 1, hospital_route_url: "https://maps.example/h", responder_route_url: "https://maps.example/r",
+});
+
+/** The officer page's GET routes; `sos` is read on every poll. */
+const officerRoutes = (sos: () => ReturnType<typeof sosRow>[], zones: HazardZone[] = []) => ({
+  "/api/auth/me": () => json(200, { user: { username: "o", role: "officer" }, idle_timeout_minutes: 60 }),
+  "/api/hazard-zones": () => json(200, { success: true, zones }),
+  "/api/sos": () => {
+    const data = sos();
+    return json(200, { success: true, count: data.length, escalated_count: 0, invalid_location_count: 0, data });
+  },
+  "/api/node-health": () => json(200, { generated_at: "", summary: { online: 1, offline: 0, never_seen: 0 }, nodes_with_issues: 0, nodes: [] }),
+});
+
+// The officer page loads auth, zones, SOS and node health and draws the map
+// before the first assertion; on a busy PC (Python suite running alongside)
+// that passed the 1 s findBy default, so the first wait in each test gets 5 s.
+describe("Officer page", { timeout: 30_000 }, () => {
   it("shows SOS count, escalations and node problems - hostile text stays text", async () => {
     const hostile = '<img src=x onerror="window.__xss=1">';
     routeFetch({
@@ -144,7 +289,7 @@ describe("Officer page", () => {
       }),
     });
     const { container } = render(<Providers><OfficerPage /></Providers>);
-    expect(await screen.findByText("2 online, 1 offline", { exact: false })).toBeInTheDocument();
+    expect(await screen.findByText("2 online, 1 offline", { exact: false }, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByText("1 escalated")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Resolve all" })).toBeInTheDocument();
     expect(screen.getByText("No report for 7 min (expected every 60s)")).toBeInTheDocument();
@@ -152,6 +297,54 @@ describe("Officer page", () => {
     expect(container.querySelector("img[src='x']")).toBeNull();
     expect((window as unknown as { __xss?: number }).__xss).toBeUndefined();
     expect(await screen.findByText("officer1")).toBeInTheDocument();
+  });
+
+  // B42: "Resolve all" used to POST no body and the server closed every
+  // open row - including SOS requests that arrived while the confirm dialog
+  // was open and that nobody had seen.
+  it("'Resolve all' resolves only the SOS requests on screen when the dialog opened", async () => {
+    let open = [sosRow(11), sosRow(12)];
+    let resolveBody: unknown = null;
+    routeFetch({
+      ...officerRoutes(() => open),
+      "/api/sos/resolve-all": (init) => {
+        resolveBody = JSON.parse(String(init?.body));
+        return json(200, { status: "ok", resolved_count: 2 });
+      },
+    });
+    // A citizen sends SOS #13 while the officer reads the confirm dialog
+    const confirm = vi.spyOn(window, "confirm").mockImplementation((message) => {
+      open = [...open, sosRow(13)];
+      expect(String(message)).toMatch(/the 2 SOS requests listed here/);
+      return true;
+    });
+    render(<Providers><OfficerPage /></Providers>);
+    await userEvent.click(await screen.findByRole("button", { name: "Resolve all" }, { timeout: 5000 }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(resolveBody).toEqual({ ids: [11, 12] }));
+  });
+
+  it("'Resolve all' sends nothing when the officer cancels", async () => {
+    let resolveCalled = false;
+    routeFetch({
+      ...officerRoutes(() => [sosRow(5)]),
+      "/api/sos/resolve-all": () => {
+        resolveCalled = true;
+        return json(200, { status: "ok", resolved_count: 1 });
+      },
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<Providers><OfficerPage /></Providers>);
+    await userEvent.click(await screen.findByRole("button", { name: "Resolve all" }, { timeout: 5000 }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(resolveCalled).toBe(false);
+  });
+
+  it("?focus= for a zone that has ended says so instead of 'Showing ...'", async () => {
+    vi.stubGlobal("location", { ...window.location, search: "?focus=NODE-09", pathname: "/officer.html", replace: vi.fn() });
+    routeFetch(officerRoutes(() => [], [zone()])); // NODE-04 only
+    render(<Providers><OfficerPage /></Providers>);
+    expect(await screen.findByText("NODE-09 has no active hazard zone on the map")).toBeInTheDocument();
   });
 
   it("shows the all-clear when there are no open SOS requests", async () => {
@@ -165,5 +358,77 @@ describe("Officer page", () => {
     expect(await screen.findByText(/All SOS requests resolved/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Resolve all" })).toBeNull();
     expect(await screen.findByText("All nodes reporting normally")).toBeInTheDocument();
+  });
+});
+
+// B63: a focus request for a zone that is gone used to stay pending and fly
+// the map there hours later, when the node raised a new hazard.
+describe("FocusOnNode", () => {
+  type Props = { request: FocusRequest | null; zones: HazardZone[]; loaded: boolean; onMissing?: (r: FocusRequest) => void };
+  function Harness(p: Props) {
+    const markerRefs = useRef(new Map<string, L.Marker>());
+    return (
+      <MapContainer center={[29.39, 79.45]} zoom={12}>
+        <FocusOnNode request={p.request} zones={p.zones} loaded={p.loaded} markerRefs={markerRefs} onMissing={p.onMissing} />
+      </MapContainer>
+    );
+  }
+  function renderFocus(props: Props) {
+    const flyTo = vi.spyOn(L.Map.prototype, "flyTo").mockImplementation(function (this: L.Map) { return this; });
+    const utils = render(<Harness {...props} />);
+    return { flyTo, rerender: (p: Props) => utils.rerender(<Harness {...p} />) };
+  }
+
+  it("waits for the first zone list, then drops a request whose zone is gone", () => {
+    const request = { nodeId: "NODE-04", seq: 1 };
+    const onMissing = vi.fn();
+    const { flyTo, rerender } = renderFocus({ request, zones: [], loaded: false, onMissing });
+    expect(onMissing).not.toHaveBeenCalled(); // still loading - keep waiting
+    rerender({ request, zones: [zone({ node_id: "NODE-07" })], loaded: true, onMissing });
+    expect(onMissing).toHaveBeenCalledWith(request);
+    // hours later NODE-04 raises a new hazard: the old request must not fire
+    rerender({ request, zones: [zone()], loaded: true, onMissing });
+    expect(flyTo).not.toHaveBeenCalled();
+    expect(onMissing).toHaveBeenCalledTimes(1);
+  });
+
+  it("still flies to a zone that arrives with the first zone list", () => {
+    const request = { nodeId: "NODE-04", seq: 1 };
+    const onMissing = vi.fn();
+    const { flyTo, rerender } = renderFocus({ request, zones: [], loaded: false, onMissing });
+    act(() => rerender({ request, zones: [zone()], loaded: true, onMissing }));
+    expect(flyTo).toHaveBeenCalledTimes(1);
+    expect(onMissing).not.toHaveBeenCalled();
+  });
+});
+
+describe("SOS pin stacking (overlapping pins at district zoom)", () => {
+  it("puts escalated SOS on top, then the longest-open, all above hazard icons", () => {
+    const off = (escalated: boolean, minutes_open: number) => sosZIndexOffset({ escalated, minutes_open });
+    expect(off(true, 0)).toBeGreaterThan(off(false, 999));
+    expect(off(true, 0)).toBeGreaterThan(off(false, 50_000)); // the cap keeps it below every escalated one
+    expect(off(false, 30)).toBeGreaterThan(off(false, 5));
+    expect(off(true, 30)).toBeGreaterThan(off(true, 5));
+    for (const v of [off(false, 0), off(false, -3), off(false, Number.NaN), off(true, 0)]) {
+      expect(v).toBeGreaterThan(0); // hazard markers use Leaflet's default offset 0
+    }
+  });
+
+  it("is applied to the Leaflet markers", () => {
+    const sos = (id: number, escalated: boolean, minutes_open: number): SosRequest => ({
+      id, latitude: 29.39, longitude: 79.45, location_source: "gps", note: null, status: "open",
+      timestamp: new Date().toISOString(), escalated, minutes_open, nearest_hospital: "H", hospital_distance_km: 1,
+      hospital_route_url: "https://maps.example/h", responder_route_url: "https://maps.example/r",
+    });
+    const refs = { current: new Map<string, L.Marker>() };
+    render(
+      <Providers>
+        <MapContainer center={[29.39, 79.45]} zoom={12}>
+          <SosMarkers requests={[sos(1, false, 40), sos(2, true, 2)]} markerRefs={refs} />
+        </MapContainer>
+      </Providers>,
+    );
+    expect(refs.current.get("sos:1")!.options.zIndexOffset).toBe(1040);
+    expect(refs.current.get("sos:2")!.options.zIndexOffset).toBe(2002);
   });
 });

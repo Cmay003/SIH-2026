@@ -1,0 +1,269 @@
+{
+  "_about": "What citizens should do, per hazard type. ONE table shared by server/server.js (WhatsApp alert template {{4}}) and the citizen SOS page (frontend/src/lib/advice.ts, bundled at build time). Wording is taken from data/sample_sops/ (the source file is named per hazard): citizen actions only, not authority actions. MEDIUM uses the SOP's MEDIUM paragraph; HIGH is used for HIGH and CRITICAL. 'whatsapp' must stay ONE line (Meta rejects template parameters with newlines or tabs) - the English lines are unchanged from the old HAZARD_ADVICE in server.js. Keys must match the backend's hazard_type values. Safety-critical text: a domain expert must check it against the official district SOPs before a real deployment.",
+  "_hi_status": "needs native-speaker review - every Hindi ('hi') string in this file was written without a native-speaker check",
+  "hi_reviewed": false,
+  "hazards": {
+    "flood": {
+      "source": "flood_response.txt",
+      "name": { "en": "Flood", "hi": "बाढ़" },
+      "whatsapp": {
+        "en": "Move to higher ground and avoid flooded roads and bridges.",
+        "hi": "ऊँचे स्थान पर जाएँ और पानी भरी सड़कों व पुलों से बचें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "If you live in a low-lying area or near the riverbank, move valuables to higher ground.",
+            "Keep drains and drainage channels near your home clear.",
+            "Watch for further updates from local authorities."
+          ],
+          "hi": [
+            "यदि आप निचले इलाके में या नदी किनारे रहते हैं, तो कीमती सामान ऊँचे स्थान पर रखें।",
+            "अपने घर के पास की नालियाँ साफ़ रखें।",
+            "स्थानीय प्रशासन की आगे की सूचनाओं पर ध्यान दें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Move to higher ground immediately.",
+            "Do not cross flooded roads or bridges.",
+            "Follow evacuation instructions from local authorities and go to a relief shelter if told to."
+          ],
+          "hi": [
+            "तुरंत ऊँचे स्थान पर जाएँ।",
+            "पानी भरी सड़कें या पुल पार न करें।",
+            "स्थानीय प्रशासन के निकासी निर्देशों का पालन करें और कहे जाने पर राहत शिविर में जाएँ।"
+          ]
+        }
+      }
+    },
+    "gas leak": {
+      "source": "gas_leak_response.txt",
+      "name": { "en": "Gas leak", "hi": "गैस रिसाव" },
+      "whatsapp": {
+        "en": "Leave the area, avoid flames and electrical switches.",
+        "hi": "क्षेत्र छोड़ दें, आग और बिजली के स्विच से दूर रहें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Open doors and windows to let fresh air in.",
+            "Do not light flames or use anything that can spark nearby.",
+            "Watch for instructions from local authorities."
+          ],
+          "hi": [
+            "ताज़ी हवा के लिए दरवाज़े और खिड़कियाँ खोलें।",
+            "पास में आग न जलाएँ और चिंगारी पैदा करने वाली कोई चीज़ इस्तेमाल न करें।",
+            "स्थानीय प्रशासन के निर्देशों पर ध्यान दें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Leave the area now and move at least 150 metres away.",
+            "Do not use electrical switches or open flames in the area.",
+            "Once you are safely away, call 112 or the fire service."
+          ],
+          "hi": [
+            "अभी क्षेत्र छोड़ें और कम से कम 150 मीटर दूर चले जाएँ।",
+            "इस क्षेत्र में बिजली के स्विच या खुली आग का उपयोग न करें।",
+            "सुरक्षित दूरी पर पहुँचकर 112 या दमकल सेवा को कॉल करें।"
+          ]
+        }
+      }
+    },
+    "fire": {
+      "source": "fire_response.txt",
+      "name": { "en": "Forest fire", "hi": "जंगल की आग" },
+      "whatsapp": {
+        "en": "Move away from the fire and follow official evacuation advice.",
+        "hi": "आग से दूर जाएँ और आधिकारिक निकासी सलाह का पालन करें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Do not enter the affected forest area.",
+            "Stay alert and be ready to leave if local authorities ask you to."
+          ],
+          "hi": [
+            "प्रभावित वन क्षेत्र में प्रवेश न करें।",
+            "सतर्क रहें और स्थानीय प्रशासन के कहने पर निकलने के लिए तैयार रहें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "If you are within 2 km of the fire, leave now.",
+            "Avoid the affected area until it is declared safe.",
+            "Follow instructions from the fire service and the forest department."
+          ],
+          "hi": [
+            "यदि आप आग से 2 किमी के भीतर हैं, तो अभी निकल जाएँ।",
+            "सुरक्षित घोषित होने तक प्रभावित क्षेत्र से दूर रहें।",
+            "दमकल सेवा और वन विभाग के निर्देशों का पालन करें।"
+          ]
+        }
+      }
+    },
+    "extreme heat": {
+      "source": "extreme_heat_response.txt",
+      "name": { "en": "Extreme heat", "hi": "अत्यधिक गर्मी (लू)" },
+      "whatsapp": {
+        "en": "Drink water often, stay out of the sun 12-3 pm, call 112 for heatstroke.",
+        "hi": "बार-बार पानी पिएँ, दोपहर 12 से 3 बजे तक धूप से बचें, लू लगने पर 112 पर कॉल करें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Drink water often, even if you are not thirsty, and use ORS.",
+            "Avoid hard outdoor work between 12 noon and 3 pm.",
+            "Wear light, loose cotton clothes and check on elderly people, young children and outdoor workers."
+          ],
+          "hi": [
+            "प्यास न लगे तब भी बार-बार पानी पिएँ और ओआरएस लें।",
+            "दोपहर 12 से 3 बजे के बीच बाहर भारी काम न करें।",
+            "हल्के, ढीले सूती कपड़े पहनें और बुज़ुर्गों, छोटे बच्चों व बाहर काम करने वालों का हाल पूछते रहें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Stay in shade or a cool place; use a cooling shelter if one is open nearby.",
+            "Drink water often and use ORS.",
+            "If someone is confused, has hot dry skin or faints: move them to shade, cool them with water and call 112."
+          ],
+          "hi": [
+            "छाया या ठंडी जगह में रहें; पास में शीतल आश्रय खुला हो तो वहाँ जाएँ।",
+            "बार-बार पानी पिएँ और ओआरएस लें।",
+            "यदि किसी को भ्रम हो, त्वचा गर्म और सूखी हो या वह बेहोश हो जाए: उसे छाया में ले जाएँ, पानी से ठंडा करें और 112 पर कॉल करें।"
+          ]
+        }
+      }
+    },
+    "landslide": {
+      "source": "landslide_response.txt",
+      "name": { "en": "Landslide", "hi": "भूस्खलन" },
+      "whatsapp": {
+        "en": "Move away from the slope and avoid hill roads nearby.",
+        "hi": "ढलान से दूर जाएँ और पास की पहाड़ी सड़कों पर यात्रा न करें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Avoid travel on hill roads near the affected slope.",
+            "Watch for new cracks, tilting trees or poles and sudden muddy water in streams, and report them to local authorities."
+          ],
+          "hi": [
+            "प्रभावित ढलान के पास की पहाड़ी सड़कों पर यात्रा न करें।",
+            "नई दरारें, झुकते पेड़ या खंभे और नालों में अचानक मटमैला पानी दिखे तो स्थानीय प्रशासन को बताएँ।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "If your house is on or directly below the slope, leave now and move to stable ground away from it.",
+            "Do not travel on roads through the slide zone.",
+            "Do not return until authorities declare the area safe."
+          ],
+          "hi": [
+            "यदि आपका घर ढलान पर या उसके ठीक नीचे है, तो अभी निकलें और ढलान से दूर स्थिर ज़मीन पर जाएँ।",
+            "भूस्खलन क्षेत्र से गुज़रने वाली सड़कों पर यात्रा न करें।",
+            "प्रशासन द्वारा क्षेत्र सुरक्षित घोषित किए जाने तक वापस न लौटें।"
+          ]
+        }
+      }
+    },
+    "air pollution": {
+      "source": "air_pollution_response.txt",
+      "name": { "en": "Air pollution", "hi": "वायु प्रदूषण" },
+      "whatsapp": {
+        "en": "Limit outdoor activity; wear an N95 mask outdoors.",
+        "hi": "बाहर की गतिविधि कम करें; बाहर N95 मास्क पहनें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Children, elderly people and people with asthma, lung or heart disease should cut down long or hard outdoor activity.",
+            "Do not burn waste or leaves in the open."
+          ],
+          "hi": [
+            "बच्चे, बुज़ुर्ग और दमा, फेफड़े या हृदय रोग वाले लोग बाहर लंबी या भारी गतिविधि कम करें।",
+            "कूड़ा या पत्ते खुले में न जलाएँ।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Avoid hard outdoor activity.",
+            "Keep windows closed.",
+            "Wear an N95 mask outdoors."
+          ],
+          "hi": [
+            "बाहर भारी गतिविधि से बचें।",
+            "खिड़कियाँ बंद रखें।",
+            "बाहर N95 मास्क पहनें।"
+          ]
+        }
+      }
+    },
+    "water quality degradation": {
+      "source": "water_quality_response.txt",
+      "name": { "en": "Unsafe water", "hi": "असुरक्षित पानी" },
+      "whatsapp": {
+        "en": "Do not drink untreated water from this source; boil water.",
+        "hi": "इस स्रोत का बिना उपचारित पानी न पिएँ; पानी उबालकर पिएँ।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "If you use this water source, boil drinking water (rolling boil for at least one minute) or use treated water.",
+            "Keep doing this until test results show the water is safe."
+          ],
+          "hi": [
+            "यदि आप इस स्रोत का पानी इस्तेमाल करते हैं, तो पीने का पानी कम से कम एक मिनट तेज़ उबालें या उपचारित पानी लें।",
+            "जाँच के नतीजे पानी को सुरक्षित बताने तक ऐसा करते रहें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Do not use this water source for drinking or cooking.",
+            "Use another safe water supply, such as tankers arranged by local authorities.",
+            "See a doctor if you get diarrhoea or other stomach illness."
+          ],
+          "hi": [
+            "इस स्रोत का पानी पीने या खाना बनाने के लिए इस्तेमाल न करें।",
+            "दूसरी सुरक्षित जल आपूर्ति का उपयोग करें, जैसे स्थानीय प्रशासन के टैंकर।",
+            "दस्त या पेट की कोई और बीमारी हो तो डॉक्टर को दिखाएँ।"
+          ]
+        }
+      }
+    }
+  },
+  "default": {
+    "source": "none - generic advice for a hazard type not listed above",
+    "name": { "en": "Hazard", "hi": "खतरा" },
+    "whatsapp": {
+      "en": "Follow instructions from local authorities.",
+      "hi": "स्थानीय प्रशासन के निर्देशों का पालन करें।"
+    },
+    "actions": {
+      "MEDIUM": {
+        "en": [
+          "Stay alert and follow instructions from local authorities.",
+          "If you are in danger, call 112."
+        ],
+        "hi": [
+          "सतर्क रहें और स्थानीय प्रशासन के निर्देशों का पालन करें।",
+          "ख़तरे में हों तो 112 पर कॉल करें।"
+        ]
+      },
+      "HIGH": {
+        "en": [
+          "Move away from the affected area if it is safe to do so.",
+          "Follow instructions from local authorities.",
+          "If you are in danger, call 112."
+        ],
+        "hi": [
+          "सुरक्षित हो तो प्रभावित क्षेत्र से दूर चले जाएँ।",
+          "स्थानीय प्रशासन के निर्देशों का पालन करें।",
+          "ख़तरे में हों तो 112 पर कॉल करें।"
+        ]
+      }
+    }
+  }
+}

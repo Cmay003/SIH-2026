@@ -51,6 +51,10 @@ export interface Hazard {
   eta_minutes: number | null;
   predicted_time: string | null;
   prediction_text: string;
+  /** timestamp of the reading behind this hazard */
+  last_reading_at?: string | null;
+  /** true when the node has not reported for a while - shown, but never alarms */
+  stale?: boolean;
 }
 
 export interface HazardsResponse {
@@ -77,6 +81,10 @@ export interface HazardZone {
   longitude: number;
   radius_m: number;
   confirmed: boolean;
+  /** timestamp of the reading behind this zone */
+  last_reading_at?: string | null;
+  /** true when the node has not reported for a while - shown, but never alarms */
+  stale?: boolean;
 }
 
 export interface HazardZonesResponse {
@@ -84,11 +92,20 @@ export interface HazardZonesResponse {
   zones: HazardZone[];
 }
 
+/**
+ * Where an SOS location came from. "manual" = the person tapped a point on
+ * the SOS page map because their location was denied, unavailable or slow -
+ * approximate, and the officer views say so.
+ */
+export type LocationSource = "gps" | "manual" | "whatsapp";
+
 /** One open SOS as the officer sees it (GET /api/sos) */
 export interface SosRequest {
   id: number;
   latitude: number;
   longitude: number;
+  /** null for an SOS filed before the source was recorded */
+  location_source?: LocationSource | null;
   note: string | null;
   status: string;
   timestamp: string;
@@ -98,12 +115,17 @@ export interface SosRequest {
   hospital_distance_km: number;
   hospital_route_url: string;
   responder_route_url: string;
+  /** why a farther hospital was chosen (the nearer one is inside a hazard zone) */
+  hospital_skipped?: SkippedHospital | null;
+  hospital_in_hazard_zone?: HospitalZone | null;
 }
 
 export interface SosListResponse {
   success: boolean;
   count: number;
   escalated_count: number;
+  /** open rows left out because their stored coordinates are not numbers (old bad data, B47) */
+  invalid_location_count?: number;
   data: SosRequest[];
 }
 
@@ -157,24 +179,38 @@ export interface SatelliteCheck {
 }
 
 /** GET /api/nearest-hospital?latitude=&longitude= (public) */
+/** A nearer hospital the server passed over because it lies inside an active HIGH/CRITICAL zone */
+export interface SkippedHospital {
+  hospital: string;
+  distance_km: number;
+  hazard_type: string;
+  severity: Severity;
+}
+
+/** Hazard zone the chosen hospital itself is in (only when EVERY hospital is in one) */
+export interface HospitalZone {
+  hazard_type: string;
+  severity: Severity;
+}
+
+/** GET /api/nearest-hospital - distance_km is straight-line, maps_url the road route */
 export interface NearestHospital {
   hospital: string;
   distance_km: number;
   maps_url: string;
+  skipped_hospital?: SkippedHospital | null;
+  hospital_in_hazard_zone?: HospitalZone | null;
 }
 
 /** GET /api/sos/device/:device_id (public) */
 export type DeviceSosStatus =
   | { active: false }
-  | { active: true; sos_id: number; hospital: string; distance_km: number; maps_url: string };
+  | ({ active: true; sos_id: number } & NearestHospital);
 
 /** POST /api/sos -> 201 received, or 409 already_active (same fields) */
-export interface SosCreateResponse {
+export interface SosCreateResponse extends NearestHospital {
   status: "received" | "already_active";
   sos_id: number;
-  hospital: string;
-  distance_km: number;
-  maps_url: string;
 }
 
 export type LandUse = "agricultural" | "forest" | "urban_low" | "urban_high";
@@ -194,4 +230,86 @@ export interface NodeConfig {
 /** GET /api/admin/nodes */
 export interface AdminNodesResponse {
   nodes: Record<string, NodeConfig>;
+}
+
+// ---- Model card (GET /api/admin/model-card, admin only) ----
+// Written offline by ml/evaluate_models.py (its validate_card() is the
+// contract) and passed through unchanged by the backend and server.js.
+// Rates are fractions 0..1, LSTM errors are metres, numbers are rounded to
+// 4 dp and never NaN (null instead).
+
+export type DataProvenance = "SYNTHETIC" | "REAL";
+export type ModelId = "flood" | "anomaly_filter" | "edge" | "lstm";
+
+export interface ModelHeadlineMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  baseline: number | null;
+  higher_is_better: boolean;
+}
+
+export interface ModelConfusionMatrix {
+  title: string;
+  labels: string[];
+  /** rows = actual, columns = predicted */
+  matrix: number[][];
+}
+
+export interface ModelReliabilityBin {
+  bin_lower: number;
+  bin_upper: number;
+  count: number;
+  mean_predicted: number | null;
+  observed_rate: number | null;
+}
+
+export interface ModelEntry {
+  id: ModelId;
+  name: string;
+  status: "evaluated" | "not_available";
+  /** set when not_available (numbers are then null and lists empty) */
+  status_reason: string | null;
+  purpose: string;
+  runs_where: string;
+  artifact: { path: string; sha256: string | null; modified_at: string | null };
+  training_data: { provenance: DataProvenance | null; generator: string | null; size: number | null; description: string | null };
+  evaluation: {
+    provenance: DataProvenance | null;
+    split: string | null;
+    split_kind: "independent_draw" | "group" | "row" | "catchment" | null;
+    test_size: number | null;
+    test_positives: number | null;
+    leakage_guard: string | null;
+  };
+  baseline: { name: string | null; description: string | null };
+  beats_baseline: boolean | null;
+  headline_metrics: ModelHeadlineMetric[];
+  false_alarm: { definition: string | null; rate: number | null; miss_definition: string | null; miss_rate: number | null };
+  calibration: {
+    applicable: boolean;
+    method: string | null;
+    brier: number | null;
+    brier_uncalibrated: number | null;
+    brier_reference: number | null;
+    ece: number | null;
+    reliability: ModelReliabilityBin[];
+    note: string | null;
+  };
+  confusion_matrices: ModelConfusionMatrix[];
+  /** model-specific extras; not rendered */
+  details: Record<string, unknown>;
+  limitations: string[];
+}
+
+export interface ModelCard {
+  schema_version: number;
+  generated_by: string;
+  seed: number;
+  provenance: "SYNTHETIC" | "REAL" | "MIXED" | "NONE";
+  /** must always be shown next to the numbers */
+  banner: string;
+  /** newest model file's time, "YYYY-MM-DDTHH:MM:SSZ" (UTC) */
+  models_updated_at: string | null;
+  models: ModelEntry[];
 }

@@ -2,28 +2,35 @@
   display: grid;
   grid-template-columns: minmax(280px, 42%) 1fr;
   min-height: 100vh;
+  min-height: 100dvh;
 }
 
 /* ---- Brand panel ---- */
 .brand {
-  background: linear-gradient(150deg, var(--green-dark), var(--green) 60%, var(--green-mid));
-  color: #fff;
-  padding: 48px 44px;
+  /* ends at --green (not the lighter --green-mid) so white text keeps >= 4.5:1 */
+  background: linear-gradient(150deg, var(--green-dark), var(--green) 60%, var(--green));
+  color: var(--on-brand);
+  padding: var(--space-12) 44px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  gap: var(--space-8);
   position: relative;
   overflow: hidden;
 }
 .brand::after {
   content: "";
   position: absolute;
-  right: -120px;
-  bottom: -120px;
+  right: -140px; /* keeps the faint ring clear of the footer text */
+  bottom: -140px;
   width: 360px;
   height: 360px;
   border: 40px solid rgba(255, 255, 255, 0.07);
   border-radius: 50%;
+  pointer-events: none;
+}
+.brand :focus-visible {
+  outline-color: var(--focus-on-brand);
 }
 .logo {
   display: flex;
@@ -33,13 +40,14 @@
 .logo h1 {
   margin: 0;
   font-size: 30px;
-  letter-spacing: 1px;
+  letter-spacing: 0.06em;
+  line-height: 1.1;
 }
 .logo small {
   display: block;
-  font-size: 13px;
-  opacity: 0.85;
-  margin-top: 2px;
+  font-size: var(--text-sm);
+  opacity: 0.9;
+  margin-top: 4px;
 }
 .brandCopy h2 {
   font-size: 26px;
@@ -49,7 +57,7 @@
 }
 .brandCopy p {
   margin: 0;
-  opacity: 0.9;
+  opacity: 0.92;
   line-height: 1.6;
   max-width: 420px;
 }
@@ -74,8 +82,7 @@
   flex: none;
 }
 .brandFoot {
-  font-size: 12px;
-  opacity: 0.75;
+  font-size: var(--text-xs);
 }
 
 /* ---- Form side ---- */
@@ -83,34 +90,37 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px 20px;
+  padding: var(--space-8) var(--space-5);
 }
 .card {
   width: 100%;
-  max-width: 400px;
+  max-width: 420px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: var(--radius-lg);
   padding: 34px 30px 28px;
-  box-shadow: 0 10px 30px rgba(27, 94, 32, 0.1);
+  box-shadow: var(--shadow-lg);
 }
 .card h2 {
   margin: 0 0 6px;
   font-size: 24px;
+  color: var(--heading);
 }
 .sub {
   margin: 0 0 22px;
   color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: var(--text-md);
+  line-height: var(--leading);
 }
 
 .notice {
   border-radius: 10px;
+  border-left: 4px solid currentColor;
   padding: 11px 14px;
-  font-size: 14px;
+  font-size: var(--text-md);
+  font-weight: var(--weight-medium);
   line-height: 1.45;
-  margin-bottom: 16px;
+  margin-bottom: var(--space-4);
 }
 .error {
   background: var(--danger-bg);
@@ -122,50 +132,63 @@
 }
 
 .field {
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 .field label {
   display: block;
-  font-size: 13px;
+  font-size: var(--text-md);
   font-weight: bold;
   margin: 0 0 6px;
 }
 .field input {
   width: 100%;
+  min-height: 48px;
   padding: 12px 14px;
   font-size: 16px; /* 16px avoids iOS zoom-on-focus */
-  border: 1.5px solid var(--border);
+  border: 1.5px solid var(--border-strong);
   border-radius: 10px;
   background: var(--input-bg);
   color: var(--text);
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: border-color var(--dur-fast), box-shadow var(--dur-fast);
 }
-.field input:focus {
-  outline: none;
+.field input:hover {
   border-color: var(--green-mid);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green-mid) 25%, transparent);
+}
+/* Focus: solid blue ring (the --focus colour, >= 3:1 in both themes); the
+   transparent outline still shows in forced-colours (Windows High Contrast) mode. */
+.field input:focus {
+  outline: 2px solid transparent;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 3px var(--focus);
 }
 .field input[aria-invalid="true"] {
   border-color: var(--danger);
+  border-width: 2px;
+}
+.field input[aria-invalid="true"]:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger);
 }
 .inputWrap {
   position: relative;
 }
 .inputWrap input {
-  padding-right: 70px;
+  padding-right: 76px;
 }
 .togglePw {
   position: absolute;
   right: 6px;
   top: 50%;
   transform: translateY(-50%);
+  min-height: 36px;
+  min-width: 56px;
   background: none;
   border: none;
-  color: var(--green);
+  color: var(--link);
   font-weight: bold;
-  font-size: 13px;
+  font-size: var(--text-sm);
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
 .togglePw:hover {
@@ -173,15 +196,17 @@
 }
 .caps {
   margin-top: 6px;
-  font-size: 12.5px;
-  color: #b26a00;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--warning-text);
 }
 
 .submit {
   width: 100%;
-  border: none;
+  min-height: 48px;
+  border: 2px solid transparent; /* button edge in forced-colours mode */
   border-radius: 10px;
-  padding: 13px 16px;
+  padding: 11px 14px;
   font-size: 16px;
   font-weight: bold;
   background: var(--green);
@@ -191,12 +216,14 @@
   align-items: center;
   justify-content: center;
   gap: 10px;
+  margin-top: var(--space-2);
+  transition: background-color var(--dur-fast);
 }
-.submit:hover {
+.submit:hover:not(:disabled) {
   background: var(--green-dark);
 }
 .submit:disabled {
-  opacity: 0.7;
+  opacity: 0.75;
   cursor: progress;
 }
 .spinner {
@@ -214,10 +241,10 @@
 }
 
 .help {
-  margin-top: 16px;
-  font-size: 13px;
+  margin-top: var(--space-4);
+  font-size: var(--text-sm);
   color: var(--text-muted);
-  line-height: 1.5;
+  line-height: var(--leading);
 }
 
 .sosLink {
@@ -229,17 +256,20 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px 12px;
-  font-size: 14px;
+  font-size: var(--text-md);
   color: var(--text-muted);
 }
 .sosLink a {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
   background: var(--sos);
   color: #fff;
   text-decoration: none;
   font-weight: bold;
-  padding: 9px 14px;
-  border-radius: 999px;
+  padding: 8px 16px;
+  border-radius: var(--radius-pill);
   font-size: 13.5px;
 }
 .sosLink a:hover {
@@ -264,10 +294,20 @@
   }
   .formSide {
     align-items: flex-start;
-    padding-top: 24px;
+    padding: var(--space-6) var(--space-4) var(--space-8);
   }
   .card {
     padding: 26px 20px 22px;
-    box-shadow: none;
+    box-shadow: var(--shadow);
+  }
+}
+
+@media (max-width: 380px) {
+  .card {
+    padding: 22px 16px 20px;
+  }
+  .sosLink a {
+    width: 100%;
+    justify-content: center;
   }
 }

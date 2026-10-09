@@ -212,9 +212,15 @@ function setupAuth(app, db, { officerApiKey }) {
   }
 
   // ---- middleware -----------------------------------------------------
+  // The ONLY 401 that means "your session ended". The pages send the user
+  // to the login page just for this code, so a 401 that is about something
+  // else (e.g. the AI backend rejecting the server's key) can't start a
+  // redirect loop between a page and /login.html (B53).
+  const LOGIN_REQUIRED = { error: "Login required", code: "login_required" };
+
   function requireLogin(req, res, next) {
     const session = currentSession(req);
-    if (!session) return res.status(401).json({ error: "Login required" });
+    if (!session) return res.status(401).json(LOGIN_REQUIRED);
     if (!sameOrigin(req)) return res.status(403).json({ error: "Cross-site request blocked" });
     req.user = session.user;
     next();
@@ -231,7 +237,7 @@ function setupAuth(app, db, { officerApiKey }) {
         return next();
       }
       const session = currentSession(req);
-      if (!session) return res.status(401).json({ error: "Login required" });
+      if (!session) return res.status(401).json(LOGIN_REQUIRED);
       if (!roles.has(session.user.role)) return res.status(403).json({ error: `${roleName} role required` });
       if (!sameOrigin(req)) return res.status(403).json({ error: "Cross-site request blocked" });
       req.user = session.user;
@@ -284,11 +290,19 @@ function setupAuth(app, db, { officerApiKey }) {
       return res.status(400).json({ error: "Enter your username and password." });
     }
 
-    const user = q.userByName.get(username.trim());
+    const found = q.userByName.get(username.trim());
+    // Always run the (slow) hash check, so timing doesn't reveal anything either
+    const passwordOk = await verifyPassword(password, found ? found.password_hash : DUMMY_HASH);
+    // Decide from a FRESH copy of the row (B45). Parallel requests all read
+    // the same failed_attempts before their scrypt finished, so 20 wrong
+    // passwords at once counted as ONE failure and the lock never came.
+    // DatabaseSync is synchronous and nothing awaits between this read and
+    // the write below, so no other request can run in between. Re-checking
+    // the lock here also stops a correct guess in the same burst from
+    // signing in after the burst has locked the account.
+    const user = found ? q.userByName.get(found.username) : null;
     const now = Date.now();
     const locked = !!(user && user.locked_until && new Date(user.locked_until).getTime() > now);
-    // Always run the (slow) hash check, so timing doesn't reveal anything either
-    const passwordOk = await verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
     if (!user || !user.active || locked || !passwordOk) {
       if (user && !locked && !passwordOk) {
         // A lock that has EXPIRED starts the count from zero again. Before,

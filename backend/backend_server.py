@@ -4,6 +4,7 @@ Run: uvicorn backend_server:app --host 127.0.0.1 --port 8000
 (127.0.0.1: only server.js on the same machine should reach this service.)
 """
 
+import json
 import sqlite3
 import os
 import secrets
@@ -41,8 +42,12 @@ from integration_pipeline import (
     process_reading,
     compute_flood_risk,
     explain_flood_risk,
+    implausible_fields,
+    rain_reading_plausible,
+    DERIVED_FROM,
 )
 from rag_alert_pipeline import build_knowledge_base, severity_band
+from hazard_classification import LANDSLIDE_RAIN_WINDOWS_HOURS, PROXY_SATURATION_PER_MM
 from cap_alert import generate_cap_alert
 from hazard_confirmation import HazardConfirmer
 import river_forecast
@@ -67,6 +72,7 @@ app.add_middleware(
 )
 
 DB_PATH = paths.DB_PATH  # var/sanjeevni.db, shared with server/server.js
+MODEL_CARD_PATH = paths.MODEL_CARD_PATH  # var/models/model_card.json (ml/evaluate_models.py)
 
 # Admin node-registry endpoints use the same OFFICER_API_KEY as server.js.
 # There is NO fallback key: the old demo default was published in the repo,
@@ -147,6 +153,13 @@ def init_node_registry_table(conn):
     node_cols = {row[1] for row in conn.execute("PRAGMA table_info(nodes)")}
     if "report_interval_seconds" not in node_cols:
         conn.execute("ALTER TABLE nodes ADD COLUMN report_interval_seconds REAL")
+    # Per-node landslide rainfall threshold I = alpha * D^-beta (NULL = the
+    # global Caine 1980 default - see hazard_classification.py). Setting
+    # either one also marks a node WITHOUT a tilt sensor as a slope node, so
+    # its rain gauge can raise a landslide WATCH.
+    for col in ("landslide_rain_alpha", "landslide_rain_beta"):
+        if col not in node_cols:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} REAL")
     row_count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
     if row_count == 0:
         for node_id, cfg in _SEED_NODES.items():
@@ -206,9 +219,8 @@ def reload_node_registry():
     rows = conn.execute("SELECT * FROM nodes").fetchall()
     conn.close()
 
-    NODE_REGISTRY.clear()
-    for row in rows:
-        NODE_REGISTRY[row["node_id"]] = {
+    new_registry = {
+        row["node_id"]: {
             "location": row["location"],
             "land_use": row["land_use"],
             "curve_number": row["curve_number"],
@@ -216,14 +228,34 @@ def reload_node_registry():
             "longitude": row["longitude"],
             "upstream_node": row["upstream_node"],
             "report_interval_seconds": row["report_interval_seconds"],
+            "landslide_rain_alpha": row["landslide_rain_alpha"],
+            "landslide_rain_beta": row["landslide_rain_beta"],
         }
-        # Lazily create history/health tracking for any node not seen
-        # before (e.g. just added via the admin API) - never overwrites
-        # existing history for a node that already had readings.
-        if row["node_id"] not in node_history:
-            node_history[row["node_id"]] = deque(maxlen=HISTORY_WINDOW)
-        if row["node_id"] not in node_health:
-            node_health[row["node_id"]] = {}
+        for row in rows
+    }
+    # Built first, swapped in under the ingest lock. Admin edits run on the
+    # same thread pool as ingest: clearing and refilling the dict in place
+    # let a concurrent reading see a half-built registry and be rejected as
+    # an "unknown node" - and the node then dropped it for good, because
+    # the batch itself answered 200. Same dict object, so every existing
+    # reference to NODE_REGISTRY stays valid. Readers outside the lock
+    # iterate over a snapshot (list(NODE_REGISTRY.items())).
+    with _ingest_lock:
+        # Tracking entries are created BEFORE the node is published in the
+        # registry: get_nodes() reads outside this lock and looks up
+        # node_history for every node in its registry snapshot, so a node
+        # must never be visible in NODE_REGISTRY without a history entry
+        # (that was a KeyError -> 500 for a node just added by an admin).
+        for node_id in new_registry:
+            # Lazily create history/health tracking for any node not seen
+            # before (e.g. just added via the admin API) - never overwrites
+            # existing history for a node that already had readings.
+            if node_id not in node_history:
+                node_history[node_id] = deque(maxlen=HISTORY_WINDOW)
+            if node_id not in node_health:
+                node_health[node_id] = {}
+        NODE_REGISTRY.clear()
+        NODE_REGISTRY.update(new_registry)
 
 
 HISTORY_WINDOW = 50
@@ -240,8 +272,18 @@ node_history: dict[str, deque] = {}
 node_health: dict[str, dict] = {}
 
 # --- UPGRADE: terrain elevation -> auto-derived curve number ------------
-# Uses Open-Elevation (https://open-elevation.com) - free, no API key,
-# open-source (self-hostable if the public instance is rate-limited).
+# Uses Open-Meteo's Elevation API - the same provider as the weather
+# forecast below, so weather and terrain come from one provider instead
+# of two (the Sentinel-1 radar cross-check is separate, see satellite_check.py).
+# Docs: https://open-meteo.com/en/docs/elevation-api (checked 2026-10-08):
+#   GET /v1/elevation?latitude=a,b,...&longitude=x,y,...  (comma-separated,
+#   up to 100 coordinates per request), no API key for non-commercial use;
+#   returns {"elevation": [m, ...]} - always a list, in request order.
+#   Errors are HTTP 400 + {"error": true, "reason": ...}.
+#   Data: Copernicus DEM 2021 GLO-90 (90 m grid). The ~100 m sample
+#   offset below is only about one grid cell, so the slope is a coarse
+#   local estimate - fine for a capped CN nudge, not for engineering use.
+#   Attribution required: Copernicus programme + Open-Meteo.
 # Replaces a HAND-TYPED curve_number guess in NODE_REGISTRY with one
 # derived from real terrain slope around the node. Cached indefinitely
 # per node (elevation doesn't change), computed once and reused.
@@ -252,7 +294,7 @@ node_health: dict[str, dict] = {}
 # (steeper terrain sheds water faster, raising effective runoff response
 # even for the same land cover). This applies a modest, capped adjustment
 # on top of the land-use base, not a replacement for it.
-OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
+OPEN_METEO_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
 ELEVATION_FETCH_TIMEOUT_SECONDS = 8
 ELEVATION_SAMPLE_OFFSET_DEG = 0.001  # ~100m at these latitudes
 
@@ -314,15 +356,23 @@ def fetch_terrain_derived_curve_number(
             (latitude, longitude + ELEVATION_SAMPLE_OFFSET_DEG),
             (latitude, longitude - ELEVATION_SAMPLE_OFFSET_DEG),
         ]
-        locations_param = "|".join(f"{lat},{lon}" for lat, lon in points)
+        # One request for all 5 points: parallel comma-separated lists.
         response = requests.get(
-            OPEN_ELEVATION_URL,
-            params={"locations": locations_param},
+            OPEN_METEO_ELEVATION_URL,
+            params={
+                "latitude": ",".join(str(lat) for lat, _ in points),
+                "longitude": ",".join(str(lon) for _, lon in points),
+            },
             timeout=ELEVATION_FETCH_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        results = response.json()["results"]
-        elevations = [r["elevation"] for r in results]
+        elevations = [float(e) for e in response.json()["elevation"]]
+        # A short list would otherwise compute a slope from fewer
+        # neighbours (or crash on [0]) - treat it like any bad response.
+        if len(elevations) != len(points):
+            raise ValueError(
+                f"expected {len(points)} elevations, got {len(elevations)}"
+            )
 
         center_elev = elevations[0]
         # ~111,320m per degree of latitude/longitude (approximation valid
@@ -407,7 +457,11 @@ def fetch_forecast_rainfall_mm(
                 "latitude": latitude,
                 "longitude": longitude,
                 "hourly": "precipitation",
-                "forecast_days": 1,
+                # 2 days, not 1: with forecast_days=1 the response stops at
+                # 23:00 UTC today, so from 18:00 UTC (23:30 IST - monsoon
+                # night rain) the "next 6 hours" window ran off the end and
+                # summed only 5..1 hours, under-reporting the flood input.
+                "forecast_days": 2,
                 "timezone": "UTC",
             },
             timeout=WEATHER_FETCH_TIMEOUT_SECONDS,
@@ -419,13 +473,26 @@ def fetch_forecast_rainfall_mm(
         hourly_precip = payload["hourly"]["precipitation"]
 
         current_hour_key = now.strftime("%Y-%m-%dT%H:00")
-        start_idx = (
-            hourly_times.index(current_hour_key)
-            if current_hour_key in hourly_times
-            else 0
-        )
+        # The current hour must be in the response. Falling back to index 0
+        # (as before) summed whatever hours the payload started with - an
+        # old or wrongly-zoned forecast - and cached it as "the next 6 h".
+        if current_hour_key not in hourly_times:
+            raise ValueError(f"forecast has no entry for {current_hour_key}")
+        start_idx = hourly_times.index(current_hour_key)
 
-        forecast_6h_mm = float(sum(hourly_precip[start_idx : start_idx + 6]))
+        window = hourly_precip[start_idx : start_idx + 6]
+        # A short or gappy window is an incomplete forecast, not "less rain":
+        # caching a 3-hour sum as the 6-hour value would quietly lower flood
+        # risk for the next 30 min. Raising takes the failure path below
+        # (last good cached value, else None = "forecast unavailable").
+        # Open-Meteo sends null for hours it has no value for; sum() would
+        # raise TypeError on those anyway, this just says why.
+        if len(window) < 6 or any(v is None for v in window):
+            raise ValueError(
+                f"incomplete 6 h forecast window ({len(window)} hours, "
+                f"{sum(v is None for v in window)} null)"
+            )
+        forecast_6h_mm = float(sum(window))
 
         _weather_cache[node_id] = {"value": forecast_6h_mm, "fetched_at": now}
         _api_failed_at.pop("weather", None)
@@ -504,6 +571,16 @@ ADDED_READING_COLUMNS = {
     "soil_saturation_source": "TEXT",  # "sensor" or "rainfall_proxy"
     "link": "TEXT",
     "rainfall_mm_since_last": "REAL",  # per-reading rain - input for the river forecast
+    # Comma-separated fields dropped as physically impossible (their value
+    # columns are then NULL). Kept even when the reading still alerted on
+    # another sensor, so maintainers can see a channel has failed.
+    "sensor_faults": "TEXT",
+    # The node's position WHEN the reading was taken. The CAP export used
+    # the live registry, so a node moved later relocated its old alerts and
+    # a deleted node's alerts were placed at 0,0. Filled by save_reading
+    # from result["latitude"/"longitude"]; NULL on rows from before this.
+    "latitude": "REAL",
+    "longitude": "REAL",
 }
 
 
@@ -578,6 +655,7 @@ def save_reading(enriched: dict, result: dict, timestamp: str):
         if column not in row:
             row[column] = enriched[column] if column in enriched else result.get(column)
     row["simulated"] = 1 if enriched.get("simulated") else 0
+    row["sensor_faults"] = ",".join(result.get("sensor_faults") or ()) or None
 
     columns = ", ".join(row)
     placeholders = ", ".join("?" for _ in row)
@@ -664,6 +742,10 @@ WATER_LEVEL_SMOOTHING_WINDOW = (
 
 RATE_WINDOW_MINUTES = 15  # rate of rise is measured against the oldest reading this recent
 MIN_RATE_SPAN_SECONDS = 30  # shorter spans turn mm of sensor jitter into huge m/hr values
+# Upstream data older than RATE_WINDOW_MINUTES (or this many of the
+# upstream node's configured report intervals, if longer) is no evidence
+# about the river NOW - see upstream_history_for().
+UPSTREAM_MAX_MISSED_REPORTS = 3
 # Fastest believable river rise/fall. Steeper slopes come from a sudden
 # step (sensor knocked, glitch, re-mount) still inside the 15-minute window,
 # and were reaching +400 m/hr on a river that was actually FALLING, which
@@ -675,7 +757,9 @@ MAX_RIVER_RATE_M_PER_HR = float(os.environ.get("SANJEEVNI_MAX_RIVER_RATE_M_PER_H
 def clamp_river_rate(rate: float) -> float:
     return max(-MAX_RIVER_RATE_M_PER_HR, min(MAX_RIVER_RATE_M_PER_HR, rate))
 SOIL_DRYING_TIME_CONSTANT_HOURS = 48.0  # saturation proxy decays to ~37% after this long without rain
-SOIL_SATURATION_PER_MM = 0.01
+# One constant for both sides: assess_landslide_rain() takes a storm's own
+# rain back out of this proxy before the antecedent-wetness test.
+SOIL_SATURATION_PER_MM = PROXY_SATURATION_PER_MM
 
 # node_id -> deque of (datetime, rainfall_mm), only the last 24 hours.
 # In-memory like node_history, so rainfall totals restart from 0 when the
@@ -932,11 +1016,22 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         rate_per_hour(history, "gas_ppm", raw.gas_ppm, now) if raw.gas_ppm is not None else None
     )
 
+    # Rain gauge range check (integration_pipeline.rain_reading_plausible):
+    # the cap scales with the time since this node's previous reading. An
+    # impossible value is counted as NO rain - kept out of the rain log and
+    # the soil proxy - and reported as a sensor fault below, so it can't
+    # raise a landslide WATCH that keeps re-scoring itself for 24 h.
+    rain_hours_since_prev = (
+        (now - history[-1]["timestamp"]).total_seconds() / 3600 if history else None
+    )
+    rain_fault = not rain_reading_plausible(raw.rainfall_mm_since_last, rain_hours_since_prev)
+    rain_mm = 0.0 if rain_fault else raw.rainfall_mm_since_last
+
     # Rainfall totals come from a time-pruned log, not "the last 50
     # readings" (~4 min at a 5s interval) as before.
     rain_log = node_rainfall.setdefault(raw.node_id, deque())
-    if raw.rainfall_mm_since_last > 0:
-        rain_log.append((now, raw.rainfall_mm_since_last))
+    if rain_mm > 0:
+        rain_log.append((now, rain_mm))
     while rain_log and rain_log[0][0] < now - timedelta(hours=24):
         rain_log.popleft()
     rainfall_24h_mm = sum(mm for _, mm in rain_log)
@@ -945,6 +1040,20 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     rainfall_intensity_mm_hr = sum(
         mm for t, mm in rain_log if t >= now - timedelta(hours=1)
     )
+    # mm per trailing window, for the landslide rainfall threshold, which
+    # needs more durations than 1 h and 24 h (see
+    # LANDSLIDE_RAIN_WINDOWS_HOURS). Same ">=" edge as the intensity above.
+    rainfall_windows_mm = {
+        hours: sum(mm for t, mm in rain_log if t >= now - timedelta(hours=hours))
+        for hours in LANDSLIDE_RAIN_WINDOWS_HOURS
+    }
+    # How many separate rain reports make up each window: a window built
+    # from ONE report may not trigger the landslide WATCH on its own (see
+    # hazard_classification.assess_landslide_rain).
+    rainfall_windows_count = {
+        hours: sum(1 for t, _ in rain_log if t >= now - timedelta(hours=hours))
+        for hours in LANDSLIDE_RAIN_WINDOWS_HOURS
+    }
 
     # Soil saturation: the real capacitive sensor when the node has one;
     # otherwise a proxy that rises with rain and dries out exponentially
@@ -967,17 +1076,14 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     else:
         soil_saturation = min(
             1.0,
-            max(0.0, prev_saturation + raw.rainfall_mm_since_last * SOIL_SATURATION_PER_MM),
+            max(0.0, prev_saturation + rain_mm * SOIL_SATURATION_PER_MM),
         )
         soil_saturation_source = "rainfall_proxy"
 
     upstream_node = config.get("upstream_node")
-    upstream_last = (
-        last_entry_with(node_history[upstream_node], "river_level_m")
-        if upstream_node and node_history.get(upstream_node) else None
-    )
+    upstream_hist = upstream_history_for(upstream_node, raw.simulated, now)
+    upstream_last = last_entry_with(upstream_hist, "river_level_m")
     if upstream_last:
-        upstream_hist = node_history[upstream_node]
         upstream_level_m = upstream_last["river_level_m"]
         # UPGRADE: cross-node spatial correlation needs the upstream
         # node's OWN rate of rise, not just its current level - see
@@ -1020,6 +1126,8 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         "curve_number_source": curve_number_source,
         "rainfall_24h_mm": rainfall_24h_mm,
         "rainfall_intensity_mm_hr": rainfall_intensity_mm_hr,
+        "rainfall_windows_mm": rainfall_windows_mm,
+        "rainfall_windows_count": rainfall_windows_count,
         "forecast_rainfall_6h_mm": forecast_rainfall_6h_mm,
         "river_level_m": water_level_m,
         "simulated": raw.simulated,
@@ -1036,6 +1144,9 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         # unchanged (None if the node doesn't have that sensor).
         "tilt_angle_deg": raw.tilt_angle_deg,
         "vibration_magnitude": raw.vibration_magnitude,
+        # Per-node landslide rain threshold override (None = Caine 1980).
+        "landslide_rain_alpha": config.get("landslide_rain_alpha"),
+        "landslide_rain_beta": config.get("landslide_rain_beta"),
         "pm25_ugm3": raw.pm25_ugm3,
         "pm10_ugm3": raw.pm10_ugm3,
         "water_ph": raw.water_ph,
@@ -1051,20 +1162,68 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         "link": raw.link,
     }
 
-    history.append(
-        {
-            "timestamp": now,
-            "river_level_m": water_level_m,
-            "raw_water_level_m": converted_value,  # unsmoothed - see smooth_water_level()
-            "rainfall_mm_since_last": raw.rainfall_mm_since_last,
-            "soil_saturation": soil_saturation,
-            "gas_ppm": raw.gas_ppm,
-            "temp_c": raw.temp_c,
-            "humidity_pct": raw.humidity_pct,
-        }
-    )
+    # A value no working sensor can produce (see PHYSICAL_LIMITS) is kept
+    # out of history as None - the same gap a missing sensor leaves - so
+    # one 14 m spike can't skew the next 15 minutes of rise rates, the
+    # median smoothing, an upstream neighbour's features or drift checks.
+    faulty = set(implausible_fields(enriched))
+    if converted_value is not None and implausible_fields({"river_level_m": converted_value}):
+        faulty.add("raw_water_level_m")
+    if rain_fault:
+        # Like a PHYSICAL_LIMITS fault: None in history (so the river
+        # forecast does not train on it) and listed for process_reading,
+        # which puts it in result["sensor_faults"] and drops the raw value
+        # from a live row. A wholly suppressed row keeps the raw value, as
+        # other faulty fields do, to help label anomalies.
+        faulty.add("rainfall_mm_since_last")
+        enriched["sensor_faults"] = ["rainfall_mm_since_last"]
+    entry = {
+        "timestamp": now,
+        "river_level_m": water_level_m,
+        "raw_water_level_m": converted_value,  # unsmoothed - see smooth_water_level()
+        "rainfall_mm_since_last": raw.rainfall_mm_since_last,
+        "soil_saturation": soil_saturation,
+        "gas_ppm": raw.gas_ppm,
+        "temp_c": raw.temp_c,
+        "humidity_pct": raw.humidity_pct,
+        # Lets a neighbour tell simulator data from real data - see
+        # upstream_history_for().
+        "simulated": raw.simulated,
+    }
+    for field in faulty:
+        if field in entry:
+            entry[field] = None
+    history.append(entry)
 
     return enriched
+
+
+def upstream_history_for(upstream_node: Optional[str], simulated: bool, now: datetime) -> list:
+    """The upstream node's history entries that may feed THIS reading:
+    same simulated flag, taken in the last UPSTREAM_MAX_AGE window, not
+    after `now`. Empty means "no upstream evidence", and derive_features
+    then falls back to the node's own level and a 0.0 upstream rate.
+
+    - Simulated history never feeds a real node: in the mixed demo
+      (`simulation.js --skip NODE-04`) a scripted upstream flood used to
+      boost the REAL node's flood risk and count as flood-signature
+      corroboration.
+    - Stale history is no evidence: a washed-away or flat-battery upstream
+      node used to keep its last rise rate (e.g. 0.6 m/hr) for days,
+      boosting every downstream reading."""
+    if not upstream_node or not node_history.get(upstream_node):
+        return []
+    cfg = NODE_REGISTRY.get(upstream_node) or {}
+    # A slow (deep-sleep) upstream node reports every few minutes; allow a
+    # few of its intervals, but never less than the rate window itself.
+    max_age = timedelta(seconds=max(
+        RATE_WINDOW_MINUTES * 60,
+        UPSTREAM_MAX_MISSED_REPORTS * (cfg.get("report_interval_seconds") or 0),
+    ))
+    return [
+        e for e in node_history[upstream_node]
+        if bool(e.get("simulated")) == bool(simulated) and now - max_age <= e["timestamp"] <= now
+    ]
 
 
 MAX_CLOCK_SKEW_MINUTES = 5  # node timestamps further in the future are treated as clock garbage
@@ -1113,6 +1272,38 @@ def update_node_health(raw: RawReading, received_at: datetime, taken_at: datetim
         health["signal_strength_dbm"] = raw.signal_strength_dbm
         health["link"] = raw.link
         health["sensor_drift"] = drift
+    remember_report_interval(health, node_history.get(raw.node_id, ()), received_at)
+
+
+# How long the node's normal (slow) reporting interval is remembered while
+# it reports faster. Longer than any single hazard episode is likely to
+# last; an admin can always pin report_interval_seconds instead.
+REPORT_INTERVAL_MEMORY_HOURS = 24
+# A new estimate this close to the remembered one replaces it (ordinary
+# jitter, or a genuinely re-tuned node); a much faster one is an elevated
+# burst and does not.
+REPORT_INTERVAL_SHRINK_TOLERANCE = 0.75
+
+
+def remember_report_interval(health: dict, history, now: datetime):
+    """Keeps node_health["observed_interval_seconds"] at the node's NORMAL
+    reporting interval. A percentile of recent gaps alone is not enough:
+    after a hazard the last 11 readings can all be 5 s apart, and the
+    node that had just reported the hazard was then flagged "offline"
+    60 s later, when its normal 60 s report was simply on its way. So a
+    much faster estimate does not overwrite the remembered interval until
+    REPORT_INTERVAL_MEMORY_HOURS have passed without confirming it."""
+    estimate = expected_gap_seconds([r["timestamp"] for r in list(history)[-REPORT_GAP_SAMPLE:]])
+    if estimate is None:
+        return
+    previous = health.get("observed_interval_seconds")
+    previous_at = health.get("observed_interval_at")
+    expired = previous_at is None or now - parse_timestamp(previous_at) > timedelta(
+        hours=REPORT_INTERVAL_MEMORY_HOURS
+    )
+    if previous is None or expired or estimate >= REPORT_INTERVAL_SHRINK_TOLERANCE * previous:
+        health["observed_interval_seconds"] = estimate
+        health["observed_interval_at"] = now.isoformat()
 
 
 # Readings are processed one at a time. FastAPI runs these sync endpoints
@@ -1181,6 +1372,18 @@ def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
         _rag_collection,
         _rag_embedder,
     )
+    # A reading that still alerted on another sensor was classified
+    # WITHOUT its faulty fields; store and report it the same way, so a
+    # 14 m spike never lands in the readings table as a measurement on a
+    # live row (charts, forecast and the CSV export read those columns).
+    # The fault is kept in the sensor_faults column. A wholly suppressed
+    # reading keeps its raw values as before - status 'suppressed' already
+    # keeps it out of everything, and the raw value helps label anomalies.
+    if result["status"] != "suppressed":
+        for field in result.get("sensor_faults", ()):
+            enriched[field] = None
+            for derived in DERIVED_FROM.get(field, ()):
+                enriched[derived] = None
     result["timestamp"] = timestamp
     result["node_id"] = raw.node_id
     result["location"] = enriched["location"]
@@ -1189,8 +1392,8 @@ def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
     result["river_level_m"] = enriched[
         "river_level_m"
     ]  # corrected water level, not the raw uninverted distance
-    result["temp_c"] = raw.temp_c
-    result["humidity_pct"] = raw.humidity_pct
+    result["temp_c"] = enriched["temp_c"]
+    result["humidity_pct"] = enriched["humidity_pct"]
     result["forecast_rainfall_6h_mm"] = enriched["forecast_rainfall_6h_mm"]
 
     # UPGRADE: predictive maintenance - checked on every reading, but
@@ -1205,8 +1408,11 @@ def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
     # Multi-node cross-check (hazard_confirmation.py): an alert only goes
     # public once corroborated; until then officers see it as pending.
     if result["status"] == "alert_dispatched":
+        # simulated: simulator traffic must never corroborate a real alert
+        # (it would go public and reach real WhatsApp subscribers).
         confirmed, basis = _confirmer.assess(
-            raw.node_id, result["hazard_type"], result["severity"], taken_at, NODE_REGISTRY
+            raw.node_id, result["hazard_type"], result["severity"], taken_at, NODE_REGISTRY,
+            simulated=raw.simulated,
         )
         result["confirmation"] = basis or "unconfirmed"
         if not confirmed:
@@ -1339,17 +1545,39 @@ def get_alert_as_cap(alert_id: int):
             detail=f"Reading {alert_id} is not an alert (status '{row.get('status')}')",
         )
 
-    config = NODE_REGISTRY.get(row["node_id"], {})
+    # Position stored with the reading first (where the node WAS); the
+    # live registry only for rows saved before those columns existed. No
+    # position at all (old row, node since deleted) is refused: a CAP area
+    # at 0,0 - the old default - is a wrong public warning area, not a
+    # harmless placeholder.
+    latitude, longitude = row.get("latitude"), row.get("longitude")
+    if latitude is None or longitude is None:
+        config = NODE_REGISTRY.get(row["node_id"], {})
+        latitude, longitude = config.get("latitude"), config.get("longitude")
+    if latitude is None or longitude is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Alert {alert_id} has no known location (node '{row['node_id']}' is not registered)",
+        )
+
     cap_xml = generate_cap_alert(
         hazard_type=row.get("hazard_type") or "flood",
         severity=row.get("severity") or "LOW",
         location=row.get("location") or row["node_id"],
-        latitude=config.get("latitude", 0.0),
-        longitude=config.get("longitude", 0.0),
+        latitude=latitude,
+        longitude=longitude,
         message=row.get("message") or "No alert message recorded for this reading.",
         node_id=row["node_id"],
         risk_score=row.get("risk_score") or 0.0,
         severity_source=row.get("severity_source") or "ml_model",
+        # Same reading -> same identifier and <sent> on every download, so
+        # a polling CAP consumer does not re-publish it as a new alert.
+        reading_id=row["id"],
+        sent_at=parse_timestamp(row["timestamp"]) if row.get("timestamp") else None,
+        # Simulator traffic must never reach a consumer as a real warning.
+        status="Exercise" if row.get("simulated") else "Actual",
+        # radius_m omitted: cap_alert picks the severity's zone, matching
+        # server.js HAZARD_RADIUS_M (the map and WhatsApp reach).
     )
     return Response(content=cap_xml, media_type="application/xml")
 
@@ -1460,8 +1688,12 @@ def get_flood_frequency_heatmap():
 @app.get("/api/nodes")
 def get_nodes():
     out = []
-    for node_id, config in NODE_REGISTRY.items():
-        last = node_history[node_id][-1] if node_history[node_id] else None
+    # Snapshot: an admin edit can reload the registry during this loop.
+    for node_id, config in list(NODE_REGISTRY.items()):
+        # .get: second guard against a node visible before its history
+        # entry exists (reload_node_registry creates history first).
+        history = node_history.get(node_id, ())
+        last = history[-1] if history else None
         health = node_health.get(node_id, {})
         out.append(
             {
@@ -1471,7 +1703,7 @@ def get_nodes():
                 "latitude": config["latitude"],
                 "longitude": config["longitude"],
                 "last_river_level_m": last["river_level_m"] if last else None,
-                "reading_count": len(node_history[node_id]),
+                "reading_count": len(history),
                 "last_seen": health.get("last_seen"),
                 "battery_pct": health.get("battery_pct"),
                 "signal_strength_dbm": health.get("signal_strength_dbm"),
@@ -1501,19 +1733,36 @@ def _format_duration(seconds: float) -> str:
     return f"{seconds / 3600:.1f} h"
 
 
-def median_gap_seconds(timestamps: list) -> Optional[float]:
-    """Typical seconds between reports, from at least 3 gaps."""
-    gaps = [(b - a).total_seconds() for a, b in zip(timestamps, timestamps[1:])]
-    gaps = [g for g in gaps if g > 0]
-    return statistics.median(gaps) if len(gaps) >= 3 else None
+REPORT_GAP_PERCENTILE = 0.9
+REPORT_GAP_SAMPLE = 11  # most recent readings (10 gaps) used for a live estimate
+
+
+def expected_gap_seconds(timestamps: list) -> Optional[float]:
+    """The node's NORMAL reporting interval, from at least 3 gaps: a high
+    percentile (the slow end), not the median. Nodes report every 5 s (30 s
+    on deep sleep) while a hazard is elevated and every 60 s (300 s)
+    otherwise; after an elevated burst the median was the burst cadence,
+    so the node that had just reported the hazard was flagged "offline -
+    check power/link or theft" for minutes. With 10 gaps the 90th
+    percentile is the second-largest, so one long outage gap is ignored
+    but the normal heartbeat is kept."""
+    gaps = sorted(g for g in ((b - a).total_seconds() for a, b in zip(timestamps, timestamps[1:])) if g > 0)
+    if len(gaps) < 3:
+        return None
+    return gaps[int(REPORT_GAP_PERCENTILE * (len(gaps) - 1))]
 
 
 def observed_interval_from_db(conn, node_id: str) -> Optional[float]:
+    # 'untimed' backlog rows carry their ARRIVAL time, not when they were
+    # taken, so they say nothing about the node's reporting cadence. A
+    # longer sample than the live estimate (HISTORY_WINDOW + 1), so a
+    # restart right after a hazard burst still sees the normal interval.
     rows = conn.execute(
-        "SELECT timestamp FROM readings WHERE node_id=? AND timestamp IS NOT NULL ORDER BY id DESC LIMIT 11",
-        (node_id,),
+        "SELECT timestamp FROM readings WHERE node_id=? AND timestamp IS NOT NULL "
+        "AND status IS NOT 'untimed' ORDER BY id DESC LIMIT ?",
+        (node_id, HISTORY_WINDOW + 1),
     ).fetchall()
-    return median_gap_seconds(sorted(parse_timestamp(r[0]) for r in rows))
+    return expected_gap_seconds(sorted(parse_timestamp(r[0]) for r in rows))
 
 
 def seed_node_health_from_db():
@@ -1540,6 +1789,7 @@ def seed_node_health_from_db():
                     # signal threshold after a restart (review R20)
                     "link": row["link"],
                     "observed_interval_seconds": observed_interval_from_db(conn, row["node_id"]),
+                    "observed_interval_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
     conn.close()
@@ -1552,14 +1802,17 @@ def compute_node_health(now: Optional[datetime] = None) -> list[dict]:
     otherwise looks exactly like a calm one on the hazard map."""
     now = now or datetime.now(timezone.utc)
     out = []
-    for node_id, cfg in NODE_REGISTRY.items():
+    for node_id, cfg in list(NODE_REGISTRY.items()):  # snapshot - see reload_node_registry()
         health = node_health.get(node_id, {})
         # Expected cadence: the configured value, else what the node has
         # actually been doing. A LoRa node that heartbeats every 60 s used to
         # be judged against the 5 s default and flagged "missing" all the
         # time unless someone configured it by hand (review R19).
-        recent = [r["timestamp"] for r in list(node_history.get(node_id, ()))[-11:]]
-        observed = median_gap_seconds(recent) or health.get("observed_interval_seconds")
+        # The slower of the live estimate and the remembered normal interval
+        # (remember_report_interval), so an elevated burst can't shrink it.
+        recent = [r["timestamp"] for r in list(node_history.get(node_id, ()))[-REPORT_GAP_SAMPLE:]]
+        estimates = [v for v in (expected_gap_seconds(recent), health.get("observed_interval_seconds")) if v]
+        observed = max(estimates) if estimates else None
         interval = cfg.get("report_interval_seconds") or max(DEFAULT_REPORT_INTERVAL_SECONDS, observed or 0)
         offline_after = max(MIN_OFFLINE_AFTER_SECONDS, interval * MISSED_REPORTS_BEFORE_OFFLINE)
         issues = []
@@ -1632,8 +1885,12 @@ def get_river_forecast(node_id: str):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         """SELECT timestamp, river_level_m, rainfall_mm_since_last FROM readings
-           WHERE node_id=? AND status != 'suppressed' AND river_level_m IS NOT NULL
-           ORDER BY id DESC LIMIT 3000""",  # sensor faults excluded
+           WHERE node_id=? AND status NOT IN ('suppressed', 'untimed') AND river_level_m IS NOT NULL
+           ORDER BY id DESC LIMIT 3000""",
+        # Sensor faults are excluded, and so are 'untimed' backlog rows:
+        # they are stamped with their ARRIVAL time (R6), so an hours-old
+        # level would land in the newest step and become the "Now" level
+        # the forecast starts from.
         (node_id,),
     ).fetchall()
     conn.close()
@@ -1708,6 +1965,28 @@ class NodeConfig(BaseModel):
     # Expected seconds between reports; None = DEFAULT_REPORT_INTERVAL_SECONDS.
     # Set e.g. 300 for a deep-sleep node so it isn't flagged missing.
     report_interval_seconds: Optional[float] = Field(default=None, gt=0, le=24 * 3600)
+    # Landslide rainfall threshold I = alpha * D^-beta (mm/h, hours) from a
+    # regional study, in place of the global Caine (1980) 14.82 / 0.39.
+    # None = the global default. The bounds only reject typos: published
+    # I-D thresholds have alpha of a few to a few tens of mm/h and beta
+    # between 0 and 1.
+    landslide_rain_alpha: Optional[float] = Field(default=None, gt=0, le=200)
+    landslide_rain_beta: Optional[float] = Field(default=None, ge=0, le=2)
+
+
+LANDSLIDE_OVERRIDE_FIELDS = ("landslide_rain_alpha", "landslide_rain_beta")
+
+
+def landslide_override_values(cfg: NodeConfig, existing: Optional[dict]) -> tuple:
+    """(alpha, beta) to store. A field left OUT of the request keeps the
+    node's current value: the admin page predates these fields, and a
+    plain location edit from it must not silently wipe a calibrated
+    threshold. Sending null explicitly clears it."""
+    return tuple(
+        getattr(cfg, field) if field in cfg.model_fields_set or existing is None
+        else existing.get(field)
+        for field in LANDSLIDE_OVERRIDE_FIELDS
+    )
 
 
 # LoRa packets carry the node id in 12 bytes (SJ_NODE_ID_LEN in sj_packet.h):
@@ -1743,7 +2022,7 @@ def upstream_problem(node_id: str, upstream: Optional[str]) -> Optional[str]:
 
 @app.get("/api/admin/nodes")
 def admin_list_nodes(auth=Depends(require_admin_auth)):
-    return NODE_REGISTRY
+    return dict(NODE_REGISTRY)  # snapshot - serialised after we return, while a reload may run
 
 
 @app.post("/api/admin/nodes/{node_id}")
@@ -1760,7 +2039,8 @@ def admin_create_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO nodes (node_id, location, land_use, curve_number, latitude, longitude, upstream_node, report_interval_seconds) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO nodes (node_id, location, land_use, curve_number, latitude, longitude, upstream_node, "
+        "report_interval_seconds, landslide_rain_alpha, landslide_rain_beta) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             node_id,
             cfg.location,
@@ -1770,6 +2050,7 @@ def admin_create_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
             cfg.longitude,
             cfg.upstream_node,
             cfg.report_interval_seconds,
+            *landslide_override_values(cfg, None),
         ),
     )
     conn.commit()
@@ -1791,7 +2072,8 @@ def admin_update_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "UPDATE nodes SET location=?, land_use=?, curve_number=?, latitude=?, longitude=?, upstream_node=?, report_interval_seconds=? WHERE node_id=?",
+        "UPDATE nodes SET location=?, land_use=?, curve_number=?, latitude=?, longitude=?, upstream_node=?, "
+        "report_interval_seconds=?, landslide_rain_alpha=?, landslide_rain_beta=? WHERE node_id=?",
         (
             cfg.location,
             cfg.land_use,
@@ -1800,6 +2082,7 @@ def admin_update_node(node_id: str, cfg: NodeConfig, auth=Depends(require_admin_
             cfg.longitude,
             cfg.upstream_node,
             cfg.report_interval_seconds,
+            *landslide_override_values(cfg, NODE_REGISTRY.get(node_id)),
             node_id,
         ),
     )
@@ -1815,7 +2098,7 @@ def admin_delete_node(node_id: str, auth=Depends(require_admin_auth)):
         raise HTTPException(status_code=404, detail=f"Node '{node_id}' does not exist")
 
     dependents = [
-        n for n, cfg in NODE_REGISTRY.items() if cfg.get("upstream_node") == node_id
+        n for n, cfg in list(NODE_REGISTRY.items()) if cfg.get("upstream_node") == node_id
     ]
     if dependents:
         raise HTTPException(
@@ -1832,6 +2115,40 @@ def admin_delete_node(node_id: str, auth=Depends(require_admin_auth)):
     # historical data outlives the node's registry entry, same as
     # deleting a citizen report never deletes the SOS history tied to it.
     return {"status": "deleted", "node_id": node_id}
+
+
+@app.get("/api/model-card")
+def get_model_card(auth=Depends(require_admin_auth)):
+    """Honest evaluation report for the four models (flood, anomaly
+    filter, edge network, LSTM), written offline by ml/evaluate_models.py.
+    Served as-is; the contract is validate_card() in that script.
+
+    Admin-only like the node registry: it is an engineering report, and
+    its numbers come from SYNTHETIC data - the page must show the card's
+    own banner/provenance next to every figure, never the numbers alone.
+    Read on every request (a few KB), so re-running the script needs no
+    backend restart."""
+    try:
+        with open(MODEL_CARD_PATH, encoding="utf-8") as f:
+            card = json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=r"No model card yet - run: venv\Scripts\python.exe ml\evaluate_models.py",
+        )
+    except (OSError, ValueError):
+        # ValueError covers JSONDecodeError and bad UTF-8: a hand-edited or
+        # truncated file is a server problem, not "not generated yet".
+        raise HTTPException(
+            status_code=500,
+            detail=r"model_card.json is unreadable - re-run ml\evaluate_models.py",
+        )
+    if not isinstance(card, dict) or "models" not in card:
+        raise HTTPException(
+            status_code=500,
+            detail=r"model_card.json is not a model card - re-run ml\evaluate_models.py",
+        )
+    return card
 
 
 @app.get("/api/health")

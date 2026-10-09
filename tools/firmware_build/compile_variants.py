@@ -42,6 +42,8 @@ VARIANTS = [
     ("node-default", "sanjeevni_lora_node", {}, None),
     ("node-deepsleep-lora", "sanjeevni_lora_node", DEEP_SLEEP_BATTERY, None),
     ("node-deepsleep-wifi", "sanjeevni_lora_node", {**DEEP_SLEEP_BATTERY, "TRANSPORT": "TRANSPORT_WIFI"}, None),
+    # always-on WiFi node: its flushQueue() is called from loop(), one batch per call
+    ("node-wifi", "sanjeevni_lora_node", {"TRANSPORT": "TRANSPORT_WIFI"}, None),
     # modular landslide node: only MPU6050 + battery, no self-test at boot
     ("node-tilt-only", "sanjeevni_lora_node",
      {"ENABLE_WATER_LEVEL": "0", "ENABLE_DHT": "0", "ENABLE_GAS": "0", "ENABLE_FLAME": "0",
@@ -53,6 +55,17 @@ VARIANTS = [
 ]
 
 
+def shown_path(path):
+    """`path` relative to the repo for the summary line, or absolute when that
+    is impossible: on Windows os.path.relpath raises ValueError ("path is on
+    mount 'C:', start on mount 'D:'") when SANJEEVNI_VAR_DIR puts var/ on
+    another drive - which crashed the run after the first variant compiled."""
+    try:
+        return os.path.relpath(path, REPO)
+    except ValueError:
+        return os.path.abspath(path)
+
+
 def find_cli(explicit):
     for candidate in (explicit, os.environ.get("ARDUINO_CLI"), shutil.which("arduino-cli")):
         if candidate and os.path.isfile(candidate):
@@ -61,13 +74,15 @@ def find_cli(explicit):
 
 
 def apply_overrides(config_path, overrides):
-    text = open(config_path, encoding="utf-8").read()
+    with open(config_path, encoding="utf-8") as f:
+        text = f.read()
     for name, value in overrides.items():
         pattern = re.compile(rf"^(#define {re.escape(name)}[ \t]+)(\S+)", re.MULTILINE)
         text, n = pattern.subn(lambda m: m.group(1) + value, text)
         if n != 1:
             raise SystemExit(f"{config_path}: expected exactly one '#define {name}', found {n}")
-    open(config_path, "w", encoding="utf-8", newline="").write(text)
+    with open(config_path, "w", encoding="utf-8", newline="") as f:  # closed before arduino-cli reads it
+        f.write(text)
 
 
 def prepare(sketch, overrides):
@@ -91,7 +106,8 @@ def compile_one(cli, config_file, work, sketch, log_path, jobs):
     start = time.time()
     run = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     output = run.stdout + run.stderr
-    open(log_path, "w", encoding="utf-8").write(output)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(output)
     return run.returncode, output, time.time() - start
 
 
@@ -135,7 +151,7 @@ def main():
                 "compiled - the safety check did NOT fire" if code == 0 else
                 f"failed, but without '{expected_error}'")
         print(f"{'ok  ' if passed else 'FAIL'} {name:28s} {secs:6.0f}s  {detail}")
-        print(f"     ({label}; log: {os.path.relpath(log_path, REPO)})")
+        print(f"     ({label}; log: {shown_path(log_path)})")
         ok &= passed
 
     print("\nALL VARIANTS OK" if ok else "\nSOME VARIANTS FAILED")

@@ -1,70 +1,334 @@
+/* Staff dashboard. Colours come from the global tokens (global.css); the few
+   extra shades below are local to the dashboard and redefined for dark mode,
+   so both themes stay consistent. Spacing scale: 4 / 8 / 12 / 16 / 20 / 28. */
 .main {
-  padding: 20px;
-  max-width: 1280px;
+  --dash-accent: var(--green-dark);
+  --dash-gap: 16px;
+  --dash-amber-bg: #fff4e0;
+  --dash-amber-text: #8a4b00;
+  --dash-crit-solid: #b71c1c;
+  --dash-alert-glow: rgba(220, 38, 38, 0.18);
+
+  padding: 16px 16px 40px;
+  max-width: 1600px;
   margin: 0 auto;
+}
+@media (min-width: 700px) {
+  .main {
+    --dash-gap: 20px;
+    padding: 24px 24px 48px;
+  }
+}
+@media (prefers-color-scheme: dark) {
+  .main {
+    --dash-accent: #a5d6a7;
+    --dash-amber-bg: #3a2a10;
+    --dash-amber-text: #ffcc80;
+    --dash-crit-solid: #c62828;
+    --dash-alert-glow: rgba(255, 107, 107, 0.22);
+  }
+}
+/* Focus lands on <main> via the skip link; no ring around the whole page */
+.main:focus {
+  outline: none;
 }
 
 .main h2 {
-  color: var(--green-dark);
-  margin: 28px 0 12px;
+  color: var(--dash-accent);
+  margin: 0 0 12px;
+  font-size: 1.25rem;
+  line-height: 1.3;
 }
-@media (prefers-color-scheme: dark) {
-  .main h2 {
-    color: #a5d6a7;
+
+.section {
+  margin-top: 28px;
+  min-width: 0;
+}
+
+.sectionHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin-bottom: 12px;
+}
+.main .sectionHead h2 {
+  margin: 0;
+}
+.sectionMeta {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ---- Header: alarm sound control ---- */
+.headerTools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---- Live / last-updated bar ---- */
+.liveBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 10px 14px;
+  font-size: 14px;
+}
+.liveState {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: bold;
+}
+.liveDot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--sev-low);
+}
+.live_stale .liveState {
+  color: var(--critical-text);
+}
+.live_stale .liveDot {
+  background: var(--sev-high);
+}
+.live_connecting .liveDot {
+  background: var(--sev-medium);
+}
+.liveMeta {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+.countChip {
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 13px;
+  font-weight: bold;
+  background: var(--green-light);
+  color: var(--dash-accent);
+  white-space: nowrap;
+}
+.countChipAlert {
+  background: var(--critical-bg);
+  color: var(--critical-text);
+}
+@media (max-width: 520px) {
+  .counts {
+    margin-left: 0;
   }
+}
+
+/* ---- Overview: critical hazard + latest reading ---- */
+.overview {
+  display: grid;
+  gap: 0 var(--dash-gap);
+  /* start, not stretch: a stretched section would let the critical card
+     (and the hospital card under it) overflow into the next section */
+  align-items: start;
+}
+/* Wide / control-room screens: the two most important blocks side by side */
+@media (min-width: 1200px) {
+  .overview {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  }
+}
+
+.readingSection {
+  container-type: inline-size;
 }
 
 /* ---- KPI tiles ---- */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 15px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
 }
-@media (max-width: 900px) {
+/* 2 or 4 columns (never 3) so the 8 tiles never leave a gap; 4 only once
+   each tile has room for a node ID or hazard name on one line */
+@container (min-width: 720px) {
   .tiles {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
 .tile {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
   background: var(--surface);
-  padding: 18px 20px;
+  padding: 14px 16px;
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   border: 1px solid var(--border);
-  min-width: 0;
-}
-.tiles {
-  margin: 0;
+  border-left: 5px solid var(--green-mid);
 }
 .tileLabel {
-  margin: 0 0 8px;
+  margin: 0;
   color: var(--text-muted);
-  font-size: 15px;
+  font-size: 12.5px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 .tileValue {
   margin: 0;
-  font-size: 28px;
+  font-size: 26px;
+  line-height: 1.15;
   font-weight: bold;
-  color: var(--green-dark);
-  overflow-wrap: anywhere;
+  color: var(--dash-accent);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: break-word;
 }
-@media (prefers-color-scheme: dark) {
-  .tileValue {
-    color: #a5d6a7;
-  }
+.tileText {
+  font-size: 19px;
+}
+.tileIcon {
+  margin-right: 6px;
+  font-size: 0.9em;
+}
+.unit {
+  font-size: 0.55em;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.tileTone_MEDIUM {
+  border-left-color: var(--sev-medium);
+}
+.tileTone_MEDIUM .tileValue {
+  color: var(--dash-amber-text);
+}
+.tileTone_HIGH,
+.tileTone_CRITICAL {
+  border-left-color: var(--sev-high);
+}
+.tileTone_HIGH .tileValue,
+.tileTone_CRITICAL .tileValue {
+  color: var(--critical-text);
+}
+
+/* Risk meter (decorative; the number carries the value) */
+.meter {
+  display: block;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: var(--green-light);
+  overflow: hidden;
+}
+.meterFill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green-mid);
+}
+.tileTone_MEDIUM .meterFill,
+.MEDIUM .meterFill {
+  background: var(--sev-medium);
+}
+.tileTone_HIGH .meterFill,
+.tileTone_CRITICAL .meterFill,
+.HIGH .meterFill,
+.CRITICAL .meterFill {
+  background: var(--sev-high);
+}
+
+/* ---- Severity badge (shape + text, never colour alone) ---- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  background: var(--green-lighter);
+  color: var(--text-muted);
+}
+.tone_LOW {
+  background: var(--green-light);
+  color: var(--dash-accent);
+}
+.tone_MEDIUM {
+  background: var(--dash-amber-bg);
+  color: var(--dash-amber-text);
+}
+.tone_HIGH {
+  background: var(--critical-bg);
+  color: var(--critical-text);
+}
+.tone_CRITICAL {
+  background: var(--dash-crit-solid);
+  border-color: var(--dash-crit-solid);
+  color: #fff;
 }
 
 /* ---- Nearest hospital ---- */
 .hospital {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  margin-top: 12px;
+  padding: 14px 16px;
   background: var(--green-light);
-  padding: 15px 20px;
-  border-radius: var(--radius);
-  margin-top: 20px;
   border: 1px solid var(--green-mid);
+  border-radius: var(--radius);
 }
-.hospital a {
+.hospitalIcon {
+  font-size: 28px;
+  line-height: 1;
+}
+.hospitalText {
+  flex: 1 1 200px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+.hospitalLabel {
+  font-size: 13px;
   font-weight: bold;
+  color: var(--text-muted);
+}
+.directions {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: var(--green);
+  color: #fff;
+  font-weight: bold;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.directions:hover {
+  background: var(--green-dark);
 }
 
 /* ---- Critical hazard callout ---- */
@@ -72,34 +336,72 @@
   text-decoration: none;
   color: inherit;
   display: block;
+  border-radius: var(--radius);
 }
 
 .critical {
   background: var(--surface);
   border-radius: var(--radius);
-  padding: 20px 24px;
-  box-shadow: 0 3px 14px rgba(220, 38, 38, 0.18);
+  padding: 20px;
   border: 2px solid var(--sev-high);
+  border-left-width: 8px;
+  box-shadow: 0 3px 14px var(--dash-alert-glow);
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 20px;
+  gap: 16px 24px;
   flex-wrap: wrap;
   transition: box-shadow 0.15s;
 }
 .cardLink:hover .critical {
   box-shadow: 0 6px 20px rgba(220, 38, 38, 0.28);
 }
+.criticalMain {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+.criticalTop {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+.moreNote {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--text-muted);
+}
 .critical h3 {
   margin: 0 0 6px;
-  font-size: 20px;
+  font-size: 22px;
+  line-height: 1.25;
   color: var(--critical-text);
+  overflow-wrap: anywhere;
+}
+.critical .hint {
+  display: block;
 }
 .criticalScore {
-  font-size: 36px;
+  min-width: 110px;
+  font-size: 44px;
+  line-height: 1;
   font-weight: 800;
   color: var(--critical-text);
   text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 480px) {
+  .critical {
+    padding: 16px;
+  }
+  .critical h3 {
+    font-size: 19px;
+  }
+  .criticalScore {
+    font-size: 36px;
+    text-align: left;
+  }
 }
 .scoreLabel {
   display: block;
@@ -108,7 +410,56 @@
   letter-spacing: 1px;
   color: var(--text-muted);
   text-transform: uppercase;
-  margin-top: 2px;
+  margin-top: 6px;
+}
+
+/* The top hazard is not always HIGH: match its colour to its severity */
+.critical_MEDIUM {
+  border-color: var(--sev-medium);
+  box-shadow: var(--shadow);
+}
+.critical_MEDIUM h3,
+.critical_MEDIUM .criticalScore {
+  color: var(--dash-amber-text);
+}
+.critical_LOW,
+.critical_NONE {
+  border-color: var(--green-mid);
+  box-shadow: var(--shadow);
+}
+.critical_LOW h3,
+.critical_LOW .criticalScore,
+.critical_NONE h3,
+.critical_NONE .criticalScore {
+  color: var(--dash-accent);
+}
+
+/* Slow glow on a HIGH / CRITICAL callout - only when motion is welcome */
+@media (prefers-reduced-motion: no-preference) {
+  .critical_HIGH,
+  .critical_CRITICAL {
+    animation: alertGlow 2.4s ease-in-out infinite;
+  }
+  .live_live .liveDot {
+    animation: livePulse 2s ease-out infinite;
+  }
+}
+@keyframes alertGlow {
+  0%,
+  100% {
+    box-shadow: 0 3px 14px var(--dash-alert-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--dash-alert-glow), 0 3px 20px var(--dash-alert-glow);
+  }
+}
+@keyframes livePulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(67, 160, 71, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 8px rgba(67, 160, 71, 0);
+  }
 }
 
 .allClear {
@@ -116,19 +467,15 @@
   border: 1px solid var(--green-mid);
   border-radius: var(--radius);
   padding: 18px 22px;
-  color: var(--green-dark);
+  color: var(--dash-accent);
   font-weight: bold;
-}
-@media (prefers-color-scheme: dark) {
-  .allClear {
-    color: #a5d6a7;
-  }
 }
 
 .location {
   color: var(--text-muted);
   font-size: 14px;
   margin-bottom: 8px;
+  overflow-wrap: anywhere;
 }
 
 .eta {
@@ -137,19 +484,55 @@
   padding: 8px 10px;
   border-radius: 6px;
   display: inline-block;
+  max-width: 100%;
 }
 .critical .eta {
   background: var(--critical-bg);
 }
+.critical_MEDIUM .eta {
+  background: var(--dash-amber-bg);
+}
+.critical_LOW .eta,
+.critical_NONE .eta {
+  background: var(--green-lighter);
+}
+
+/* Highlight after "show" in the emergency alarm */
+.highlighted {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .hazardCard.highlighted {
+    animation: flash 1s ease-in-out 3;
+  }
+}
+@keyframes flash {
+  50% {
+    background: var(--critical-bg);
+  }
+}
 
 /* ---- Hazard cards ---- */
 .hazardGrid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 15px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: var(--dash-gap);
+}
+.hazardItem {
+  min-width: 0;
+}
+/* equal-height cards in the hazard grid */
+.hazardItem > .cardLink {
+  height: 100%;
 }
 
 .hazardCard {
+  display: flex;
+  flex-direction: column;
   background: var(--surface);
   border-radius: var(--radius);
   padding: 16px 18px;
@@ -163,15 +546,25 @@
   box-shadow: var(--shadow-hover);
   transform: translateY(-2px);
 }
+.cardHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
 .hazardCard h3 {
-  margin: 0 0 6px;
+  margin: 0;
   font-size: 17px;
+  line-height: 1.3;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .MEDIUM {
   border-left-color: var(--sev-medium);
 }
 .MEDIUM h3 {
-  color: var(--sev-medium);
+  color: var(--dash-amber-text);
 }
 .HIGH,
 .CRITICAL {
@@ -181,33 +574,106 @@
 .CRITICAL h3 {
   color: var(--sev-high);
 }
+.LOW {
+  border-left-color: var(--green-mid);
+}
 
 .scoreRow {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  font-size: 14px;
+  color: var(--text-muted);
 }
 .score {
   font-size: 22px;
   font-weight: bold;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.hazardCard .meter {
+  margin: 4px 0 12px;
+}
+.hazardCard .eta {
+  align-self: flex-start;
+}
+/* Node stopped reporting: last known state only (never alarms) */
+.stale {
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  padding: 6px 10px;
+  border-radius: 6px;
+  align-self: flex-start;
+  max-width: 100%;
 }
 .hint {
   margin-top: 10px;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--green);
   font-weight: bold;
+}
+.hazardCard .hint {
+  margin-top: auto;
+  padding-top: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  .hint {
+    color: var(--dash-accent);
+  }
 }
 
 .empty {
   color: var(--text-muted);
   font-style: italic;
+  margin: 0;
+}
+
+/* ---- Loading skeletons ---- */
+.skeleton {
+  display: block;
+  border-radius: 8px;
+  background: linear-gradient(90deg, var(--green-light) 25%, var(--green-lighter) 50%, var(--green-light) 75%);
+  background-size: 200% 100%;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton {
+    animation: shimmer 1.4s linear infinite;
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+.skeletonCard {
+  height: 132px;
+  border-radius: var(--radius);
+}
+.skeletonText {
+  display: inline-block;
+  width: 70%;
+  height: 0.9em;
+}
+.skeletonGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: var(--dash-gap);
 }
 
 /* ---- Sensor table ---- */
+/* Scrolls on its own in both directions (never the page); the header row
+   stays visible while scrolling down. */
 .tableWrap {
-  overflow-x: auto;
+  overflow: auto;
+  max-height: min(70vh, 560px);
   -webkit-overflow-scrolling: touch;
+  background: var(--surface);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   border: 1px solid var(--border);
@@ -215,43 +681,66 @@
 .table {
   width: 100%;
   min-width: 760px;
-  background: var(--surface);
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
 }
 .table th,
 .table td {
-  padding: 11px 12px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   text-align: left;
   font-size: 14px;
+  vertical-align: middle;
 }
 .table th {
-  background: var(--green-dark);
-  color: #fff;
   position: sticky;
   top: 0;
+  z-index: 1;
+  background: var(--green-dark);
+  color: #fff;
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
 }
-.table tbody tr:hover {
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+.table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.table tbody tr:nth-child(even) {
   background: var(--green-lighter);
 }
-.risk_LOW {
-  color: var(--sev-low);
+.table tbody tr.rowSevere {
+  background: var(--critical-bg);
+}
+.table tbody tr:hover {
+  background: var(--green-light);
+}
+.device {
+  white-space: nowrap; /* IDs are at most 12 chars; the table scrolls in its own wrapper */
   font-weight: bold;
 }
-.risk_MEDIUM {
-  color: var(--sev-medium);
-  font-weight: bold;
+.muted {
+  color: var(--text-muted);
 }
-.risk_HIGH,
-.risk_CRITICAL {
-  color: var(--sev-high);
-  font-weight: bold;
+.cellUnit {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+.table td.empty {
+  text-align: center;
+  padding: 24px 12px;
 }
 
 .errorBox {
   background: var(--danger-bg);
   color: var(--danger);
+  border: 1px solid currentColor;
   border-radius: var(--radius);
   padding: 12px 16px;
-  margin-top: 16px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
 }
