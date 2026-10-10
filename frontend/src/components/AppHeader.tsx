@@ -54,6 +54,9 @@ export function UserChip({ variant = "onBrand" }: { variant?: "onBrand" | "light
         <span className={styles.name}>{username}</span>
         <span className={styles.role}>{role}</span>
       </span>
+      {(role === "officer" || role === "admin") && window.location.pathname !== "/trends.html" && (
+        <a className={styles.adminLink} href="/trends.html">Trends &amp; reports</a>
+      )}
       {role === "admin" && window.location.pathname !== "/admin.html" && (
         <a className={styles.adminLink} href="/admin.html">Manage nodes</a>
       )}
@@ -62,4 +65,9 @@ export function UserChip({ variant = "onBrand" }: { variant?: "onBrand" | "light
       </button>
     </div>
   );
+}
+
+/** A plain page link styled for the green header (e.g. the trends page's "Officer map"). */
+export function HeaderNavLink({ href, children }: { href: string; children: ReactNode }) {
+  return <a className={styles.adminLink} href={href}>{children}</a>;
 }

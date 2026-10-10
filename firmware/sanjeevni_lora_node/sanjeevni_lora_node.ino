@@ -1,16 +1,57 @@
 /*
  * SANJEEVNI - LoRa sensor node (Phase 2)
  * =====================================================================
- * Samples every sensor every 5 s, runs the edge-AI model on the device,
- * and decides locally what to send:
- *   - elevated (edge AI WATCH/URGENT, or a local threshold): send NOW
- *   - normal: one heartbeat reading per minute
+ * Samples every sensor every 5 s, runs an edge-AI model on the device
+ * (edge_ai.h: the MAIN model with water + DHT + gas + flame fitted, the
+ * LITE one on any other kit - deep-sleep wakes included; config.h
+ * EDGE_MODEL), and decides locally what to send (sj_report.h):
+ *   - urgent (edge AI WATCH/URGENT, a local threshold, a fast river rise,
+ *     a newly raised sensor anomaly, an SOS): send NOW, and ahead of any
+ *     queued backlog (urgent outbox; its queued copy is not sent twice)
+ *   - normal: one report per NORMAL_REPORT_INTERVAL_MS (5 min without a
+ *     siren, 1 min with one - config.h) - the latest sample plus a SUMMARY
+ *     (min / max / mean, highest edge verdict) of every sample since the
+ *     previous report (SUMMARY_ENABLE)
  * Every reading to send goes into a LittleFS queue first and is removed
  * only after the gateway (LoRa) or backend (WiFi) acknowledges it - so
  * readings survive link outages and reboots (store-and-forward).
  * MQ135 gas and PMS5003 PM values are left out (and can't trigger the
  * local alert) until MQ135_WARMUP_S / PMS5003_WARMUP_S after each boot:
  * a cold heater / fan gives false values (sj_warmup.h).
+ * Optional for solar nodes (MQ135_DUTY_CYCLE / PMS5003_DUTY_CYCLE, off by
+ * default; sj_duty.h): the heater / fan are switched on only around the
+ * reports that carry their value, and stay on while the node is elevated.
+ *
+ * SOS button (SOS_BUTTON_PIN, config.h) - for people with no phone: held
+ * for SOS_HOLD_MS it measures at once and sends that reading flagged as an
+ * SOS BEFORE any queued backlog (sj_sos.h, SjPriorityOutbox in
+ * sj_packet.h); it is queued on flash as well, so it is retried until
+ * acknowledged and survives a reboot. The server raises an SOS at the
+ * node's registered position. It also wakes a deep-sleeping node.
+ *
+ * Village siren (SIREN_PIN, config.h; sj_siren.h): sounds when the server
+ * commands it - the command comes in the gateway's ACK of one of our
+ * readings (SjAckCmd) - or, only as an offline fallback, when the gateway
+ * has not answered for SIREN_OFFLINE_AFTER_S and the water level or gas is
+ * at its siren danger level on consecutive samples (evacuation hazards
+ * only - never heat, PM, tilt, flame or an edge-AI verdict on its own;
+ * decision 2026-10-09). Every reading says whether it is fitted /
+ * sounding / why, and a change is reported at once. A command over LoRa is
+ * obeyed only if its MAC checks out with this node's SIREN_CMD_KEY
+ * (secrets.h; sj_auth.h) - without a key the node still acknowledges and
+ * still has its offline fallback, but no LoRa command can sound it.
+ *
+ * Flash flood + sensor anomalies (sj_anomaly.h): every regular sample
+ * updates the river's rate of rise (cm/min over RISE_WINDOW_S); a fast rise
+ * is flagged (fast_rise) and sent at once. Per-sensor checks - stuck value,
+ * spike, physically impossible rate, dropouts - go into every reading as
+ * edge_anomaly for the backend; a value they doubt never sounds the
+ * offline siren on its own.
+ *
+ * Offline SOS Wi-Fi (SOS_HOTSPOT_ENABLE, mains/solar LoRa nodes; sj_hotspot.h):
+ * an open access point "SANJEEVNI-SOS" with a captive SOS page. A request
+ * is kept in an outbox (RAM + NVS) and sent to the gateway as an SjSosMsg
+ * packet, ahead of everything else, until the gateway ACKs it.
  *
  * DEEP_SLEEP_ENABLED 1 (config.h, battery nodes without MQ135/PMS5003):
  * each wake measures once, queues, sends, and sleeps again - every
@@ -37,18 +78,31 @@
 #include <esp_timer.h>
 #include <sys/time.h>
 #include "config.h"
+#if DEEP_SLEEP_ENABLED && SOS_BUTTON_PIN >= 0
+#include <driver/rtc_io.h>  // the button's pull-up has to stay on in deep sleep
+#endif
 #include "sj_packet.h"
 #include "sj_file_queue.h"
 #include "sj_sleep.h"
 #include "sj_session.h"
 #include "sj_selftest.h"
 #include "sj_warmup.h"
+#include "sj_duty.h"
+#include "sj_sos.h"
+#include "sj_siren.h"
+#include "sj_anomaly.h"
+#include "sj_report.h"
+#include "sj_hotspot.h"
 #include "sensors.h"
 #include "edge_ai.h"
 
 #if TRANSPORT == TRANSPORT_LORA
 #include <SPI.h>
 #include <RadioLib.h>
+// secrets.h is optional on a LoRa node: only SIREN_CMD_KEY is read from it.
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
 #elif TRANSPORT == TRANSPORT_WIFI
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -57,11 +111,18 @@
 #else
 #error "Set TRANSPORT in config.h"
 #endif
+#if SOS_HOTSPOT_ENABLE
+#include <WiFi.h>
+#include "sj_hotspot_ap.h"
+#endif
 
-// One queued reading + when it was measured (device seconds since boot)
+// One queued reading + when it was measured (device seconds since boot) +
+// its summary (used only with SJ_X_SUMMARY). The summary is last: the
+// queue upgrade (sjUpgradeRecord) converts the older layouts without it.
 struct QueuedReading {
   SjReading reading;
   uint32_t takenAtS;
+  SjSummary summary;
 };
 
 static SjFileQueue<QueuedReading> queue;
@@ -79,9 +140,48 @@ static uint32_t lastSerialMs = 0;  // deep sleep: a Serial command keeps the nod
 static bool queueOk = false;
 static bool edgeOk = false;
 
-// Survives deep sleep (not a power-on) - see sj_sleep.h
+// Survives deep sleep and resets (not a power-on) - see sj_sleep.h
 RTC_DATA_ATTR static SjSleepState sleepState;
 static bool resumedFromSleep = false;
+
+// SOS readings waiting to be sent before the backlog (sj_packet.h). Two:
+// a second SOS after the cooldown while the first is still unsent.
+static SjPriorityOutbox<QueuedReading, 2> sosOutbox;
+// Urgent readings (SJ_X_PRIORITY) waiting to go ahead of the backlog, right
+// after the SOS ones; full = the oldest falls back to its place in the
+// queue. And the readings that went ahead, so their queued copies are not
+// sent again (sj_packet.h). Both RAM: lost in deep sleep / a reset, which
+// costs at worst one duplicate packet per reading, never a reading.
+static SjPriorityOutbox<QueuedReading, URGENT_OUTBOX_SLOTS> urgentOutbox;
+static SjSentAhead<SENT_AHEAD_SLOTS> sentAhead;
+// The regular samples since the last regular report (sj_report.h)
+static SjSummaryAcc summaryAcc;
+static bool sosRequested = false;      // the button was held: measure + send an SOS reading
+static uint32_t sosConfirmedAtMs = 0;  // the gateway has the SOS: LED on for SOS_LED_CONFIRM_MS from here
+static bool sosConfirmed = false;
+
+#if SIREN_PIN >= 0
+static const SjSirenTiming SIREN_TIMING = {SIREN_OFFLINE_AFTER_S * 1000UL, SIREN_OFFLINE_URGENT_SAMPLES,
+                                           SIREN_ON_S * 1000UL, SIREN_MAX_ON_S * 1000UL, SIREN_COOLDOWN_S * 1000UL};
+static SjSiren siren;
+#endif
+#if SIREN_PIN >= 0 && TRANSPORT == TRANSPORT_LORA
+#ifndef SIREN_CMD_KEY
+#define SIREN_CMD_KEY ""  // no secrets.h entry: LoRa siren commands are refused (setupSiren() says so)
+#endif
+static uint8_t sirenCmdKey[SJ_CMD_KEY_LEN];
+static bool sirenCmdKeyOk = false;  // SIREN_CMD_KEY parsed: commands in the gateway's ACK are checked with it
+#endif
+static bool sirenReportDue = false;  // the siren started / stopped: measure and report now
+
+// River rise rate + sensor anomaly checks (sj_anomaly.h). On a deep-sleep
+// node in RTC memory, so the history survives the sleeps (magic-checked;
+// a power-on starts it over).
+#if DEEP_SLEEP_ENABLED
+RTC_DATA_ATTR
+#endif
+static SjEdgeTrack edgeTrack;
+static SjEdgeConfig edgeConfig;
 
 // Seconds on the RTC clock. Unlike esp_timer (which restarts at 0 on every
 // wake), it keeps counting through deep sleep, so a reading queued before
@@ -100,6 +200,172 @@ static uint32_t deviceSeconds() {
 // 49.7 days and switch the gas/PM values off again for minutes.
 static uint32_t uptimeSeconds() { return (uint32_t)(esp_timer_get_time() / 1000000LL); }
 
+// Milliseconds on the same RTC clock as deviceSeconds() - it keeps running
+// through deep sleep, so the rise rate spans wakes. Wraps after 49.7 days;
+// sj_anomaly.h only takes differences.
+static uint32_t deviceMillis() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (uint32_t)((uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL);
+}
+
+// =====================================================================
+// Gas / PM duty cycle (solar nodes; sj_duty.h, config.h) - off by default.
+// Off: the sensors are always powered and "warm" means past the boot
+// warm-up only - exactly the behaviour without the duty cycle.
+// =====================================================================
+#if MQ135_DUTY_CYCLE
+static const SjDutyCfg GAS_DUTY =
+    sjDutyConfig(MQ135_WARMUP_S, DUTY_MARGIN_S, NORMAL_REPORT_INTERVAL_MS, SJ_DUTY_EVERY_N(MQ135_DUTY_PERIOD_S));
+static SjDuty gasDuty;
+static void setGasHeater(bool on) { digitalWrite(MQ135_HEATER_PIN, on ? MQ135_HEATER_ON : !MQ135_HEATER_ON); }
+#endif
+#if PMS5003_DUTY_CYCLE
+static const SjDutyCfg PM_DUTY =
+    sjDutyConfig(PMS5003_WARMUP_S, DUTY_MARGIN_S, NORMAL_REPORT_INTERVAL_MS, SJ_DUTY_EVERY_N(PMS5003_DUTY_PERIOD_S));
+static SjDuty pmDuty;
+static uint32_t pmsCmdMs = 0;  // last sleep / wake command
+static void pmsSetAwake(bool awake) {
+#if PMS5003_SET_PIN >= 0
+  digitalWrite(PMS5003_SET_PIN, awake ? HIGH : LOW);  // datasheet: LOW = sleeping mode
+#else
+  uint8_t cmd[7];
+  sjPmsCommand(cmd, SJ_PMS_CMD_SLEEP_SET, awake ? 1 : 0);
+  Serial2.write(cmd, sizeof(cmd));
+#endif
+  pmsCmdMs = millis();
+}
+#endif
+
+#if ENABLE_GAS
+static bool gasPowered() {
+#if MQ135_DUTY_CYCLE
+  return gasDuty.powered;
+#else
+  return true;
+#endif
+}
+// Seconds the heater has been on - the self-test's "warming up (Ns of Ws)"
+static uint32_t gasPoweredS() {
+  uint32_t s = uptimeSeconds();
+#if MQ135_DUTY_CYCLE
+  uint32_t on = sjDutyPoweredMs(gasDuty, millis()) / 1000;
+  if (on < s) s = on;
+#endif
+  return s;
+}
+// A value read now counts: past the boot warm-up and, with the duty cycle,
+// MQ135_WARMUP_S since the heater was last switched on.
+static bool gasWarm() {
+  bool warm = !sjWarmingUp(uptimeSeconds(), MQ135_WARMUP_S);
+#if MQ135_DUTY_CYCLE
+  warm = warm && sjDutyWarm(gasDuty, GAS_DUTY, millis(), 0);
+#endif
+  return warm;
+}
+#endif
+#if ENABLE_PMS5003
+static bool pmPowered() {
+#if PMS5003_DUTY_CYCLE
+  return pmDuty.powered;
+#else
+  return true;
+#endif
+}
+static uint32_t pmPoweredS() {
+  uint32_t s = uptimeSeconds();
+#if PMS5003_DUTY_CYCLE
+  uint32_t on = sjDutyPoweredMs(pmDuty, millis()) / 1000;
+  if (on < s) s = on;
+#endif
+  return s;
+}
+// A frame received frameAgeMs ago counts: it was measured past the boot
+// warm-up (sjWarmWhenMeasured) and, with the duty cycle, after the fan had
+// run PMS5003_WARMUP_S since it was last switched on.
+static bool pmWarm(uint32_t frameAgeMs) {
+  bool warm = sjWarmWhenMeasured(uptimeSeconds(), frameAgeMs, PMS5003_WARMUP_S);
+#if PMS5003_DUTY_CYCLE
+  warm = warm && sjDutyWarm(pmDuty, PM_DUTY, millis(), frameAgeMs);
+#endif
+  return warm;
+}
+// readPm() found no frame for 10 s: a dropout once the PMS5003 should be
+// streaming - past the boot warm-up and, with the duty cycle,
+// PMS5003_WARMUP_S since it was switched ON (sjDutyMissIsDropout: counted
+// from the wake, so the repeated wake commands to a dead module do not
+// hide it). A slow first frame after a wake is not a dropout.
+static bool pmMissIsDropout() {
+  bool due = !sjWarmingUp(uptimeSeconds(), PMS5003_WARMUP_S);
+#if PMS5003_DUTY_CYCLE
+  due = due && sjDutyMissIsDropout(pmDuty, PM_DUTY, millis());
+#endif
+  return due;
+}
+#endif
+
+static void setupDutyCycle() {
+#if MQ135_DUTY_CYCLE
+  pinMode(MQ135_HEATER_PIN, OUTPUT);
+  setGasHeater(true);  // on at boot: the first warm-up starts with the node
+  sjDutyBegin(gasDuty, millis());
+  Serial.printf("[duty] MQ135 heater duty cycle: gas in every %u. report (warm-up %us)\n", (unsigned)GAS_DUTY.everyN,
+                (unsigned)MQ135_WARMUP_S);
+#endif
+#if PMS5003_DUTY_CYCLE
+#if PMS5003_SET_PIN >= 0
+  pinMode(PMS5003_SET_PIN, OUTPUT);
+#endif
+  pmsSetAwake(true);  // a reset of the ESP32 does not wake a PMS5003 slept by the serial command
+  sjDutyBegin(pmDuty, millis());
+  Serial.printf("[duty] PMS5003 duty cycle (%s): PM in every %u. report (fan settles %us)\n",
+                PMS5003_SET_PIN >= 0 ? "SET pin" : "serial command", (unsigned)PM_DUTY.everyN,
+                (unsigned)PMS5003_WARMUP_S);
+#endif
+}
+
+// Every loop(): switch the heater / fan for the next report that should
+// carry their value; both stay on while the node is elevated.
+static void serviceDutyCycle() {
+#if MQ135_DUTY_CYCLE || PMS5003_DUTY_CYCLE
+  uint32_t now = millis();
+#endif
+#if MQ135_DUTY_CYCLE
+  SjDutyAction g = sjDutyStep(gasDuty, GAS_DUTY, now, lastReportMs, NORMAL_REPORT_INTERVAL_MS, elevated);
+  if (g != SJ_DUTY_STAY) {
+    setGasHeater(g == SJ_DUTY_WAKE);
+    Serial.println(g == SJ_DUTY_WAKE ? "[duty] MQ135 heater on - warming up" : "[duty] MQ135 heater off");
+  }
+#endif
+#if PMS5003_DUTY_CYCLE
+  SjDutyAction p = sjDutyStep(pmDuty, PM_DUTY, now, lastReportMs, NORMAL_REPORT_INTERVAL_MS, elevated);
+  if (p != SJ_DUTY_STAY) {
+    pmsSetAwake(p == SJ_DUTY_WAKE);
+    Serial.println(p == SJ_DUTY_WAKE ? "[duty] PMS5003 awake - fan settling" : "[duty] PMS5003 asleep");
+  }
+#if PMS5003_SET_PIN < 0
+  // The serial command can be missed (e.g. sent while the module was
+  // sending): repeat it while the PMS5003 does not obey (sj_duty.h).
+  // A repeated wake restarts the warm-up: the fan may only start now.
+  else if (sjPmsResendDue(pmDuty, now, pmsCmdMs, sjPmEverSeen, sjPmLastFrameMs)) {
+    pmsSetAwake(pmDuty.powered);
+    sjDutyRestartWarmUp(pmDuty, now);
+  }
+#endif
+#endif
+}
+
+// After every reading that went out as a report: did it carry a warm value?
+static void dutyOnReport(const SjReading& r) {
+#if MQ135_DUTY_CYCLE
+  sjDutyOnReport(gasDuty, (r.flags & SJ_HAS_GAS) != 0);
+#endif
+#if PMS5003_DUTY_CYCLE
+  sjDutyOnReport(pmDuty, (r.flags & SJ_HAS_PM) != 0);
+#endif
+  (void)r;
+}
+
 // =====================================================================
 // Reading
 // =====================================================================
@@ -107,7 +373,10 @@ static uint32_t uptimeSeconds() { return (uint32_t)(esp_timer_get_time() / 10000
 // is simply left out, so e.g. a dead DHT22 no longer throws away a good
 // water level. Returns false only if NOTHING could be measured - the
 // backend rejects such a reading, so it isn't queued.
-static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
+// failed: bit (1 << SJ_AF_*) per watched sensor that is fitted but did not
+// answer this time - the anomaly checks count these as dropouts (a sensor
+// still warming up is not a failure).
+static bool takeReading(SjReading& r, bool& localAlert, uint8_t& failed) {
   memset(&r, 0, sizeof(r));
   r.magic = SJ_MAGIC;
   r.version = SJ_VERSION;
@@ -115,6 +384,7 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
   strncpy(r.node_id, NODE_ID, SJ_NODE_ID_LEN);
   r.edge_risk = SJ_EDGE_NONE;
   localAlert = false;
+  failed = 0;
 
   float waterM = 0, tempC = 0, humidity = 0, gasPpm = 0;
   bool flame = false;
@@ -124,6 +394,7 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
     r.water_level_mm = sjClampU16(waterM * 1000.0f);
     localAlert |= waterM >= LOCAL_WATER_FRACTION_LIMIT * ULTRASONIC_MOUNT_HEIGHT_CM / 100.0f;
   } else {
+    failed |= 1u << SJ_AF_WATER;
     Serial.println("[sensor] water level: no echo");
   }
 #endif
@@ -134,15 +405,19 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
     r.humidity_x100 = sjClampU16(humidity * 100);
     localAlert |= tempC >= LOCAL_TEMP_LIMIT_C;
   } else {
+    failed |= (1u << SJ_AF_TEMP) | (1u << SJ_AF_HUMIDITY);
     Serial.println("[sensor] DHT22 read failed");
   }
 #endif
 #if ENABLE_GAS
   // Still read during the warm-up, so a missing sensor is reported at once;
-  // the value itself is only used after MQ135_WARMUP_S (sj_warmup.h).
-  if (readGasPpm(gasPpm)) {
-    localAlert |= sjAddGasValue(r, gasPpm, uptimeSeconds(), MQ135_WARMUP_S, LOCAL_GAS_LIMIT_PPM);
+  // the value itself is only used once warm (sj_warmup.h). Heater off (duty
+  // cycle): not read at all - no value, and not a dropout.
+  if (!gasPowered()) {
+  } else if (readGasPpm(gasPpm)) {
+    localAlert |= sjAddGasValueIfWarm(r, gasPpm, gasWarm(), LOCAL_GAS_LIMIT_PPM);
   } else {
+    failed |= 1u << SJ_AF_GAS;
     Serial.println("[sensor] MQ135: no signal");
   }
 #endif
@@ -172,13 +447,19 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
     r.tilt_deg_x100 = sjClampI16(tilt * 100);
     r.vibration_g_x1000 = sjClampU16(vibration * 1000);
     localAlert |= tilt >= LOCAL_TILT_LIMIT_DEG;
+  } else {
+    failed |= 1u << SJ_AF_TILT;
   }
 #endif
 #if ENABLE_PMS5003
   uint16_t pm25, pm10;
-  if (readPm(pm25, pm10)) {  // left out until PMS5003_WARMUP_S (sj_warmup.h)
-    localAlert |=
-        sjAddPmValues(r, pm25, pm10, uptimeSeconds(), PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT);
+  if (!pmPowered()) {
+    // asleep (duty cycle): no value, and not a dropout
+  } else if (readPm(pm25, pm10)) {  // left out until the fan has settled (sj_warmup.h)
+    localAlert |= sjAddPmValuesIfWarm(r, pm25, pm10, pmWarm(millis() - sjPmLastFrameMs), LOCAL_PM25_LIMIT,
+                                      LOCAL_PM10_LIMIT);
+  } else if (pmMissIsDropout()) {
+    failed |= 1u << SJ_AF_PM25;  // no frame for 10 s after the warm-up: not just a slow first frame
   }
 #endif
 #if ENABLE_PH
@@ -202,25 +483,32 @@ static bool takeReading(SjReading& r, EdgeRiskLevel& edge, bool& localAlert) {
     r.battery_x10 = sjClampU16(battery * 10);
   }
 #endif
-
-  // The edge model was trained on all five core inputs together.
-  edge = EDGE_UNAVAILABLE;
-  const uint16_t edgeInputs = SJ_HAS_WATER | SJ_HAS_DHT | SJ_HAS_GAS | SJ_HAS_FLAME;
-  if ((r.flags & edgeInputs) == edgeInputs) {
-    edge = runEdgeInference(waterM, tempC, humidity, gasPpm, flame);
-    if (edge != EDGE_UNAVAILABLE) r.edge_risk = (uint8_t)edge;
-  }
+  (void)waterM, (void)tempC, (void)humidity, (void)gasPpm, (void)flame;  // unused when their sensor is off
   return (r.flags & SJ_MEASUREMENT_FLAGS) != 0;
 }
 
+// The edge model's verdict (edge_ai.h; main or lite, config.h EDGE_MODEL),
+// stamped into the reading. After edgeChecks(): the lite model reads the
+// rise rate, and ignores it while the water level is in doubt. From the
+// reading's own fixed-point values, so the verdict matches what is sent.
+static EdgeRiskLevel edgeVerdict(SjReading& r) {
+  const SjEdgeScale scale = {EDGE_BENCH_SCALE_MODEL, ULTRASONIC_MOUNT_HEIGHT_CM / 100.0f, EDGE_RIVER_EMPTY_M,
+                             EDGE_RIVER_FULL_M, edgeConfig.fastRiseCmPerMin};
+  EdgeRiskLevel edge = runEdgeInference(r, scale);
+  r.edge_risk = edge <= EDGE_URGENT ? (uint8_t)edge : SJ_EDGE_NONE;
+  return edge;
+}
+
 static void printReading(const SjReading& r, EdgeRiskLevel edge, bool localAlert) {
-  Serial.printf("[%s #%lu-%lu]", NODE_ID, (unsigned long)r.session, (unsigned long)r.seq);
+  Serial.printf("[%s #%lu-%lu]%s%s", NODE_ID, (unsigned long)r.session, (unsigned long)r.seq,
+                (r.flags & SJ_SOS_PRESSED) ? " SOS" : "", (r.flags & SJ_SIREN_ON) ? " SIREN" : "");
   if (r.flags & SJ_HAS_WATER) Serial.printf(" water=%.3fm", r.water_level_mm / 1000.0f);
   if (r.flags & SJ_HAS_DHT) Serial.printf(" temp=%.1fC hum=%.0f%%", r.temp_c_x100 / 100.0f, r.humidity_x100 / 100.0f);
   if (r.flags & SJ_HAS_GAS) Serial.printf(" gas=%uppm", r.gas_ppm);
 #if ENABLE_GAS
   // says why gas is missing in the first minutes (not sent, not alerting)
-  else if (sjWarmingUp(uptimeSeconds(), MQ135_WARMUP_S)) Serial.print(" gas=warming-up");
+  else if (!gasPowered()) Serial.print(" gas=heater-off");
+  else if (!gasWarm()) Serial.print(" gas=warming-up");
 #endif
   if (r.flags & SJ_HAS_FLAME) Serial.printf(" flame=%d", (r.flags & SJ_FLAME_DETECTED) ? 1 : 0);
   if (r.flags & SJ_HAS_RAIN) Serial.printf(" rain=%.2fmm", r.rain_mm_x100 / 100.0f);
@@ -228,14 +516,340 @@ static void printReading(const SjReading& r, EdgeRiskLevel edge, bool localAlert
   if (r.flags & SJ_HAS_TILT) Serial.printf(" tilt=%.2fdeg vib=%.3fg", r.tilt_deg_x100 / 100.0f, r.vibration_g_x1000 / 1000.0f);
   if (r.flags & SJ_HAS_PM) Serial.printf(" pm2.5=%u pm10=%u", r.pm25, r.pm10);
 #if ENABLE_PMS5003
-  else if (sjWarmingUp(uptimeSeconds(), PMS5003_WARMUP_S)) Serial.print(" pm=warming-up");
+  else if (!pmPowered()) Serial.print(" pm=asleep");
+  else if ((!sjPmEverSeen || millis() - sjPmLastFrameMs > 10000) && pmMissIsDropout()) Serial.print(" pm=no-frame");
+  else if (!pmWarm(0)) Serial.print(" pm=warming-up");
 #endif
   if (r.flags & SJ_HAS_PH) Serial.printf(" pH=%.2f", r.ph_x100 / 100.0f);
   if (r.flags & SJ_HAS_TURBIDITY) Serial.printf(" turb=%.0fNTU", r.turbidity_ntu_x10 / 10.0f);
   if (r.flags & SJ_HAS_BATTERY) Serial.printf(" batt=%.0f%%", r.battery_x10 / 10.0f);
-  Serial.printf(" | edge=%s local_alert=%d queued=%u\n",
-                edge <= EDGE_URGENT ? SJ_EDGE_NAMES[edge] : "n/a", localAlert, queue.count());
+  if (r.xflags & SJ_X_RISE_RATE)
+    Serial.printf(" rise=%+.2fcm/min%s", r.rise_cm_min_x100 / 100.0f, (r.xflags & SJ_X_FAST_RISE) ? " FAST-RISE" : "");
+  for (uint8_t c = 0; c < SJ_AC_COUNT; c++)
+    for (uint8_t f = 0; f < SJ_AF_COUNT; f++)
+      if (r.anomaly[c] & (1u << f)) Serial.printf(" ?%s:%s", SJ_AC_NAMES[c], SJ_AF_NAMES[f]);
+  Serial.printf(" | edge=%s local_alert=%d queued=%u%s\n", edge <= EDGE_URGENT ? SJ_EDGE_NAMES[edge] : "n/a",
+                localAlert, queue.count(), (r.xflags & SJ_X_PRIORITY) ? " -> sent FIRST" : "");
 }
+
+// =====================================================================
+// Flash flood rise rate + anomaly checks (sj_anomaly.h - unit-tested on a PC)
+// =====================================================================
+static void setupEdgeChecks() {
+  sjEdgeDefaultLimits(edgeConfig.field, RISE_BENCH_SCALE, ULTRASONIC_MOUNT_HEIGHT_CM / 100.0f);
+  edgeConfig.staleMs = EDGE_STALE_S * 1000UL;
+  edgeConfig.riseWindowMs = RISE_WINDOW_S * 1000UL;
+  edgeConfig.fastRiseCmPerMin =
+      RISE_BENCH_SCALE ? FAST_RISE_BENCH_FRACTION_PER_MIN * ULTRASONIC_MOUNT_HEIGHT_CM : FAST_RISE_CM_PER_MIN;
+  edgeConfig.riseMinSamples = RISE_MIN_SAMPLES;
+  edgeConfig.fastRiseSamples = FAST_RISE_SAMPLES;
+  edgeConfig.riseNoiseK = RISE_NOISE_K;
+  if (!resumedFromSleep || !sjEdgeValid(edgeTrack)) sjEdgeBegin(edgeTrack);
+}
+
+// Stamps the reading with the checks' verdict. Only a REGULAR sample is
+// checked (and updates the history); an extra one for an SOS / a siren
+// report a moment later carries the last regular verdict - over a step of
+// a second or two a "rate" or "spike" would be noise. Runs before the
+// siren looks at the reading: a doubtful value must not sound it.
+// Returns true when this regular sample raised an anomaly the previous one
+// did not have - that reading goes at once (sj_report.h); one that stays
+// flagged rides with the normal reports.
+static bool edgeChecks(SjReading& r, uint8_t failed, bool regular) {
+  SjEdgeResult e;
+  uint8_t before[SJ_AC_COUNT];
+  memcpy(before, sjEdgeLast(edgeTrack).anomaly, sizeof(before));
+  if (regular) {
+    SjSample s;
+    sjSampleFromReading(r, failed, s);
+    sjEdgeSample(edgeTrack, s, deviceMillis(), edgeConfig, e);
+  } else {
+    e = sjEdgeLast(edgeTrack);
+  }
+#if !EDGE_ANOMALY_ENABLE
+  memset(e.anomaly, 0, sizeof(e.anomaly));  // not reported (spikes are still kept out of the rise rate)
+  memset(before, 0, sizeof(before));
+#endif
+  sjEdgeStamp(r, e);
+  return regular && sjNewAnomaly(before, r.anomaly);
+}
+
+// =====================================================================
+// SOS button (sj_sos.h - the press rules are unit-tested on a PC)
+// =====================================================================
+#if SOS_BUTTON_PIN >= 0
+static const SjSosTiming SOS_TIMING = {SOS_HOLD_MS, SOS_COOLDOWN_MS, SOS_STUCK_MS, SOS_DEBOUNCE_MS};
+static SjSosButton sosButton;  // shared by the interrupt and loop(): only touched under sosMux
+static portMUX_TYPE sosMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Every edge, so a press is seen even while loop() is blocked - a backlog
+// flush (up to ~20 s), an HTTPS timeout, sensor reads. sjSosUpdate() is a
+// few comparisons. Arduino's GPIO interrupt service is not registered as
+// IRAM-only (it waits while the flash cache is off, e.g. during a LittleFS
+// write), so it may call this inline function even if it lands in flash.
+static void IRAM_ATTR onSosEdge() {
+  portENTER_CRITICAL_ISR(&sosMux);
+  sjSosUpdate(sosButton, digitalRead(SOS_BUTTON_PIN) == LOW, millis(), SOS_TIMING);
+  portEXIT_CRITICAL_ISR(&sosMux);
+}
+
+static void setupSosButton(bool wokeByButton) {
+  pinMode(SOS_BUTTON_PIN, INPUT_PULLUP);
+  delay(1);  // let the pull-up charge the cable before the first read
+  bool pressed = digitalRead(SOS_BUTTON_PIN) == LOW;
+  // The cooldown spans deep-sleep wakes (RTC clock); a power-on starts fresh.
+  uint32_t since = sjSosSinceLastMs(resumedFromSleep && sleepState.sosEver, sleepState.sosAtS, deviceSeconds());
+  portENTER_CRITICAL(&sosMux);
+  sjSosBegin(sosButton, pressed, wokeByButton, millis(), since, SOS_TIMING);
+  portEXIT_CRITICAL(&sosMux);
+  attachInterrupt(digitalPinToInterrupt(SOS_BUTTON_PIN), onSosEdge, CHANGE);
+  if (pressed && !wokeByButton) {
+    Serial.printf("[sos] button on GPIO%d is pressed at start-up - SOS off until it is released\n", SOS_BUTTON_PIN);
+  }
+}
+
+// Samples the button (a hold that is still going on has no edge) and turns
+// a finished SOS press into sosRequested. Called from loop() and between
+// the sends of a long flush.
+static SjSosPhase pollSosButton() {
+  portENTER_CRITICAL(&sosMux);
+  SjSosPhase phase = sjSosUpdate(sosButton, digitalRead(SOS_BUTTON_PIN) == LOW, millis(), SOS_TIMING);
+  bool trigger = sjSosTakeTrigger(sosButton);
+  bool refused = sosButton.refused;
+  sosButton.refused = 0;
+  portEXIT_CRITICAL(&sosMux);
+  if (trigger) {
+    sosRequested = true;
+    sleepState.sosEver = 1;
+    sleepState.sosAtS = deviceSeconds();  // the cooldown must survive deep sleep
+    Serial.println("[sos] button held - measuring and sending an SOS now");
+  }
+  if (refused) Serial.printf("[sos] pressed again within %lus of the last SOS - already sent\n", SOS_COOLDOWN_MS / 1000);
+  return phase;
+}
+
+static bool sosButtonStuck(uint32_t& heldMs) {
+  portENTER_CRITICAL(&sosMux);
+  bool stuck = sosButton.stuck;
+  heldMs = sjSosHeldMs(sosButton, millis());
+  portEXIT_CRITICAL(&sosMux);
+  return stuck;
+}
+#else
+static void setupSosButton(bool) {}
+static SjSosPhase pollSosButton() { return SJ_SOS_IDLE; }
+#endif
+
+// LED for the person at the node: -1 = nothing SOS-related to show
+static int sosLed(SjSosPhase phase) {
+  bool confirmed = sjSosConfirmShowing(sosConfirmed, sosConfirmedAtMs, millis(), SOS_LED_CONFIRM_MS);
+  return sjSosLed(phase, !sosOutbox.empty(), confirmed, millis());
+}
+
+// =====================================================================
+// Village siren (sj_siren.h - the rules are unit-tested on a PC)
+// =====================================================================
+#if SIREN_PIN >= 0
+static const uint8_t SIREN_OFF_LEVEL = SIREN_ACTIVE_LEVEL == HIGH ? LOW : HIGH;
+static const uint32_t SIREN_WATER_LIMIT_MM =
+    (uint32_t)(SIREN_LOCAL_WATER_FRACTION * ULTRASONIC_MOUNT_HEIGHT_CM * 10.0f + 0.5f);
+
+static void setupSiren() {
+  digitalWrite(SIREN_PIN, SIREN_OFF_LEVEL);  // level first, so switching to output gives no blip
+  pinMode(SIREN_PIN, OUTPUT);
+  sjSirenBegin(siren, millis());
+#if TRANSPORT == TRANSPORT_LORA
+  sirenCmdKeyOk = sjParseHexKey(SIREN_CMD_KEY, sirenCmdKey, SJ_CMD_KEY_LEN);
+  if (!sirenCmdKeyOk) {
+    Serial.println("[siren] SIREN_CMD_KEY missing or not 32 hex characters (secrets.h) - siren commands from the "
+                   "gateway are REFUSED; the offline fallback still works. See secrets.example.h");
+  }
+#endif
+}
+
+// Drives the pin; a start / stop is logged and reported at once (the
+// server re-sends a command until a reading shows it took effect).
+static void noteSirenChange() {
+  digitalWrite(SIREN_PIN, siren.on ? SIREN_ACTIVE_LEVEL : SIREN_OFF_LEVEL);
+  if (!sjSirenTakeChanged(siren)) return;
+  sirenReportDue = true;
+  if (!siren.on) {
+    Serial.println("[siren] off");
+  } else if (siren.reason == SJ_SIREN_COMMAND) {
+    Serial.printf("[siren] ON by server command for %lus\n", (unsigned long)(siren.onForMs / 1000));
+  } else {
+    Serial.printf("[siren] ON by this node: no gateway for %us and URGENT on %u samples\n",
+                  (unsigned)SIREN_OFFLINE_AFTER_S, (unsigned)SIREN_OFFLINE_URGENT_SAMPLES);
+  }
+}
+
+// Every loop() pass and between the sends of a long flush: ends a sounding
+// on time even while the node is busy.
+static void serviceSiren() {
+  sjSirenTick(siren, millis(), SIREN_TIMING);
+  noteSirenChange();
+}
+
+// One regular sample's verdict for the offline fallback (measured = the
+// reading has values; a failed one counts as "not urgent").
+static void sirenSample(const SjReading& r, bool measured) {
+  bool urgent = measured && sjSirenLocalUrgent(r, SIREN_WATER_LIMIT_MM, SIREN_LOCAL_GAS_PPM);
+  sjSirenSample(siren, urgent, millis(), SIREN_TIMING);
+  noteSirenChange();
+}
+
+// The next hop took a reading: we are online, and its answer may carry a command.
+static void onLinkAck(const SjDownlink& d) {
+  if (d.refused) {
+    Serial.println("[siren] a siren command in the ACK was IGNORED: its MAC did not match SIREN_CMD_KEY (or no key "
+                   "is set) - a foreign transmitter, or the key differs from the gateway's SIREN_MASTER_KEY");
+  }
+  sjSirenAck(siren, millis());
+  sjSirenApplyDownlink(siren, d, millis(), SIREN_TIMING);
+  noteSirenChange();
+}
+
+static uint16_t sirenFlags() { return sjSirenFlags(siren); }
+static uint8_t sirenTxState() { return sjSirenTxState(siren); }
+#else
+static void setupSiren() {}
+static void serviceSiren() {}
+static void sirenSample(const SjReading&, bool) {}
+static void onLinkAck(const SjDownlink&) {}
+static uint16_t sirenFlags() { return 0; }
+static uint8_t sirenTxState() { return SJ_TX_VALID; }
+#endif
+
+// Mirrors the outbox's newest SOS into RTC memory (sj_sleep.h), so it goes
+// first again after a deep sleep or a reset however many readings were
+// queued since - even one whose flash push failed. Called only when an SOS
+// is queued or delivered (rare).
+static void keepPendingSos() {
+  const QueuedReading* q = sosOutbox.empty() ? nullptr : &sosOutbox.items[sosOutbox.count - 1];
+  sjSleepKeepSos(sleepState, q ? &q->reading : nullptr, q ? q->takenAtS : 0);
+}
+
+static void onSosDelivered(const QueuedReading& q) {
+  sosConfirmed = true;
+  sosConfirmedAtMs = millis();
+  keepPendingSos();  // the outbox has already removed it
+  Serial.printf("[sos] SOS #%lu-%lu delivered\n", (unsigned long)q.reading.session, (unsigned long)q.reading.seq);
+}
+
+// Gives a measured reading its uid and queues it, as sjPlanReport() said:
+// `p.summary` attaches the summary window (if it has one) and starts a new
+// one. An SOS reading also goes into the SOS outbox and an urgent one
+// (`p.priority`) into the urgent outbox, so the next flush sends it before
+// the backlog; if the flash queue fails, the outbox copy is still retried
+// until acknowledged.
+static bool queueReading(SjReading& r, bool sos, const SjReportPlan& p) {
+  r.session = session;
+  r.seq = ++seq;
+  if (sos) r.flags |= SJ_SOS_PRESSED;
+  r.flags |= sirenFlags();  // the siren's state at this measurement
+  if (p.priority) r.xflags |= SJ_X_PRIORITY;
+  QueuedReading q;
+  memset(&q, 0, sizeof(q));
+#if SUMMARY_ENABLE
+  if (p.summary && sjSummaryBuild(summaryAcc, q.summary)) r.xflags |= SJ_X_SUMMARY;
+#endif
+  q.reading = r;
+  q.takenAtS = deviceSeconds();
+  bool queued = queue.push(q);
+  if (queued) pendingRainMm = 0;  // this rain is now in a queued reading
+  if (queued && p.summary) sjSummaryReset(summaryAcc);  // a failed push keeps the window for the next report
+  if (p.priority && !sos) {
+    urgentOutbox.add(q);  // full: its oldest entry still waits in the queue, in order
+    nextFlushMs = millis();  // send now - not 0, see sjFlushDue()
+  }
+  if (sos) {
+    sosOutbox.add(q);
+    keepPendingSos();
+    sosConfirmed = false;
+    nextFlushMs = millis();  // send now - not 0, see sjFlushDue()
+    Serial.printf("[sos] SOS reading #%lu-%lu goes out before %u queued reading(s)%s\n", (unsigned long)r.session,
+                  (unsigned long)r.seq, queue.count() - (queued ? 1 : 0),
+                  queued ? "" : " - flash queue FAILED, kept in RAM + RTC memory only");
+  }
+  return queued;
+}
+
+// =====================================================================
+// Offline SOS Wi-Fi (sj_hotspot.h - the page, limits and outbox are
+// unit-tested on a PC). Served from loop() and between the sends of a
+// long flush; the requests go to the gateway in flushQueue().
+// =====================================================================
+#if SOS_HOTSPOT_ENABLE
+static SjHotspotAp hotspot;
+static SjHotspotApp hotspotApp;
+static SjHotspotSite hotspotSite;
+static const SjHotspotLimits HOTSPOT_LIMITS = {SOS_HOTSPOT_MAX_PER_WINDOW, SOS_HOTSPOT_WINDOW_S,
+                                               SOS_HOTSPOT_CLIENT_GAP_S};
+static SjSosMsgOutbox<SOS_MSG_SLOTS> sosMsgOutbox;  // waiting for the gateway's ACK; NVS copy "sos_msgs"
+static bool sosMsgArrived = false;  // a new request during a flush: it goes before the rest of the backlog
+
+// Written when a request is stored (before the page says "saved") or
+// delivered - rare, so NVS wear does not matter.
+static void saveSosMsgs() {
+  if (sjPrefs.putBytes("sos_msgs", &sosMsgOutbox, sizeof(sosMsgOutbox)) != sizeof(sosMsgOutbox)) {
+    Serial.println("[sos-wifi] NVS copy of the SOS requests NOT saved - a reset now would lose them");
+  }
+}
+
+static void restoreSosMsgs() {
+  if (!sjPrefs.isKey("sos_msgs") || sjPrefs.getBytesLength("sos_msgs") != sizeof(sosMsgOutbox)) return;
+  SjSosMsgOutbox<SOS_MSG_SLOTS> saved;
+  if (sjPrefs.getBytes("sos_msgs", &saved, sizeof(saved)) != sizeof(saved)) return;
+  uint8_t n = sjSosMsgOutboxRestore(sosMsgOutbox, saved);
+  if (n) Serial.printf("[sos-wifi] %u SOS request(s) from before the reset - sending them first\n", n);
+}
+
+// sjHotspotHandle()'s store step: the outbox and its NVS copy, then "send now".
+static bool storeLocalSos(SjSosMsg& m) {
+  SjSosMsgQueued e;
+  memset(&e, 0, sizeof(e));
+  e.msg = m;
+  e.rxAtS = uptimeSeconds();
+  e.bootId = session;
+  e.local = 1;
+  if (sjSosMsgOutboxAdd(sosMsgOutbox, e) != 1) return false;
+  saveSosMsgs();
+  sosMsgArrived = true;
+  nextFlushMs = millis();  // send now - not 0, see sjFlushDue()
+  return true;
+}
+
+static void respondHotspot(const SjHttpReq& req, String& out) {
+  char fresh[SJ_SOS_CLIENT_LEN + 1];
+  sjHotspotNewClientId(fresh, esp_random(), esp_random());  // true random: the Wi-Fi radio is on
+  SjHsOutcome o =
+      sjHotspotHandle(hotspotApp, hotspotSite, HOTSPOT_LIMITS, req, uptimeSeconds(), fresh, storeLocalSos, out);
+  const char* what = sjHotspotOutcomeText(o);
+  if (what) Serial.printf("[sos-wifi] %s (%u waiting for the gateway)\n", what, sosMsgOutbox.count);
+}
+
+// After the session is known (it is part of every request's sos_uid).
+static void setupHotspot() {
+  sjHotspotBegin(hotspotApp);
+  restoreSosMsgs();
+  WiFi.mode(WIFI_AP);
+  if (!hotspot.begin(SOS_HOTSPOT_SSID, SOS_HOTSPOT_CHANNEL, SOS_HOTSPOT_MAX_CLIENTS)) {
+    Serial.println("[sos-wifi] access point did NOT start - no offline SOS page on this node");
+    return;
+  }
+  hotspotSite = {NODE_ID, session, hotspot.ip(), false};
+  sjHotspotRememberOutbox(hotspotApp, sosMsgOutbox, uptimeSeconds());
+  Serial.printf("[sos-wifi] open Wi-Fi '%s' at http://%s/ - requests go to the gateway over LoRa\n", SOS_HOTSPOT_SSID,
+                hotspot.ip());
+}
+
+static void serviceHotspot() { hotspot.poll(respondHotspot); }
+static bool sosMsgsWaiting() { return sosMsgOutbox.count > 0; }
+#else
+static void setupHotspot() {}
+static void serviceHotspot() {}
+static bool sosMsgsWaiting() { return false; }
+#endif
 
 // =====================================================================
 // Transport
@@ -262,57 +876,119 @@ static bool setupTransport() {
   return true;
 }
 
-// Sends one reading and waits for the gateway's ACK (which it only sends
-// after saving the reading to its own flash queue).
-static bool sendOne(QueuedReading& q) {
-  SjReading r = q.reading;
-  sjUpgradeQueuedReading(r);  // queued by a v1 firmware before an update
-  r.age_s = (r.session == session) ? deviceSeconds() - q.takenAtS : SJ_AGE_UNKNOWN;
-  if (radio.transmit((uint8_t*)&r, sizeof(r)) != RADIOLIB_ERR_NONE) return false;
-
+// Transmits `len` bytes and listens LORA_ACK_TIMEOUT_MS for the gateway's
+// answer. Returns the answer's length in `reply` (0 = none, or too long to
+// be one of ours).
+static size_t loraExchange(uint8_t* data, size_t len, uint8_t* reply, size_t replyCap) {
+  if (radio.transmit(data, len) != RADIOLIB_ERR_NONE) return 0;
   loraIrq = false;  // DIO0 also fires on TX done
   radio.startReceive();
   uint32_t start = millis();
   while (!loraIrq && millis() - start < LORA_ACK_TIMEOUT_MS) delay(1);
-  bool acked = false;
+  size_t got = 0;
   if (loraIrq) {
-    uint8_t buf[sizeof(SjAck)];
-    size_t len = radio.getPacketLength();
-    if (len == sizeof(SjAck) && radio.readData(buf, len) == RADIOLIB_ERR_NONE) {
-      acked = sjAckMatches(buf, len, r);
-    }
+    size_t n = radio.getPacketLength();
+    if (n <= replyCap && radio.readData(reply, n) == RADIOLIB_ERR_NONE) got = n;
   }
   radio.standby();
+  return got;
+}
+
+// Sends one reading and waits for the gateway's ACK (which it only sends
+// after saving the reading to its own flash queue). The ACK may carry a
+// siren command (SjAckCmd) - applied at once if its MAC checks out.
+static bool sendOne(QueuedReading& q) {
+  SjReading r = q.reading;
+  r.age_s = (r.session == session) ? deviceSeconds() - q.takenAtS : SJ_AGE_UNKNOWN;
+  r.tx_state = sirenTxState();  // the siren NOW - the flags are from the measurement
+  uint8_t packet[SJ_READING_MAX_PACKET];  // + the summary when it has one (sj_packet.h)
+  size_t packetLen = sjEncodeReading(r, q.summary, packet);
+  uint8_t buf[sizeof(SjAckCmd)];
+  size_t len = loraExchange(packet, packetLen, buf, sizeof(buf));
+  SjDownlink cmd = {SJ_CMD_NONE, 0, 0};
+#if SIREN_PIN >= 0
+  const uint8_t* key = sirenCmdKeyOk ? sirenCmdKey : nullptr;
+#else
+  const uint8_t* key = nullptr;  // no siren: nothing to command
+#endif
+  bool acked = len > 0 && sjParseAck(buf, len, r, cmd, key);
+  if (acked) onLinkAck(cmd);
   return acked;
 }
 
+#if SOS_HOTSPOT_ENABLE
+// The offline-Wi-Fi requests, oldest first, each until the gateway ACKs it
+// (SJ_TYPE_SOS_MSG_ACK - it stored it on its side first). false = no ACK:
+// everything stays, the next flush tries again.
+static bool sendSosMsgs() {
+  sosMsgArrived = false;
+  while (sosMsgOutbox.count > 0) {
+    const SjSosMsgQueued e = sosMsgOutbox.items[0];
+    SjSosMsg m = e.msg;
+    long age = sjSosMsgAge(e, uptimeSeconds(), session);
+    m.age_s = age >= 0 ? (uint32_t)age : SJ_AGE_UNKNOWN;
+    uint8_t buf[sizeof(SjAck)];
+    size_t len = loraExchange((uint8_t*)&m, sjSosMsgSize(m), buf, sizeof(buf));
+    if (len == 0 || !sjSosMsgAckMatches(buf, len, m)) return false;
+    sjSosMsgOutboxRemove(sosMsgOutbox, m);
+    saveSosMsgs();
+    sjHotspotMarkSent(hotspotApp, m.session, m.seq, uptimeSeconds());  // the phone's page turns to "sent"
+    SjDownlink none = {SJ_CMD_NONE, 0, 0};
+    onLinkAck(none);  // the gateway answered: we are online
+    char uid[24];
+    sjSosUid(uid, sizeof(uid), m);
+    Serial.printf("[sos-wifi] request %s delivered to the gateway\n", uid);
+  }
+  return true;
+}
+#else
+static bool sendSosMsgs() { return true; }
+#endif
+
+// SOS readings first, then urgent ones, then up to MAX_SENDS_PER_FLUSH of
+// the backlog (sjFlushOnce() in sj_sos.h; copies that went ahead are
+// popped unsent). A button hold during the urgent readings / the backlog
+// stops the flush so loop() can measure and send the SOS at once.
 // false = the gateway didn't acknowledge (readings stay queued)
 static bool flushQueue() {
-  for (int sent = 0; sent < MAX_SENDS_PER_FLUSH && queue.count() > 0; sent++) {
-    QueuedReading q;
-    uint32_t before = queue.count();
-    if (!queue.peek(0, q)) {
-      // peek() rebuilt the queue or skipped the unreadable oldest record:
-      // carry on with the new oldest.
-      if (queue.count() != before) continue;
-      // Nothing changed (flash failing): back off instead of retrying on
-      // every loop() pass.
-      nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
-      return false;
-    }
-    if (!sendOne(q)) {
+  // Requests from the SOS Wi-Fi page first: a person typed them. If they
+  // get no ACK the readings still go - a gateway with older firmware
+  // ignores these packets, and must not stall the whole queue.
+  bool msgsSent = sendSosMsgs();
+  if (!msgsSent) {
+    Serial.println("[lora] no ACK for an SOS request from the Wi-Fi page - kept and retried (gateway firmware "
+                   "too old for SOS_HOTSPOT_ENABLE nodes?)");
+  }
+  SjFlushResult res = sjFlushOnce(
+      queue, sosOutbox, urgentOutbox, sentAhead, MAX_SENDS_PER_FLUSH, [](QueuedReading& q) { return sendOne(q); },
+      [] {
+        pollSosButton();
+        serviceSiren();    // a sounding ends on time during a long backlog flush too
+        serviceHotspot();  // phones are answered during a long backlog flush too
+#if SOS_HOTSPOT_ENABLE
+        if (sosMsgArrived) return true;  // a new request: stop, the next flush sends it first
+#endif
+        return sosRequested;
+      },
+      [](const QueuedReading& q) { onSosDelivered(q); });
+  switch (res) {
+    case SJ_FLUSH_DONE:
+    case SJ_FLUSH_SOS_WAITING:
+      if (msgsSent) return true;
+      break;  // the readings went, an SOS request did not: retry it after the back-off
+    case SJ_FLUSH_NO_ACK:
 #if DEEP_SLEEP_ENABLED
       Serial.printf("[lora] no ACK - %u reading(s) kept in queue for the next wake\n", queue.count());
 #else
       Serial.printf("[lora] no ACK - %u reading(s) kept in queue, retrying in %lus\n", queue.count(),
                     FLUSH_RETRY_INTERVAL_MS / 1000);
 #endif
-      nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
-      return false;
-    }
-    queue.pop(1);
+      break;
+    case SJ_FLUSH_STUCK:  // the oldest record can't be read (flash failing): back off, don't spin
+      break;
   }
-  return true;
+  nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
+  return false;
 }
 
 static bool waitForLink() { return true; }  // LoRa needs no connection
@@ -339,28 +1015,8 @@ static bool setupTransport() {
 
 static bool singleMode = false;  // a refused batch is resent one reading at a time
 
-// Posts up to `n` oldest readings as one batch. Backend answers per
-// reading; any HTTP 200 means every reading in the batch is final
-// (stored, duplicate or rejected) and can leave the queue.
-static int postBatch(uint32_t n) {
-  String body = "{\"readings\":[";
-  uint32_t now = deviceSeconds();
-  for (uint32_t i = 0; i < n; i++) {
-    QueuedReading q;
-    if (!queue.peek(i, q)) {
-      // If the queue could not rebuild itself (flash full or failing) the
-      // bad record is still there, and only peek(0) can skip it without a
-      // copy: go one at a time until it is the oldest. -1 = retry later.
-      singleMode = true;
-      return -1;
-    }
-    sjUpgradeQueuedReading(q.reading);  // queued by a v1 firmware before an update
-    long age = (q.reading.session == session) ? (long)(now - q.takenAtS) : -1;
-    if (i) body += ",";
-    sjAppendJson(body, q.reading, age, WiFi.RSSI(), "wifi");
-  }
-  body += "]}";
-
+// `answer` gets the response body of a 200 (it may carry siren commands).
+static int postBody(const String& body, String& answer) {
   WiFiClientSecure client;
   client.setInsecure();  // TODO: pin the backend certificate for real deployments
   HTTPClient http;
@@ -370,8 +1026,79 @@ static int postBatch(uint32_t n) {
   http.addHeader("X-Device-Key", DEVICE_KEY);  // the backend refuses readings without a valid key
   http.setTimeout(15000);
   int code = http.POST(body);
+  if (code == 200) answer = http.getString();
   http.end();
   return code;
+}
+
+// The backend took our readings (200): we are online - the siren's offline
+// fallback stands down - and its answer may hold a command for this node
+// (sjParseSirenCommands, sj_packet.h), the WiFi node's "ACK window".
+static void onBackendAnswer(const String& answer) {
+  SjDownlink d = {SJ_CMD_NONE, 0, 0};
+#if SIREN_PIN >= 0
+  SjSirenCommand cmds[4];
+  int n = sjParseSirenCommands(answer.c_str(), cmds, 4);
+  for (int i = 0; i < n; i++) {
+    if (strcmp(cmds[i].node_id, NODE_ID) != 0) continue;
+    d.cmd = cmds[i].on ? SJ_CMD_SIREN_ON : SJ_CMD_SIREN_OFF;
+    d.arg = cmds[i].forS;
+  }
+#endif
+  onLinkAck(d);
+}
+
+static void appendQueued(String& body, const QueuedReading& q) {
+  long age = (q.reading.session == session) ? (long)(deviceSeconds() - q.takenAtS) : -1;
+  sjAppendJson(body, q.reading, age, WiFi.RSSI(), "wifi", &q.summary);
+}
+
+// Posts up to `n` oldest readings as one batch (fewer if it reaches a
+// reading that already went ahead - that one is popped unsent first, see
+// sjCollectBatch). Backend answers per reading; any HTTP 200 means every
+// reading in the batch is final (stored, duplicate or rejected) and can
+// leave the queue. `n` becomes the number in the batch.
+static int postBatch(uint32_t& n, String& answer) {
+  String body = "{\"readings\":[";
+  bool first = true;
+  n = sjCollectBatch<QueuedReading>(queue, sentAhead, n, [&](const QueuedReading& q) {
+    if (!first) body += ",";
+    first = false;
+    appendQueued(body, q);
+  });
+  if (n == 0) {
+    // If the queue could not rebuild itself (flash full or failing) the
+    // bad record is still there, and only peek(0) can skip it without a
+    // copy: go one at a time until it is the oldest. -1 = retry later.
+    singleMode = true;
+    return -1;
+  }
+  body += "]}";
+  return postBody(body, answer);
+}
+
+// One outbox reading (SOS or urgent) on its own, ahead of the batches.
+static int postOne(const QueuedReading& q, String& answer) {
+  String body = "{\"readings\":[";
+  appendQueued(body, q);
+  body += "]}";
+  return postBody(body, answer);
+}
+
+// The front of an outbox, alone. false = keep it, retry after the back-off.
+// 200, or 400/422 for the reading itself (an SOS with no sensor value):
+// final either way - the server has seen it.
+static bool postOutboxFront(const QueuedReading& q, const char* what) {
+  String answer;
+  int code = postOne(q, answer);
+  if (code == 200) onBackendAnswer(answer);
+  if (sjUploadAction(code, 1) == SJ_UPLOAD_RETRY) {
+    Serial.printf("[wifi] %s send failed (HTTP %d) - kept, retrying first\n", what, code);
+    nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
+    return false;
+  }
+  sentAhead.add(q.reading);  // its queued copy is not posted again
+  return true;
 }
 
 // Sends ONE batch (up to MAX_SENDS_PER_FLUSH readings), like the LoRa
@@ -385,13 +1112,30 @@ static bool flushQueue() {
     nextFlushMs = millis() + FLUSH_RETRY_INTERVAL_MS;
     return false;
   }
+  // SOS first, then urgent readings, alone - one request per call, like the batches
+  if (!sosOutbox.empty()) {
+    QueuedReading q = sosOutbox.front();
+    if (!postOutboxFront(q, "SOS")) return false;
+    sosOutbox.remove(q.reading);
+    onSosDelivered(q);
+    return true;
+  }
+  if (!urgentOutbox.empty()) {
+    QueuedReading q = urgentOutbox.front();
+    if (!postOutboxFront(q, "urgent reading")) return false;
+    urgentOutbox.remove(q.reading);
+    return true;
+  }
+  sjPopSentAhead<QueuedReading>(queue, sentAhead);  // already posted from an outbox
   if (queue.count() == 0) return true;
   uint32_t n = singleMode ? 1 : min<uint32_t>(queue.count(), MAX_SENDS_PER_FLUSH);
-  int code = postBatch(n);
+  String answer;
+  int code = postBatch(n, answer);
   switch (sjUploadAction(code, n)) {  // shared rule, see sj_packet.h
     case SJ_UPLOAD_DONE:
       queue.pop(n);
       singleMode = false;
+      onBackendAnswer(answer);
       break;
     case SJ_UPLOAD_SPLIT:
       singleMode = true;  // the next call sends one reading at a time
@@ -440,8 +1184,12 @@ static uint32_t transportEntropy() { return esp_random(); }
 // Sends what the link takes within `budgetMs` from `startMs`, one batch
 // per flushQueue() call (sj_sleep.h).
 static void drainQueueWithin(uint32_t startMs, uint32_t budgetMs) {
-  sjDrainWithinBudget([] { return queue.count() > 0; }, [] { return flushQueue(); }, [] { return (uint32_t)millis(); },
-                      startMs, budgetMs);
+  sjDrainWithinBudget(
+      [] {
+        pollSosButton();  // a hold during the drain: stop, runSleepCycle() sends the SOS next
+        return (queue.count() > 0 || !sosOutbox.empty() || !urgentOutbox.empty()) && !sosRequested;
+      },
+      [] { return flushQueue(); }, [] { return (uint32_t)millis(); }, startMs, budgetMs);
 }
 #endif
 
@@ -501,10 +1249,15 @@ static void runSelfTest() {
   {
     float pinMv = analogReadMilliVolts(MQ135_PIN);
     float rs = mq135ResistanceKohm(pinMv);
-    selfTestLine("MQ135 gas",
-                 sjCheckMq135(pinMv, MQ135_ADC_DIVIDER_RATIO, rs, rs > 0 ? mq135Ppm(rs) : 0, uptimeS, MQ135_WARMUP_S),
-                 selfTestHint("AO via 10k/10k divider to GPIO%d (MQ135_ADC_DIVIDER_RATIO %.1f), VCC 5 V", MQ135_PIN,
-                              MQ135_ADC_DIVIDER_RATIO));
+    if (!gasPowered())  // duty cycle: the AO of an unheated module means nothing
+      selfTestLine("MQ135 gas", sjResult(SJ_CHECK_WAIT, "heater off (duty cycle) - on again before its next report"),
+                   "");
+    else
+      selfTestLine("MQ135 gas",
+                   sjCheckMq135(pinMv, MQ135_ADC_DIVIDER_RATIO, rs, rs > 0 ? mq135Ppm(rs) : 0, gasPoweredS(),
+                                MQ135_WARMUP_S),
+                   selfTestHint("AO via 10k/10k divider to GPIO%d (MQ135_ADC_DIVIDER_RATIO %.1f), VCC 5 V", MQ135_PIN,
+                                MQ135_ADC_DIVIDER_RATIO));
   }
 #else
   selfTestOff("MQ135 gas", "ENABLE_GAS");
@@ -558,14 +1311,17 @@ static void runSelfTest() {
 #if ENABLE_PMS5003
   {
     uint32_t start = millis();  // just powered on: give it time for a first frame
-    while (!sjPmEverSeen && millis() - start < 2500) {
+    while (pmPowered() && !sjPmEverSeen && millis() - start < 2500) {
       pollPms5003();
       delay(20);
     }
     pollPms5003();
-    selfTestLine("PMS5003",
-                 sjCheckPms(sjPmEverSeen, millis() - sjPmLastFrameMs, sjPm25, sjPm10, uptimeS, PMS5003_WARMUP_S),
-                 selfTestHint("PMS TX to GPIO%d, VCC 5 V, GND; the fan should be audible", PMS_RX_PIN));
+    if (!pmPowered())
+      selfTestLine("PMS5003", sjResult(SJ_CHECK_WAIT, "asleep (duty cycle) - awake again before its next report"), "");
+    else
+      selfTestLine("PMS5003",
+                   sjCheckPms(sjPmEverSeen, millis() - sjPmLastFrameMs, sjPm25, sjPm10, pmPoweredS(), PMS5003_WARMUP_S),
+                   selfTestHint("PMS TX to GPIO%d, VCC 5 V, GND; the fan should be audible", PMS_RX_PIN));
   }
 #else
   selfTestOff("PMS5003", "ENABLE_PMS5003");
@@ -591,6 +1347,32 @@ static void runSelfTest() {
 #else
   selfTestOff("battery", "ENABLE_BATTERY");
 #endif
+#if SOS_BUTTON_PIN >= 0
+  {
+    pollSosButton();
+    uint32_t heldMs;
+    bool stuck = sosButtonStuck(heldMs);
+    selfTestLine("SOS button", sjCheckSosButton(digitalRead(SOS_BUTTON_PIN) == LOW, stuck, heldMs, SOS_HOLD_MS),
+                 selfTestHint("push-button between GPIO%d and GND (1k in series), nothing else on the pin; "
+                              "dry it / check the cable", SOS_BUTTON_PIN));
+  }
+#else
+  Serial.printf("  --   %-11s off (SOS_BUTTON_PIN -1)\n", "SOS button");
+#endif
+#if SIREN_PIN >= 0
+  // Not sounded by the self-test (it runs at every power-on, and a village
+  // siren at every reboot would teach people to ignore it).
+  Serial.printf("  --   %-11s GPIO%d, %s - not tested automatically: check it with the server's siren button\n",
+                "siren", SIREN_PIN, siren.on ? "SOUNDING" : "silent");
+#else
+  Serial.printf("  --   %-11s off (SIREN_PIN -1)\n", "siren");
+#endif
+#if SOS_HOTSPOT_ENABLE
+  Serial.printf("  --   %-11s '%s' %s, %u phone(s) on it, %u request(s) waiting for the gateway\n", "SOS Wi-Fi",
+                SOS_HOTSPOT_SSID, hotspot.up() ? hotspot.ip() : "NOT RUNNING", hotspot.stations(), sosMsgOutbox.count);
+#else
+  Serial.printf("  --   %-11s off (SOS_HOTSPOT_ENABLE 0)\n", "SOS Wi-Fi");
+#endif
 
 #if TRANSPORT == TRANSPORT_LORA
   // A radio not found at boot makes RadioLib end the SPI bus; restart it
@@ -606,8 +1388,10 @@ static void runSelfTest() {
 #endif
   selfTestLine("queue", sjCheckQueue(queueOk, queue.count(), QUEUE_CAPACITY, queue.dropped()),
                selfTestHint("Tools > Partition Scheme must include a SPIFFS/LittleFS partition"));
-  selfTestLine("edge AI", sjCheckEdge(edgeOk, ENABLE_WATER_LEVEL && ENABLE_DHT && ENABLE_GAS && ENABLE_FLAME),
-               selfTestHint("re-flash; edge_model_data.h must match the TFLite library version"));
+  uint8_t goldenPassed, goldenTotal;
+  edgeGoldenResult(goldenPassed, goldenTotal);
+  selfTestLine("edge AI", sjCheckEdge(SJ_EDGE_MODEL_NAME, edgeOk, goldenPassed, goldenTotal),
+               selfTestHint("re-flash; the edge_*model_data.h header must match the TFLite library version"));
 
   const uint8_t* n = selfTestTally.counts;
   Serial.printf("=== %u OK, %u WAIT, %u WARN, %u FAIL - %s ===\n\n", n[SJ_CHECK_OK], n[SJ_CHECK_WAIT],
@@ -627,7 +1411,12 @@ static void handleSerial() {
     case 'r': Serial.printf("[mq135] R0 for clean air = %.2f kOhm -> MQ135_R0_KOHM\n", calibrateMq135R0Kohm()); break;
     case 's': Serial.printf("[soil] %u mV (dry -> SOIL_DRY_MV, in water -> SOIL_WET_MV)\n", readSoilMillivolts()); break;
     case 'p': Serial.printf("[ph] %.0f mV (in pH7 -> PH_MV_AT_7, in pH4 -> PH_MV_AT_4)\n", readPhMillivolts()); break;
-    case 'q': Serial.printf("[queue] %u waiting, %u dropped (overflow or unreadable) since queue creation\n", queue.count(), queue.dropped()); break;
+    case 'q':
+      Serial.printf("[queue] %u waiting (+%u SOS, %u urgent sent first), %u dropped (overflow or unreadable) since queue creation\n", queue.count(), sosOutbox.count, urgentOutbox.count, queue.dropped());
+#if SOS_HOTSPOT_ENABLE
+      Serial.printf("[sos-wifi] %u request(s) waiting for the gateway (max %u)\n", sosMsgOutbox.count, (unsigned)SOS_MSG_SLOTS);
+#endif
+      break;
     case 'c': queue.clear(); Serial.println("[queue] cleared"); break;
   }
 }
@@ -646,6 +1435,24 @@ static void enterDeepSleep(uint32_t seconds) {
   // while it is stuck closed, or every wake would end instantly.
   if (!sleepState.rainWakeOff && digitalRead(RAIN_GAUGE_PIN) == HIGH) {
     esp_sleep_enable_ext0_wakeup((gpio_num_t)RAIN_GAUGE_PIN, 0);
+  }
+#endif
+#if SOS_BUTTON_PIN >= 0
+  // ext1 (ext0 is the rain gauge's), on the pin going LOW. The digital
+  // pull-up is off in deep sleep: the RTC pull-up holds the pin HIGH, and
+  // it needs the RTC peripherals powered. Not armed while the button is
+  // pressed / stuck, or every wake would end at once - the timer wakes
+  // re-check it. pinMode first: after a rain wake that sleeps again the
+  // pin is still an RTC pad from the last sleep.
+  pinMode(SOS_BUTTON_PIN, INPUT_PULLUP);
+  delay(1);
+  if (digitalRead(SOS_BUTTON_PIN) == HIGH) {
+    esp_sleep_enable_ext1_wakeup(1ULL << SOS_BUTTON_PIN, ESP_EXT1_WAKEUP_ALL_LOW);
+    rtc_gpio_pullup_en((gpio_num_t)SOS_BUTTON_PIN);
+    rtc_gpio_pulldown_dis((gpio_num_t)SOS_BUTTON_PIN);
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  } else {
+    Serial.println("[sos] button pressed / stuck - not armed as a wake-up this sleep");
   }
 #endif
   sjSleepStateSeal(sleepState);
@@ -675,6 +1482,49 @@ static void handleRainWake() {
 #endif
 }
 
+// Lets a press in progress decide - an SOS (sosRequested) or a release -
+// before the node sleeps: asleep, a held button is not armed as a wake-up,
+// so a hold that began just before the sleep would be lost.
+static SjSosPhase finishSosHold() {
+  uint32_t start = millis();
+  SjSosPhase phase = pollSosButton();
+  while (!sosRequested && phase == SJ_SOS_HOLDING && millis() - start < SOS_HOLD_MS + 1000) {
+    digitalWrite(LED_PIN, sosLed(phase) > 0);  // fast blink: keep holding
+    delay(10);
+    phase = pollSosButton();
+  }
+  digitalWrite(LED_PIN, LOW);
+  return phase;
+}
+
+// Woken by the SOS button: a real hold or a bump? A hold returns with
+// sosRequested set - runSleepCycle() then measures and sends the SOS first.
+// A bump goes back to sleep for whatever is left, like a rain tip, unless a
+// measurement is due anyway. The hold counts from the wake (millis() 0), so
+// the boot time is part of it.
+static void handleSosWake() {
+#if SOS_BUTTON_PIN >= 0
+  pinMode(LED_PIN, OUTPUT);
+  SjSosPhase phase = finishSosHold();
+  if (sosRequested) return;
+  if (phase == SJ_SOS_IDLE) Serial.println("[sos] released before SOS_HOLD_MS - not an SOS");
+  uint32_t now = deviceSeconds();
+  if (sjRainWakeShouldResleep(now, sleepState.nextWakeS, DEEP_SLEEP_RAIN_SLACK_S)) {
+    enterDeepSleep(sjRemainingS(now, sleepState.nextWakeS));
+  }
+#endif
+}
+
+// The person at the node should see that the SOS got through before the
+// node goes dark: LED on for SOS_LED_CONFIRM_MS (a rare event - the energy
+// does not matter).
+static void showSosConfirmation() {
+  while (sjSosConfirmShowing(sosConfirmed, sosConfirmedAtMs, millis(), SOS_LED_CONFIRM_MS)) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(20);
+  }
+}
+
 // Everything that would keep drawing current while the ESP32 sleeps
 static void sleepPeripherals() {
   transportSleep();
@@ -690,7 +1540,11 @@ static void sleepUntilNextMeasurement() {
 #if ENABLE_RAIN_GAUGE
   pendingRainMm += readRainSinceLastMm();  // tips the interrupt counted while awake
 #endif
-  uint32_t interval = sjPlanSleepS(elevated, DEEP_SLEEP_INTERVAL_S, DEEP_SLEEP_ELEVATED_INTERVAL_S);
+  // An SOS the gateway hasn't acknowledged: retry soon, and first - the
+  // next wake takes it from RTC memory (the outbox is RAM).
+  bool unsent = !sosOutbox.empty();
+  uint32_t interval = sjPlanSleepS(elevated || unsent, DEEP_SLEEP_INTERVAL_S, DEEP_SLEEP_ELEVATED_INTERVAL_S);
+  keepPendingSos();
   sleepState.session = session;
   sleepState.seq = seq;
   sleepState.pendingRainMm = pendingRainMm;
@@ -701,23 +1555,47 @@ static void sleepUntilNextMeasurement() {
 }
 
 // One measurement wake: measure, queue, send what the link takes, sleep.
-static void runSleepCycle() {
-  sleepState.rainWakeOff = 0;  // re-arm the rain wake-up every measurement
+// sos = this reading carries the SOS flag (sent even if nothing could be
+// measured: the server raises the SOS from the flag alone). regular = the
+// wake's own measurement (not a second one for an SOS held meanwhile).
+static void measureAndQueue(bool sos, bool regular) {
   SjReading r;
   EdgeRiskLevel edge;
   bool localAlert;
-  if (takeReading(r, edge, localAlert)) {
-    elevated = localAlert || edge == EDGE_WATCH || edge == EDGE_URGENT;
-    r.session = session;
-    r.seq = ++seq;
-    QueuedReading q = {r, deviceSeconds()};
-    if (queue.push(q)) pendingRainMm = 0;  // this rain is now in a queued reading
+  uint8_t failed;
+  bool measured = takeReading(r, localAlert, failed);
+  bool newAnomaly = edgeChecks(r, failed, regular);
+  edge = edgeVerdict(r);
+  // a fast rise also shortens the sleep: the next wakes watch closely
+  bool elev = localAlert || edge == EDGE_WATCH || edge == EDGE_URGENT || (r.xflags & SJ_X_FAST_RISE);
+  elevated = measured && elev;
+  // Every wake reports (one sample per wake: nothing to summarise); an
+  // urgent one goes ahead of whatever is still queued.
+  if (regular && measured) sjSummaryAdd(summaryAcc, r, millis());
+  const SjReportInput in = {regular, measured, sos, false, elev, newAnomaly, true};
+  SjReportPlan plan = sjPlanReport(in);
+  if (plan.send) {
+    queueReading(r, sos, plan);
   } else {
-    elevated = false;
     Serial.println("[sensor] nothing could be measured - no reading this wake");
   }
   printReading(r, edge, localAlert);
-  if (waitForLink()) drainQueueWithin(0, DEEP_SLEEP_MAX_AWAKE_MS);  // millis() counts from this wake
+}
+
+static void runSleepCycle() {
+  sleepState.rainWakeOff = 0;  // re-arm the rain wake-up every measurement
+  bool sos = sosRequested;     // woken by a real SOS hold (handleSosWake)
+  sosRequested = false;
+  measureAndQueue(sos, true);
+  bool linked = waitForLink();
+  if (linked) drainQueueWithin(0, DEEP_SLEEP_MAX_AWAKE_MS);  // millis() counts from this wake
+  finishSosHold();
+  if (sosRequested) {  // held while this wake was measuring / sending
+    sosRequested = false;
+    measureAndQueue(true, false);
+    if (linked) drainQueueWithin(millis(), DEEP_SLEEP_MAX_AWAKE_MS);
+  }
+  showSosConfirmation();
   sleepUntilNextMeasurement();
 }
 #endif
@@ -729,12 +1607,24 @@ void setup() {
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   resumedFromSleep = wake != ESP_SLEEP_WAKEUP_UNDEFINED && sjSleepStateValid(sleepState);
   if (resumedFromSleep && wake == ESP_SLEEP_WAKEUP_EXT0) handleRainWake();  // usually sleeps again here
+#if SOS_BUTTON_PIN >= 0
+  bool sosWake = resumedFromSleep && wake == ESP_SLEEP_WAKEUP_EXT1 &&
+                 (esp_sleep_get_ext1_wakeup_status() & (1ULL << SOS_BUTTON_PIN));
+#else
+  bool sosWake = false;
+#endif
+  setupSosButton(sosWake);
+  if (sosWake) handleSosWake();  // a bump usually sleeps again here
+#else
+  setupSosButton(false);
 #endif
   if (!resumedFromSleep) delay(500);  // give the Serial Monitor a moment after a power-on
   Serial.printf("\n=== SANJEEVNI LoRa node %s ===\n", NODE_ID);
   pinMode(LED_PIN, OUTPUT);
+  setupSiren();  // early: the pin is driven to "off" before anything slow runs
 
   setupSensors();
+  setupDutyCycle();  // off by default; never with deep sleep (that needs no MQ135 / PMS5003)
   if (resumedFromSleep) {
     // Same session across wakes: reading_uid stays unique and queued
     // readings keep their age - and no flash write every few minutes.
@@ -743,13 +1633,38 @@ void setup() {
     pendingRainMm = sleepState.pendingRainMm;
   }
 
-  queueOk = queue.begin("/node_queue.bin", "/node_queue.hdr", QUEUE_CAPACITY);
+  // Readings queued by the protocol-v2 firmware are converted, not dropped
+  // (sjUpgradeRecord, sj_packet.h), at the first boot after the update -
+  // and so are the 68-byte records of the v3 firmware before summaries.
+  queueOk = queue.begin("/node_queue.bin", "/node_queue.hdr", QUEUE_CAPACITY, sjUpgradeRecord<QueuedReading>);
   if (!queueOk) {
     Serial.println("[queue] LittleFS unavailable - readings will NOT survive outages");
   }
   Serial.printf("[queue] %u reading(s) left from before reboot\n", queue.count());
-  edgeOk = setupEdgeAI();
-  Serial.println(edgeOk ? "[edge] model ready" : "[edge] model unavailable - sending without edge verdict");
+#if SOS_BUTTON_PIN >= 0
+  {
+    // An SOS sent before this wake / reset but not acknowledged goes first
+    // again. Its copy in RTC memory (keepPendingSos()) survives deep sleep
+    // and resets, whatever was queued since. A power-on loses RTC memory:
+    // then the newest SOS among the last SOS_QUEUE_SCAN queued records
+    // (maybe already delivered - then a duplicate the server ignores).
+    // A wake with nothing in RTC memory has nothing pending.
+    QueuedReading pendingSos;
+    memset(&pendingSos, 0, sizeof(pendingSos));  // no summary: an SOS reading never carries one
+    bool found = sjSleepPendingSos(sleepState, pendingSos.reading, pendingSos.takenAtS);
+    if (!found && !resumedFromSleep) found = sjFindQueuedSos(queue, SOS_QUEUE_SCAN, 0, 0, pendingSos);
+    if (found) {
+      sosOutbox.add(pendingSos);
+      Serial.printf("[sos] SOS #%lu-%lu not acknowledged yet - sending it first\n",
+                    (unsigned long)pendingSos.reading.session, (unsigned long)pendingSos.reading.seq);
+    }
+  }
+#endif
+  setupEdgeChecks();
+  sjSummaryReset(summaryAcc);  // "no edge verdict yet" is not the zero a static starts with
+  edgeOk = setupEdgeAI();  // EDGE_MODEL_IN_USE: main / lite / none (config.h)
+  Serial.printf("[edge] %s model %s\n", SJ_EDGE_MODEL_NAME,
+                edgeOk ? "ready" : "unavailable - sending without edge verdict");
   setupTransport();  // LoRa: result kept in loraBeginState for the self-test
   if (!resumedFromSleep) {
     // New session every power-on -> unique reading_uid, also across board
@@ -761,8 +1676,14 @@ void setup() {
     session = sjNextSession(stored, sjPrefs.getULong("sess32", 0), fresh);
     sjPrefs.putULong("sess32", session);
     sjSleepStateReset(sleepState, session);
+    keepPendingSos();  // the reset wiped the RTC copy of an SOS recovered above
   }
   Serial.printf("[boot] session %lu%s\n", (unsigned long)session, resumedFromSleep ? " (woke from deep sleep)" : "");
+#if !DEEP_SLEEP_ENABLED
+  Serial.printf("[boot] normal report every %lus (%s); urgent readings at once\n",
+                (unsigned long)(NORMAL_REPORT_INTERVAL_MS / 1000), SIREN_PIN >= 0 ? "siren node" : "no siren");
+#endif
+  setupHotspot();  // never with deep sleep (config.h)
 #if DEEP_SLEEP_ENABLED
   if (resumedFromSleep) runSleepCycle();  // never returns
 #endif
@@ -783,34 +1704,64 @@ void loop() {
 #if ENABLE_PMS5003
   pollPms5003();  // keep the UART buffer drained
 #endif
+  SjSosPhase sosPhase = pollSosButton();
+  serviceDutyCycle();
+  serviceSiren();
+  serviceHotspot();
 
   uint32_t now = millis();
-  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
+  bool sos = sosRequested;  // SOS: measure now, don't wait for the next sample
+  bool sirenDue = sirenReportDue;  // siren started / stopped: report it now
+  bool regular = now - lastSampleMs >= SAMPLE_INTERVAL_MS;
+  if (sos || sirenDue || regular) {
+    sosRequested = false;
     lastSampleMs = now;
     SjReading r;
     EdgeRiskLevel edge;
     bool localAlert;
-    bool ok = takeReading(r, edge, localAlert);
-    elevated = localAlert || edge == EDGE_WATCH || edge == EDGE_URGENT;
-    bool due = elevated || now - lastReportMs >= NORMAL_REPORT_INTERVAL_MS || lastReportMs == 0;
-
-    if (ok && due) {
-      r.session = session;
-      r.seq = ++seq;
-      QueuedReading q = {r, deviceSeconds()};
-      if (queue.push(q)) {
-        pendingRainMm = 0;  // this rain is now in a queued reading
+    uint8_t failed;
+    bool ok = takeReading(r, localAlert, failed);
+    bool newAnomaly = edgeChecks(r, failed, regular);
+    edge = edgeVerdict(r);
+    // A fast river rise is sent at once - every sample while it lasts.
+    elevated = localAlert || edge == EDGE_WATCH || edge == EDGE_URGENT || (r.xflags & SJ_X_FAST_RISE);
+    // Only samples on the regular schedule count towards the siren's
+    // "URGENT on N consecutive samples": an extra one taken a moment later
+    // for an SOS / a siren report sees the same glitch, not a confirmation.
+    // A start here goes out in this very reading. A value the anomaly
+    // checks doubt is never URGENT here (sjSirenLocalUrgent).
+    if (regular) sirenSample(r, ok);
+    sirenDue = sirenDue || sirenReportDue;
+    sirenReportDue = false;
+#if SUMMARY_ENABLE
+    if (regular && ok) sjSummaryAdd(summaryAcc, r, now);  // every regular sample, sent now or summarised later
+#endif
+    // What to send, and how urgently (sj_report.h): urgent readings at once
+    // and ahead of the backlog, otherwise one report per interval carrying
+    // the summary of the samples since the last one. An SOS reading goes
+    // even if no sensor answered: the server raises the SOS from the flag
+    // (the backend then refuses the reading itself and the gateway drops
+    // just that one - sjUploadAction()).
+    const SjReportInput in = {regular, ok, sos, sirenDue, elevated, newAnomaly,
+                              now - lastReportMs >= NORMAL_REPORT_INTERVAL_MS || lastReportMs == 0};
+    SjReportPlan plan = sjPlanReport(in);
+    if (plan.send) {
+      if (queueReading(r, sos, plan)) {
         lastReportMs = now;
-        if (elevated) nextFlushMs = 0;  // elevated: try to send immediately
+        dutyOnReport(r);
+        if (plan.priority || sirenDue) nextFlushMs = millis();  // try to send immediately
       }
     }
     printReading(r, edge, localAlert);
   }
 
-  if (queue.count() > 0 && (int32_t)(millis() - nextFlushMs) >= 0) flushQueue();
+  if ((queue.count() > 0 || !sosOutbox.empty() || !urgentOutbox.empty() || sosMsgsWaiting()) &&
+      sjFlushDue(millis(), nextFlushMs, FLUSH_RETRY_INTERVAL_MS))
+    flushQueue();
 
-  // LED: fast blink while elevated, off otherwise
-  digitalWrite(LED_PIN, elevated && (millis() / 150) % 2);
+  // LED: SOS feedback first (sjSosLed), else fast blink while elevated
+  int led = sosLed(sosPhase);
+  digitalWrite(LED_PIN, led >= 0 ? led : elevated && (millis() / 150) % 2);
 
 #if DEEP_SLEEP_ENABLED
   // Setup window after a power-on is over and nobody is typing commands:
@@ -818,7 +1769,13 @@ void loop() {
   if (millis() >= DEEP_SLEEP_SETUP_WINDOW_MS && millis() - lastSerialMs >= DEEP_SLEEP_SETUP_WINDOW_MS) {
     Serial.println("[sleep] setup window over - starting the deep-sleep cycle");
     drainQueueWithin(millis(), DEEP_SLEEP_MAX_AWAKE_MS);
-    sleepUntilNextMeasurement();
+    finishSosHold();
+    // A hold during that drain: loop() measures and sends the SOS on its
+    // next pass and comes back here - never sleep on a requested SOS.
+    if (!sosRequested) {
+      showSosConfirmation();
+      sleepUntilNextMeasurement();
+    }
   }
 #endif
   delay(10);

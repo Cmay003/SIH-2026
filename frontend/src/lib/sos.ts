@@ -55,6 +55,31 @@ export function sosGate(state: {
   return { enabled: true, hint: high ? "highRisk" : "available" };
 }
 
+/**
+ * A device fix less exact than this (metres) is "approximate". Devices
+ * without GPS (most laptops, some phones, GPS off) still answer with a
+ * Wi-Fi / cell / IP position that can be kilometres off. Same value as
+ * APPROX_LOCATION_M in server.js and the classic pages.
+ */
+export const APPROX_LOCATION_M = 500;
+
+/** The browser's coords.accuracy as a usable number of metres, or null. */
+export function accuracyOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/** true when a device fix may be off by more than APPROX_LOCATION_M (unknown = not flagged). */
+export function isApproximateFix(accuracyM: number | null | undefined): boolean {
+  return accuracyM != null && accuracyM > APPROX_LOCATION_M;
+}
+
+/** "±35 m", "±2.3 km", "±12 km" */
+export function formatAccuracy(accuracyM: number): string {
+  if (accuracyM < 1000) return `±${Math.round(accuracyM)} m`;
+  const km = accuracyM / 1000;
+  return `±${km < 10 ? km.toFixed(1) : Math.round(km)} km`;
+}
+
 /** One id per browser, so a device can't queue a second SOS. */
 export function newDeviceId(): string {
   const random = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(36).padStart(2, "0")).join("");

@@ -17,8 +17,9 @@ import {
 } from "../components/dashboard";
 import styles from "../components/Dashboard.module.css";
 import { AlarmSoundToggle, EmergencyAlarm } from "../components/EmergencyAlarm";
-import { alarmItemsFromHazards, receivesAlarm, type AlarmItem } from "../lib/alarm";
+import { alarmItemsFromHazards, receivesAlarm, showKeyOf, type AlarmItem } from "../lib/alarm";
 import { isSevere } from "../lib/hazards";
+import { CAP_FEED_URL } from "../lib/alertLinks";
 import { useBackgroundRefetch } from "../lib/useBackgroundRefetch";
 import { useDeniedToast } from "../components/Toast";
 import { useMe } from "../hooks/useAuth";
@@ -67,7 +68,8 @@ export function DashboardPage() {
   const alarmItems = useMemo(() => alarmItemsFromHazards(hazardList), [hazardList]);
   const deniedToast = useDeniedToast();
   // Only officers get the pop-up + siren (lib/alarm.ts receivesAlarm)
-  const alarmOn = receivesAlarm(useMe().data?.user.role);
+  const role = useMe().data?.user.role;
+  const alarmOn = receivesAlarm(role);
   // Acknowledge on the dashboard takes the officer to the map, in the same
   // officer-map tab the hazard cards use
   const ackOpensMap = useCallback((item: AlarmItem) => openOfficerMap(item.nodeId), []);
@@ -77,13 +79,15 @@ export function DashboardPage() {
   const [highlightKey, setHighlightKey] = useState<string | null>(null);
   const focusTimer = useRef<number | undefined>(undefined);
   const showHazard = useCallback((item: AlarmItem) => {
-    setHighlightKey(item.key);
+    // an area-wide forecast item goes to its most severe node's card
+    const key = showKeyOf(item);
+    setHighlightKey(key);
     window.clearTimeout(focusTimer.current);
     // Wait a moment so the alarm dialog can close (and hand focus back)
     // before focus moves to the card.
     focusTimer.current = window.setTimeout(() => {
       const card = Array.from(document.querySelectorAll<HTMLElement>("[data-hazard-key]")).find(
-        (el) => el.dataset.hazardKey === item.key,
+        (el) => el.dataset.hazardKey === key,
       );
       const target = card ?? document.getElementById("hazards-heading");
       if (!target) return;
@@ -163,7 +167,7 @@ export function DashboardPage() {
             </div>
           )}
           {hazards.data ? (
-            <HazardList hazards={hazardList} highlightKey={highlightKey} />
+            <HazardList hazards={hazardList} highlightKey={highlightKey} role={role} />
           ) : (
             hazards.isPending && <HazardSkeleton label="Loading hazard list..." cards={3} />
           )}
@@ -186,6 +190,11 @@ export function DashboardPage() {
           />
         </section>
       </main>
+      <footer className={styles.footer}>
+        <a href={CAP_FEED_URL}>Public CAP 1.2 alert feed (Atom)</a> - confirmed alerts in the Common Alerting
+        Protocol format, for emergency-management dashboards and feed readers.
+        {(role === "officer" || role === "admin") && <> · <a href="/trends.html">Risk trends &amp; district report</a></>}
+      </footer>
     </>
   );
 }

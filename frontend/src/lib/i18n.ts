@@ -74,6 +74,13 @@ const STRINGS = {
     locManualKept: "The point you set on the map is still used.",
     locManualSet:
       "Location set by hand on the map ({lat}, {lon}). Responders will see that it was set by hand and may be approximate.",
+    // Device fix less exact than APPROX_LOCATION_M (lib/sos.ts) - typical on a
+    // device without GPS (Wi-Fi / cell / IP position). {acc} is e.g. "±2.3 km".
+    // Never blocks SOS: it only offers the map.
+    // HUMAN REVIEW: safety-critical citizen text - check wording before release.
+    approxNotice: "Your location is approximate (about {acc}). If you can, check it or set your location on the map.",
+    approxSetOnMap: "Check / set my location on the map",
+    locApproxManualKept: "Your device location is only approximate ({acc}), so the point you set on the map is still used.",
   },
   hi: {
     portalLabel: "नागरिक पोर्टल",
@@ -149,6 +156,10 @@ const STRINGS = {
     locManualKept: "मानचित्र पर आपका चुना हुआ स्थान अभी भी उपयोग हो रहा है।",
     locManualSet:
       "स्थान मानचित्र पर स्वयं चुना गया ({lat}, {lon})। सहायता दल को दिखेगा कि यह स्वयं चुना गया है और अनुमानित हो सकता है।",
+    // HUMAN REVIEW: new approximate-location text - Hindi needs native-speaker review
+    approxNotice: "आपकी लोकेशन अनुमानित है (लगभग {acc})। हो सके तो इसे जाँचें या मानचित्र पर अपना स्थान चुनें।",
+    approxSetOnMap: "मानचित्र पर अपना स्थान जाँचें / चुनें",
+    locApproxManualKept: "आपके डिवाइस की लोकेशन केवल अनुमानित है ({acc}), इसलिए मानचित्र पर आपका चुना हुआ स्थान ही उपयोग हो रहा है।",
   },
 } as const;
 

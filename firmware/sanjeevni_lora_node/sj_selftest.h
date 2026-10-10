@@ -284,12 +284,33 @@ inline SjCheckResult sjCheckQueue(bool mounted, uint32_t count, uint32_t capacit
 }
 
 // ---------------------------------------------------------------------
-// Edge AI model (needs water + DHT + gas + flame enabled to be used)
+// Edge AI model (edge_ai.h): `model` = "main" / "lite" / "none" (config.h
+// EDGE_MODEL_IN_USE). golden = the generated header's golden vectors run
+// through TFLite Micro on this board at setup: each must get the class the
+// training pipeline's int8 interpreter gave it on the PC. A miss switches
+// the verdicts off (FAIL: the device does not run the model that was
+// tested). goldenTotal 0 = the check never ran (the model did not load).
 // ---------------------------------------------------------------------
-inline SjCheckResult sjCheckEdge(bool modelReady, bool inputsEnabled) {
-  if (!modelReady) return sjResult(SJ_CHECK_WARN, "model unavailable - readings carry no edge verdict");
-  if (!inputsEnabled) return sjResult(SJ_CHECK_OK, "loaded, unused on this node (needs water+DHT+gas+flame)");
-  return sjResult(SJ_CHECK_OK, "loaded");
+inline SjCheckResult sjCheckEdge(const char* model, bool modelReady, unsigned goldenPassed, unsigned goldenTotal) {
+  if (model[0] == 'n') return sjResult(SJ_CHECK_OK, "no edge model on this node (no water/DHT/gas/flame/tilt)");
+  if (goldenTotal > 0 && goldenPassed != goldenTotal)
+    return sjResult(SJ_CHECK_FAIL, "%s model: %u of %u golden vectors give the PC's class - verdicts OFF", model,
+                    goldenPassed, goldenTotal);
+  if (!modelReady) return sjResult(SJ_CHECK_WARN, "%s model unavailable - readings carry no edge verdict", model);
+  return sjResult(SJ_CHECK_OK, "%s model, %u/%u golden vectors match the PC", model, goldenPassed, goldenTotal);
+}
+
+// ---------------------------------------------------------------------
+// SOS push-button (sj_sos.h). `pinLow` = pressed right now; `stuck` = the
+// button logic has disabled SOS (pressed since power-on or for too long).
+// ---------------------------------------------------------------------
+inline SjCheckResult sjCheckSosButton(bool pinLow, bool stuck, uint32_t heldMs, uint32_t holdMs) {
+  if (stuck)
+    return sjResult(SJ_CHECK_FAIL, "pressed for %lu s / since power-on - SOS OFF until released (water? short?)",
+                    (unsigned long)(heldMs / 1000));
+  if (pinLow) return sjResult(SJ_CHECK_WARN, "pressed right now - release it, then hold %lu s to test",
+                              (unsigned long)(holdMs / 1000));
+  return sjResult(SJ_CHECK_OK, "released - hold %lu s to send an SOS", (unsigned long)(holdMs / 1000));
 }
 
 // ---------------------------------------------------------------------

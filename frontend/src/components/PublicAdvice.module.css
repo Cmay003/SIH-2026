@@ -1,0 +1,36 @@
+/* "What the public is told" (PublicAdvice.tsx, step W3): dashboard cards,
+   officer zone popups and the emergency alarm. */
+.advice {
+  margin-top: 6px;
+  font-size: var(--text-sm);
+}
+.summary {
+  cursor: pointer;
+  color: var(--link);
+  font-weight: var(--weight-bold);
+  min-height: 24px;
+}
+.summary:hover {
+  color: var(--link-hover);
+}
+.body {
+  margin-top: 4px;
+}
+.body p {
+  margin: 4px 0;
+}
+.head {
+  font-weight: var(--weight-bold);
+}
+.list {
+  margin: 2px 0 4px;
+  padding-left: 20px;
+}
+.list li {
+  margin: 2px 0;
+}
+.note {
+  margin: 4px 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}

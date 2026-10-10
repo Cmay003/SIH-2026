@@ -12,19 +12,24 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "sj_packet.h"
 
-#define SJ_SLEEP_MAGIC 0x534A5332u  // "SJS2" (session became 32-bit) - bump if SjSleepState changes
+#define SJ_SLEEP_MAGIC 0x534A5335u  // "SJS5" (64-byte v3 SOS reading) - bump if SjSleepState changes
 
 struct SjSleepState {
   uint32_t magic;
   uint32_t session;       // kept across wakes: reading_uid stays session-seq
   uint8_t elevated;       // last reading was elevated -> short sleep
   uint8_t rainWakeOff;    // rain pin stuck low: don't wake on it this cycle
-  uint8_t reserved[2];    // explicit padding, so the checksum covers no garbage
+  uint8_t sosEver;        // sosAtS is valid
+  uint8_t sosPending;     // sosReading / sosTakenAtS hold an SOS not acknowledged yet
   uint32_t seq;           // last sequence number used
   uint32_t nextWakeS;     // when the next MEASUREMENT is due (sjClock seconds)
   float pendingRainMm;    // rain since the last QUEUED reading
   uint32_t rainTipsTotal; // diagnostics: tips counted while asleep
+  uint32_t sosAtS;        // when the SOS button last sent an SOS: its cooldown spans wakes
+  uint32_t sosTakenAtS;   // the pending SOS reading's QueuedReading.takenAtS
+  SjReading sosReading;   // packed 64 bytes: no padding before `check`
   uint32_t check;
 };
 
@@ -52,6 +57,36 @@ inline void sjSleepStateReset(SjSleepState& s, uint32_t session) {
   memset(&s, 0, sizeof(s));
   s.session = session;
   sjSleepStateSeal(s);
+}
+
+// The newest SOS reading the gateway hasn't acknowledged (null = none),
+// kept in step with the node's outbox. The outbox is RAM and lost in deep
+// sleep or a reset; finding the SOS again in the flash queue by seq only
+// worked while it was among the newest SOS_QUEUE_SCAN records - a wake
+// pushes one reading, so after ~16 min without a gateway it fell back
+// behind the backlog - and not at all if its flash push had failed. The
+// reading itself (64 bytes) in RTC memory has neither problem.
+inline void sjSleepKeepSos(SjSleepState& s, const SjReading* r, uint32_t takenAtS) {
+  s.sosPending = r != nullptr;
+  if (r) {
+    s.sosReading = *r;
+    s.sosTakenAtS = takenAtS;
+  } else {
+    memset(&s.sosReading, 0, sizeof(s.sosReading));
+    s.sosTakenAtS = 0;
+  }
+  sjSleepStateSeal(s);
+}
+
+// The SOS kept by sjSleepKeepSos(), if the state verifies (not after a
+// power-on: RTC memory is garbage then) and it really is an SOS reading.
+inline bool sjSleepPendingSos(const SjSleepState& s, SjReading& r, uint32_t& takenAtS) {
+  if (!sjSleepStateValid(s) || !s.sosPending || s.sosReading.magic != SJ_MAGIC ||
+      !(s.sosReading.flags & SJ_SOS_PRESSED))
+    return false;
+  r = s.sosReading;
+  takenAtS = s.sosTakenAtS;
+  return true;
 }
 
 // How long to sleep after a measurement: short while something looks

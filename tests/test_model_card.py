@@ -266,7 +266,9 @@ class ContractTests(unittest.TestCase):
                 card = em.build_card(seed=1, models_dir=tmp, sizes=SMALL,
                                      edge_build_dir=tmp, firmware_dir=tmp)
             self.assertEqual(card["provenance"], "NONE")
-            self.assertEqual([e["status"] for e in card["models"]], ["not_available"] * 4)
+            # flood, anomaly, edge main, edge lite (firmware lane 2026-10-09), river forecast
+            self.assertGreaterEqual(len(card["models"]), 4)
+            self.assertEqual({e["status"] for e in card["models"]}, {"not_available"})
             self.assertTrue(all(e["status_reason"] for e in card["models"]))
             self.assertIsNone(card["models_updated_at"])
         finally:

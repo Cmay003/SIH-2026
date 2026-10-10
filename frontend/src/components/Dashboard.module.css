@@ -744,3 +744,30 @@
   margin-bottom: 12px;
   overflow-wrap: anywhere;
 }
+
+/* ---- CAP XML / PDF report / Timeline under a hazard card (step W2) ---- */
+/* The card stays one link; the buttons sit below it, so the card + buttons
+   column keeps equal-height cards across the grid row. */
+.hazardItem {
+  display: flex;
+  flex-direction: column;
+}
+.hazardItem > .cardLink {
+  height: auto;
+  flex: 1 1 auto;
+}
+.cardActions {
+  padding: 0 var(--space-1);
+}
+
+.footer {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-5) var(--space-8);
+  color: var(--text-muted);
+  font-size: var(--text-md);
+}
+.footer a {
+  color: var(--link);
+  font-weight: var(--weight-medium);
+}

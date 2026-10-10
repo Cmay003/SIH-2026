@@ -34,8 +34,14 @@
 //    begin() just redoes the copy. The copy needs free flash for a second
 //    set of files: if it fails (no room, failing flash) the old queue is
 //    KEPT - at its old size until the next boot tries again - instead of
-//    being wiped. A changed record struct (sizeof(T)) can't be converted:
-//    the queue then starts empty, with a message.
+//    being wiped.
+//  - A changed record struct (sizeof(T), e.g. a firmware update that made
+//    the packet longer) is converted the same way IF the caller passes an
+//    upgrade function to begin() that understands the old record: each
+//    queued record is read with the old size (its CRC checked) and
+//    converted, oldest first - readings the node / gateway already
+//    accepted survive the update. Without one, or if the copy fails (the
+//    old records can't be kept as T), the queue starts empty, with a message.
 //
 // Crash safety of push(): LittleFS makes a file's new content visible only
 // when it is closed, so each segment/header write is all-or-nothing. Data
@@ -65,10 +71,16 @@ inline uint32_t sjQueueCrc32(const uint8_t* p, size_t n) {
 template <typename T, uint32_t kSegmentBytes = 4096>
 class SjFileQueue {
  public:
-  bool begin(const char* dataPath, const char* headerPath, uint32_t capacity) {
+  // Converts one record of an older layout (`size` bytes, CRC already
+  // checked) to T. false = not convertible: that record is left out.
+  typedef bool (*Upgrade)(const uint8_t* old, uint32_t size, T& out);
+  static constexpr uint32_t kMaxOldRecord = 256;  // larger old records are not offered to `upgrade`
+
+  bool begin(const char* dataPath, const char* headerPath, uint32_t capacity, Upgrade upgrade = nullptr) {
     dataPath_ = dataPath;
     headerPath_ = headerPath;
     capacity_ = capacity;
+    upgrade_ = upgrade;
     perSeg_ = kSegmentBytes / kSlot ? kSegmentBytes / kSlot : 1;
     ready_ = false;
     header_ = Header();  // count()/dropped() read 0 if begin() fails
@@ -113,6 +125,10 @@ class SjFileQueue {
         }
         Serial.println("[queue] old-format queue unreadable - starting empty");
         return startFresh();
+      case kHdrOldRecord:
+        Serial.printf("[queue] record format changed (firmware update, %u -> %u bytes) - converting %u queued reading(s)\n",
+                      (unsigned)h.recordSize, (unsigned)sizeof(T), (unsigned)h.count);
+        return rebuild(h, false);
       case kHdrOtherRecord:
         Serial.println("[queue] record format changed (firmware update) - old queued readings can't be converted, starting empty");
         return startFresh();
@@ -221,7 +237,7 @@ class SjFileQueue {
       if (f) f.close();
     }
   };
-  enum { kHdrNone, kHdrCurrent, kHdrLegacy, kHdrOtherRecord, kHdrDamaged };
+  enum { kHdrNone, kHdrCurrent, kHdrLegacy, kHdrOldRecord, kHdrOtherRecord, kHdrDamaged };
 
   static constexpr uint32_t kMagic = 0x534A5132;        // "SJQ2"
   static constexpr uint32_t kLegacyMagic = 0x534A5131;  // "SJQ1"
@@ -234,6 +250,7 @@ class SjFileQueue {
   uint32_t perSeg_ = 1;
   bool ready_ = false;
   Header header_;
+  Upgrade upgrade_ = nullptr;
 
   static uint32_t segCount(uint32_t cap, uint32_t perSeg) { return (cap + perSeg - 1) / perSeg; }
   static uint32_t segSlots(uint32_t cap, uint32_t perSeg, uint32_t seg) {
@@ -272,10 +289,33 @@ class SjFileQueue {
     return true;
   }
 
+  // A record of an older firmware's layout (src.recordSize bytes + CRC),
+  // through upgrade_ (only offered for kHdrOldRecord, see readHeader()).
+  bool readOldSlot(Cursor& c, const Header& src, uint32_t slot, T& out) {
+    uint32_t seg = slot / src.perSeg;
+    if (seg != c.seg) {
+      if (c.f) c.f.close();
+      char p[kPathLen];
+      segPath(p, src.gen, seg);
+      c.f = LittleFS.open(p, "r");
+      c.seg = seg;
+    }
+    uint8_t buf[kMaxOldRecord + sizeof(uint32_t)];
+    size_t oldSlot = src.recordSize + sizeof(uint32_t);
+    if (!upgrade_ || src.recordSize > kMaxOldRecord || !c.f ||
+        !c.f.seek((uint32_t)((slot % src.perSeg) * oldSlot)) || c.f.read(buf, oldSlot) != oldSlot)
+      return false;
+    uint32_t crc;
+    memcpy(&crc, buf + src.recordSize, sizeof(crc));
+    if (crc != sjQueueCrc32(buf, src.recordSize)) return false;
+    return upgrade_(buf, src.recordSize, out);
+  }
+
   // Record i (0 = oldest) of a queue described by `src`; `legacy` = the
   // old single-file format, which has no per-record CRC.
   bool readSource(Cursor& c, const Header& src, bool legacy, uint32_t i, T& out) {
     uint32_t slot = (src.head + i) % src.capacity;
+    if (!legacy && src.recordSize != sizeof(T)) return readOldSlot(c, src, slot, out);
     if (!legacy) return readSlot(c, src.gen, src.perSeg, slot, out);
     if (c.seg != 0) {
       c.f = LittleFS.open(dataPath_, "r");
@@ -310,8 +350,11 @@ class SjFileQueue {
     if (n == sizeof(Header)) {
       memcpy(&h, buf, sizeof(h));
       if (h.magic != kMagic || h.crc != headerCrc(h)) return kHdrDamaged;
-      if (h.recordSize != sizeof(T)) return kHdrOtherRecord;
       bool sane = h.capacity > 0 && h.perSeg > 0 && h.gen <= 1 && h.head < h.capacity && h.count <= h.capacity;
+      if (h.recordSize != sizeof(T)) {
+        bool convertible = upgrade_ && sane && h.recordSize > 0 && h.recordSize <= kMaxOldRecord;
+        return convertible ? kHdrOldRecord : kHdrOtherRecord;
+      }
       return sane ? kHdrCurrent : kHdrDamaged;
     }
     if (n == sizeof(LegacyHeader)) {
@@ -492,7 +535,7 @@ class SjFileQueue {
     // readings the nodes were already ACKed for is worse than staying on
     // the old layout / keeping a damaged record.
     removeSegments(dst, segCount(capacity_, perSeg_));  // free the partial copy
-    if (!legacy) {
+    if (!legacy && src.recordSize == sizeof(T)) {  // old-layout records can't be kept as T
       char probe[kPathLen];
       if (src.capacity != capacity_ || src.perSeg != perSeg_) {
         if (segPath(probe, 1, segCount(src.capacity, src.perSeg))) {

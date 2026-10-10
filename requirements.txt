@@ -1,7 +1,10 @@
 # SANJEEVNI backend (backend_server.py) - the packages it actually uses,
 # pinned to the versions tested on the team laptop.
 #   .\venv\Scripts\python.exe -m pip install -r requirements.txt
-# Retraining the LSTM / edge model also needs:  requirements-training.txt
+# TensorFlow is included so ONE install also covers retraining the LSTM /
+# edge models and ml/evaluate_models.py (the model card). The backend itself
+# runs without it (fast_inference.py). It is a large download (several
+# hundred MB).
 # Exact snapshot of the whole dev environment:  requirements-lock.txt
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
@@ -19,3 +22,10 @@ chromadb==1.5.9
 sentence-transformers==6.0.1
 anthropic==1.4.0
 fpdf==1.7.2
+# Training (LSTM river forecast, edge model) + the model card; same version as
+# requirements-lock.txt. On Windows 11 with Smart App Control, see
+# WRAPT_DISABLE_EXTENSIONS in backend_server.py.
+tensorflow==2.21.0
+# Test-only: validates generated CAP XML against the official OASIS CAP 1.2
+# schema (data/cap_schema/CAP-v1.2.xsd) in tests/test_cap_schema.py.
+lxml==6.1.3

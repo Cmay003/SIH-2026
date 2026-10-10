@@ -283,6 +283,7 @@ class CapEndpointTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        bs.close_ingest_connection()  # its kept-open DB handle (Windows cannot delete an open file)
         bs.DB_PATH = cls._real_db
         bs.requests.get = cls._real_get
         shutil.rmtree(cls._tmp, ignore_errors=True)

@@ -38,6 +38,29 @@ STRAPPING = {0: "must not be held LOW at boot", 2: "must not be held HIGH at boo
              5: "must not be held LOW at boot", 12: "HIGH at boot selects 1.8 V flash - board won't boot",
              15: "must not be held LOW at boot (boot log)"}
 VALID = set(range(0, 6)) | set(range(12, 20)) | {21, 22, 23, 25, 26, 27, 32, 33, 34, 35, 36, 39}
+RTC_GPIO = {0, 2, 4, 12, 13, 14, 15, 25, 26, 27, 32, 33, 34, 35, 36, 37, 38, 39}  # can wake from deep sleep
+# A push-button to GND (internal pull-up) pulls its pin LOW whenever it is
+# pressed - also during a reset, so on a strapping pin it picks the boot mode.
+BUTTON_STRAPPING = {0: ("ERROR", "pressed during a reset = download mode, the node hangs until the next reset"),
+                    12: ("ERROR", "never put an external pull-up on it (1.8 V flash - board won't boot)"),
+                    15: ("INFO", "pressed during a reset it only silences the ROM boot log - harmless")}
+# A switch input (MOSFET gate / relay board) with its REQUIRED pull-down to
+# GND holds its pin LOW at every reset - fine where LOW is the safe boot level.
+GATE_PULLDOWN_STRAPPING = {
+    0: ("ERROR", "the gate pull-down holds it LOW at reset = download mode, the node hangs"),
+    2: ("INFO", "LOW at reset is the normal boot level - the pull-down is harmless"),
+    5: ("WARN", "the gate pull-down holds it LOW at reset, which it must not be - pick another pin"),
+    12: ("INFO", "the gate pull-down keeps it LOW at reset as the 3.3 V flash needs - so the 10k is REQUIRED, and "
+                 "never use an active-LOW relay board here (its input pulls the pin HIGH: 1.8 V flash, won't boot)"),
+    15: ("INFO", "LOW at reset only silences the ROM boot log - harmless")}
+# An input of a module that has its OWN pull-up (PMS5003 SET: "pulled up
+# inside", datasheet) holds its pin HIGH at every reset.
+MODULE_PULLUP_STRAPPING = {
+    0: ("ERROR", "the firmware refuses it (config.h): keep GPIO0 for the boot button"),
+    2: ("ERROR", "the module's pull-up holds it HIGH at reset - serial flashing (download mode) then fails"),
+    12: ("ERROR", "the module's pull-up holds it HIGH at reset = 1.8 V flash, the board won't boot"),
+    5: ("INFO", "HIGH at reset is its normal boot level - harmless"),
+    15: ("INFO", "HIGH at reset is its normal boot level - harmless")}
 ESP_ADC_MAX_V = 3.3  # absolute pin limit; ADC at 11 dB reads reliably up to ~3.1 V
 
 
@@ -106,10 +129,14 @@ def divider_pair(ratio, big=False):
 # ---- module catalogue ------------------------------------------------------
 # signal: (module pin, config key, direction seen from the ESP32, extra)
 #   direction: "out" ESP32 drives it, "in" ESP32 reads it, "io" both, "analog"
-#   extra: dict(level_v=module output voltage, divider=ratio key, pullup=text)
+#   extra: dict(level_v=module output voltage, divider=ratio key, pullup=text,
+#               pulldown=text: a resistor from the pin to GND that the wiring REQUIRES,
+#               gate_pulldown=True: that pull-down holds a switch's input LOW at reset)
 # module flags read by power_checks() (flags, not name/note text, so a
 # rename cannot switch a check off):
-#   needs_own_supply=True: transmit peaks the ESP32 3V3 pin cannot feed - must be supply "ext"
+#   needs_own_supply=True: current the ESP32's rails cannot feed (SIM7020 transmit
+#                          peaks, a 12 V siren) - must be supply "ext"
+#   own_supply=(short power-table note, power-budget <li> html) for an "ext" module
 #   max_supply="3V3": highest rail the module tolerates - power_checks() flags any other rail
 
 
@@ -131,8 +158,22 @@ def node_modules(c):
         mods.append(dict(name="IR flame sensor", supply="3V3", note="Power it from 3V3 so DO is a 3.3 V signal.",
                          signals=[("DO", "FLAME_PIN", "in", {"level_v": 3.3})]))
     if c.get("ENABLE_GAS"):
-        mods.append(dict(name="MQ135 gas", supply="5V", note="Heater ~150 mA from 5 V, always on (no deep sleep).",
+        heater = ("Heater ~150 mA from 5 V, switched by the MQ135 heater switch below (duty cycle: on only around "
+                  "the reports that carry gas)." if c.get("MQ135_DUTY_CYCLE") else
+                  "Heater ~150 mA from 5 V, always on (no deep sleep).")
+        mods.append(dict(name="MQ135 gas", supply="5V", note=heater,
                          signals=[("AO", "MQ135_PIN", "analog", {"level_v": 5.0, "divider": "MQ135_ADC_DIVIDER_RATIO"})]))
+    if c.get("ENABLE_GAS") and isinstance(c.get("MQ135_HEATER_PIN"), int) and c["MQ135_HEATER_PIN"] >= 0:
+        mods.append(dict(name="MQ135 heater switch", supply="-",
+                         note="Duty cycle (MQ135_DUTY_CYCLE): a logic-level N-MOSFET (Rds(on) specified at a gate "
+                              "voltage of 3.3 V or less - check its datasheet) in the MQ135 module's GND lead: drain "
+                              "to the module's GND pin, source to the common GND, 100R gate resistor, 10k "
+                              "gate-to-GND REQUIRED (heater off while the ESP32 resets). Switched off, the module's "
+                              "AO rises towards 5 V; the 10k/10k divider keeps the ADC pin near 2.5 V and the "
+                              "firmware does not read it then.",
+                         part="logic-level N-MOSFET for ~150 mA (heater), 100R gate resistor, 10k gate to GND",
+                         signals=[("GATE", "MQ135_HEATER_PIN", "out", {"pulldown": "10k gate to GND (REQUIRED)",
+                                                                       "gate_pulldown": True})]))
     if c.get("ENABLE_RAIN_GAUGE"):
         mods.append(dict(name="Rain gauge (reed switch)", supply="-", note="Switch between the pin and GND.",
                          signals=[("reed", "RAIN_GAUGE_PIN", "in", {"pullup": "10k to 3V3 (REQUIRED)", "needs_external_pullup": True})]))
@@ -143,8 +184,14 @@ def node_modules(c):
         mods.append(dict(name="MPU6050 tilt/vibration", supply="3V3", note=f"I2C address 0x{c.get('MPU6050_ADDR', 0x68):02X} (AD0 to GND).",
                          signals=[("SDA", "I2C_SDA", "io", {}), ("SCL", "I2C_SCL", "out", {})]))
     if c.get("ENABLE_PMS5003"):
-        mods.append(dict(name="PMS5003 particulate", supply="5V", note="Fan needs 5 V; its UART is 3.3 V logic.",
-                         signals=[("TX", "PMS_RX_PIN", "in", {"level_v": 3.3}), ("RX", "PMS_TX_PIN", "out", {})]))
+        pms_sig = [("TX", "PMS_RX_PIN", "in", {"level_v": 3.3}), ("RX", "PMS_TX_PIN", "out", {})]
+        note = "Fan needs 5 V; its UART is 3.3 V logic."
+        if isinstance(c.get("PMS5003_SET_PIN"), int) and c["PMS5003_SET_PIN"] >= 0:
+            pms_sig.append(("SET", "PMS5003_SET_PIN", "out", {"module_pullup": True}))
+            note += " SET (3.3 V level, pulled up inside the module): LOW = sleep - the duty cycle uses it."
+        elif c.get("PMS5003_DUTY_CYCLE"):
+            note += " Duty cycle: slept / woken by its serial command over the RX line - no extra wire."
+        mods.append(dict(name="PMS5003 particulate", supply="5V", note=note, signals=pms_sig))
     if c.get("ENABLE_PH"):
         mods.append(dict(name="pH board (PH-4502C)", supply="5V", note="Calibrate with pH 7 and pH 4 buffers ('p' command).",
                          signals=[("PO", "PH_PIN", "analog", {"level_v": 5.0, "divider": "PH_ADC_DIVIDER_RATIO"})]))
@@ -157,6 +204,37 @@ def node_modules(c):
     if isinstance(c.get("SENSOR_POWER_PIN"), int) and c["SENSOR_POWER_PIN"] >= 0:
         mods.append(dict(name="Sensor power switch", supply="-", note="MOSFET/load switch; resistor keeps it OFF in deep sleep.",
                          signals=[("EN", "SENSOR_POWER_PIN", "out", {})]))
+    if isinstance(c.get("SOS_BUTTON_PIN"), int) and c["SOS_BUTTON_PIN"] >= 0:
+        hold = c.get("SOS_HOLD_MS", 2000)
+        hold_s = f"{hold / 1000:g} s" if isinstance(hold, (int, float)) else "SOS_HOLD_MS"
+        mods.append(dict(name="SOS push-button", supply="-",
+                         note=f"For people without a phone: hold {hold_s} = SOS at this node's position. Normally-open "
+                              f"weatherproof button between the pin and GND; the ESP32's internal pull-up, so no resistor "
+                              f"to 3V3. The 1k in series protects the pin from ESD on an outdoor cable. Wakes a deep-sleeping node.",
+                         signals=[("SW", "SOS_BUTTON_PIN", "in", {"series": "1k in series", "internal_pullup": True,
+                                                                   "wakes": True})]))
+    if isinstance(c.get("SIREN_PIN"), int) and c["SIREN_PIN"] >= 0:
+        on_s = c.get("SIREN_ON_S", 180)
+        offline_s = c.get("SIREN_OFFLINE_AFTER_S", 900)
+        mods.append(dict(name="Village siren + strobe (12 V)", supply="ext", needs_own_supply=True,
+                         note=f"Sounds on a server command (officer / confirmed CRITICAL evacuation hazard), or by "
+                              f"itself only when the gateway has been silent {offline_s} s and the water level or gas "
+                              f"is at its siren danger level; "
+                              f"{on_s} s per trigger. Switched on the LOW side by a logic-level N-MOSFET (Rds(on) "
+                              f"specified at a gate voltage of 3.3 V or less - check its datasheet) or a relay board "
+                              f"with an active-HIGH input that works from 3.3 V: drain to the siren / strobe "
+                              f"(-), their (+) to the 12 V supply, source to the common GND. 100R gate resistor; "
+                              f"10k gate-to-GND REQUIRED (keeps the siren off while the ESP32 resets). A diode "
+                              f"across any coil or motor load (cathode to +12 V). Never an active-LOW relay board.",
+                         own_supply=("12 V supply sized for the siren + strobe current from THEIR datasheets; its (−) "
+                                     "is the common GND (low-side switch)",
+                                     "<li><strong>Village siren + strobe</strong>: its own 12 V supply (battery or "
+                                     "adapter) sized for the siren and strobe current from their datasheets - not "
+                                     "the node's 18650 / MT3608 chain. Common GND with the ESP32, because the MOSFET "
+                                     "switches the (−) side. Take the switch's current rating and the wire gauge "
+                                     "from the siren's current (not verified here).</li>"),
+                         signals=[("GATE", "SIREN_PIN", "out", {"pulldown": "10k gate to GND (REQUIRED)",
+                                                                "gate_pulldown": True})]))
     mods.append(dict(name="Status LED", supply="-", note="On-board LED on most DevKits.",
                      signals=[("LED", "LED_PIN", "out", {})]))
     return mods
@@ -173,6 +251,12 @@ def gateway_modules(c):
         mods.append(dict(name="SIM7020 NB-IoT", supply="ext", needs_own_supply=True,
                          note="Own supply that can deliver its transmit peaks (not the ESP32 3V3 pin); common GND. "
                               "Check its UART level - use a level shifter if it is not 3.3 V.",
+                         own_supply=("Must deliver the module's transmit peaks; voltage per its board's datasheet. "
+                                     "Never the ESP32 3V3 pin.",
+                                     "<li><strong>SIM7020</strong>: its own supply that can deliver its transmit peaks, "
+                                     "common GND with the ESP32. Take the voltage range and peak current from SIMCom's "
+                                     "<em>SIM7020 Hardware Design</em> document for your exact module/board (not "
+                                     "verified here).</li>"),
                          signals=sig))
     mods.append(dict(name="Status LED", supply="-", note="On-board LED on most DevKits.", signals=[("LED", "LED_PIN", "out", {})]))
     return mods
@@ -203,11 +287,24 @@ def check(board, c, mods):
                 out.append(("ERROR", f"{where}: analog input on an ADC2 pin - ADC2 does not work while WiFi is on; use GPIO32-39"))
             if gpio in STRAPPING:
                 level = "ERROR" if gpio == 12 and (extra.get("pullup") or direction == "in") else "INFO"
-                out.append((level, f"{where}: strapping pin - {STRAPPING[gpio]}"))
+                note = STRAPPING[gpio]
+                if extra.get("internal_pullup"):
+                    level, note = BUTTON_STRAPPING.get(gpio, (level, note))
+                if extra.get("gate_pulldown"):
+                    level, note = GATE_PULLDOWN_STRAPPING.get(gpio, (level, note))
+                if extra.get("module_pullup"):
+                    level, note = MODULE_PULLUP_STRAPPING.get(gpio, (level, note))
+                out.append((level, f"{where}: strapping pin - {note}"))
             if extra.get("needs_external_pullup") and gpio in INPUT_ONLY:
                 out.append(("INFO", f"{where}: input-only pin has no internal pull-up - the external 10k to 3V3 is required"))
-            if c.get("DEEP_SLEEP_ENABLED") and key == "RAIN_GAUGE_PIN" and gpio not in {0, 2, 4, 12, 13, 14, 15, 25, 26, 27, 32, 33, 34, 35, 36, 37, 38, 39}:
+            if extra.get("internal_pullup") and gpio in INPUT_ONLY:
+                out.append(("ERROR", f"{where}: GPIO34-39 have no internal pull-up - the firmware uses INPUT_PULLUP, "
+                                     f"the pin would float"))
+            if c.get("DEEP_SLEEP_ENABLED") and key == "RAIN_GAUGE_PIN" and gpio not in RTC_GPIO:
                 out.append(("ERROR", f"{where}: deep sleep needs an RTC GPIO to wake on a bucket tip"))
+            if extra.get("wakes") and gpio not in RTC_GPIO:
+                out.append(("ERROR" if c.get("DEEP_SLEEP_ENABLED") else "WARN",
+                            f"{where}: not an RTC GPIO - it cannot wake the node from deep sleep"))
             level_v = extra.get("level_v")
             if level_v:
                 ratio = extra.get("fixed_divider") or (c.get(extra["divider"]) if extra.get("divider") else 1.0) or 1.0
@@ -229,6 +326,16 @@ def check(board, c, mods):
     out += power_checks(board, c, mods)
     rank = {"ERROR": 0, "WARN": 1, "INFO": 2}
     return sorted(out, key=lambda x: rank[x[0]])
+
+
+# Output-capable GPIOs nobody uses (for an extra switch, e.g. the MQ135 heater
+# MOSFET of the duty cycle). Strapping pins are listed apart: each needs its
+# boot level kept (see STRAPPING / GATE_PULLDOWN_STRAPPING).
+def free_output_pins(c, mods):
+    """(free non-strapping GPIOs, free strapping GPIOs), both output-capable."""
+    used = {c.get(key) for m in mods for _p, key, _d, _e in m["signals"]}
+    free = sorted(p for p in VALID - INPUT_ONLY - USB_SERIAL_PINS if p not in used)
+    return [p for p in free if p not in STRAPPING], [p for p in free if p in STRAPPING]
 
 
 # ---- power path ------------------------------------------------------------
@@ -284,7 +391,7 @@ def power_checks(board, c, mods):
     for m in mods:
         if m.get("needs_own_supply") and m["supply"] != "ext":
             out.append(("ERROR", f"{m['name']}: supply is '{m['supply']}' - it needs its own supply that can deliver "
-                                 f"its transmit peaks, never the ESP32 3V3 pin"))
+                                 f"its peak current, never the ESP32 3V3 pin"))
         if m.get("max_supply") == "3V3" and m["supply"] != "3V3":
             out.append(("ERROR", f"{m['name']}: 3.3 V-only module is on the '{m['supply']}' rail"))
     if board == "node" and c.get("ENABLE_BATTERY"):
@@ -305,6 +412,9 @@ def power_checks(board, c, mods):
                if pin is not None else "SENSOR_POWER_PIN -1: ")
         out.append(("INFO", f"deep sleep, {how}these stay powered while the ESP32 sleeps - "
                             f"{', '.join(still)}; MEASURE the sleep current"))
+        if isinstance(c.get("SOS_BUTTON_PIN"), int) and c["SOS_BUTTON_PIN"] >= 0:
+            out.append(("INFO", "deep sleep with the SOS button: its pull-up needs the RTC peripherals powered "
+                                "while the ESP32 sleeps - part of the sleep current to MEASURE"))
     return out
 
 
@@ -371,6 +481,10 @@ def svg_diagram(title, c, mods):
                     part = "NO DIVIDER - see checks"
             elif extra.get("pullup"):
                 part = f"pull-up {extra['pullup'].split(' (')[0]}"
+            elif extra.get("pulldown"):
+                part = f"pull-down {extra['pulldown'].split(' (')[0]}"
+            elif extra.get("series"):
+                part = extra["series"]
             if part:
                 bad = part.startswith("NO DIVIDER")
                 w = 7 * len(part) + 12
@@ -405,6 +519,10 @@ def connection_rows(c, mods):
                        f"({extra['divider']} = {ratio:g})") if ratio > 1.0 else f"none ({extra['divider']} = 1.0)"
             elif extra.get("pullup"):
                 via = f"pull-up {extra['pullup']}"
+            elif extra.get("pulldown"):
+                via = f"pull-down {extra['pulldown']}; 100R gate resistor"
+            elif extra.get("series"):
+                via = f"{extra['series']}; internal pull-up (INPUT_PULLUP), button to GND"
             rows.append((m["name"], m["supply"], pin_name, c.get(key), key, direction, via))
     return rows
 
@@ -422,6 +540,14 @@ def parts_list(c, mods):
                     items.append(f"{m['name']} {pin_name}: resistors {pair} (top / bottom)")
             elif extra.get("pullup") and extra.get("needs_external_pullup"):
                 items.append(f"{m['name']}: 10k resistor, pin to 3V3")
+            elif extra.get("gate_pulldown") and m.get("part"):
+                items.append(f"{m['name']}: {m['part']}")
+            elif extra.get("gate_pulldown"):
+                items.append(f"{m['name']}: logic-level N-MOSFET (or an active-HIGH 3.3 V relay board), 100R gate "
+                             f"resistor, 10k gate to GND, flyback diode for a coil / motor load, its own 12 V supply")
+            elif extra.get("series"):
+                items.append(f"{m['name']}: {extra['series'].split(' in ')[0]} resistor in series + a normally-open "
+                             f"weatherproof push-button to GND")
     return items
 
 
@@ -571,9 +697,10 @@ def svg_power_node(title, c, mods):
     for x, y in drops:
         p += [_wire([(x, y), (x, bus)], "gnd"), _dot(x, bus, "gnd")]
     p += [_dot(565, NEG_Y, "gnd"),
-          _t(40, bus + 20, "common GND: TP4056 IN− / OUT−, MT3608 VIN− / VOUT−, ESP32 GND, every module, the divider bottom", 12,
-             bold=True, fill=NET_COLOR["gnd"])]
-    p += _legend(bus + 52, [("pv", "panel"), ("bat", "cell + (B+ = OUT+)"), ("5V", "5 V"), ("3V3", "3.3 V"), ("gnd", "GND")],
+          _t(40, bus + 20, "common GND: TP4056 IN− / OUT−, MT3608 VIN− / VOUT−, ESP32 GND, every module, the divider bottom"
+             + (", own supplies (−)" if nets["ext"] else ""), 12, bold=True, fill=NET_COLOR["gnd"])]
+    p += _legend(bus + 52, [("pv", "panel"), ("bat", "cell + (B+ = OUT+)"), ("5V", "5 V"), ("3V3", "3.3 V")]
+                 + ([("ext", "own supply")] if nets["ext"] else []) + [("gnd", "GND")],
                  ["ESP32 DevKit: power it from ONE source only (Espressif) - disconnect the MT3608 before plugging in USB.",
                   "Currents and panel size are typical/estimated values - MEASURE your build (see wiring.html, power budget)."])
     height = bus + 52 + 22 + 17 * 2
@@ -684,10 +811,11 @@ def power_rows(board, c, mods):
                      "pins float in deep sleep"))
     for m in nets["ext"]:
         rows.append(("Its own supply", f"{m['name']} power input", "own supply",
-                     "Must deliver the module's transmit peaks; voltage per its board's datasheet. Never the ESP32 3V3 pin."))
+                     m.get("own_supply", ("Its own supply - never the ESP32 3V3 pin.",))[0]))
     rows.append(("All GNDs", "one common GND", "GND",
                  ("every module, the ESP32, TP4056 IN− / OUT−, MT3608 VIN− / VOUT−, the divider bottom" if board == "node"
-                  else "every module, the ESP32, the 5 V source") + (", the SIM7020's own supply" if nets["ext"] else "")))
+                  else "every module, the ESP32, the 5 V source")
+                 + "".join(f", the {m['name']}'s own supply (−)" for m in nets["ext"])))
     return rows
 
 
@@ -702,6 +830,9 @@ POWER_SOURCES = {
     "devkitc": ("ESP32-DevKitC user guide (Espressif)",
                 "https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32/esp32-devkitc/user_guide.html"),
     "esp32": ("ESP32 Series Datasheet v5.3, Table 4-2 (Espressif)", "https://documentation.espressif.com/esp32_datasheet_en.html"),
+    "mq135": ("Hanwei MQ-135 technical data, copy", "https://cdn.shopify.com/s/files/1/2132/9029/files/MQ-135.pdf"),
+    "pms5003": ("Plantower PMS5003 datasheet PTQ3004-2015 V1.0 (2019-07-31), copy",
+                "https://docs.smartcitizen.me/assets/datasheets/pms5003/PTQ3004-2015%20PMS5003%20series%20data%20manual%20English_SLT_V1.0K.pdf"),
 }
 
 
@@ -717,8 +848,26 @@ def power_notes_html(board, c, mods):
     li = []
     if board == "node":
         if c.get("ENABLE_GAS"):
-            li.append("<li><strong>MQ135 heater</strong>: ~150 mA from 5 V, continuously (project figure, see the module "
-                      "notes) - this is why a gas node cannot deep-sleep.</li>")
+            li.append("<li><strong>MQ135 heater</strong>: heater resistance 33 ohm +-5 %, heating consumption less "
+                      "than 800 mW at 5 V, so ~150 mA (5 V / 33 ohm)" + _src("mq135") + ", "
+                      + ("only around the reports that carry gas (MQ135_DUTY_CYCLE: by design 195 s per 600 s, "
+                         "simulated 32.7 % on-time - ESTIMATE ~1,190 instead of ~3,640 mAh/day at 5 V, config.h). "
+                         if c.get("MQ135_DUTY_CYCLE") else
+                         "continuously - this is why a gas node cannot deep-sleep. MQ135_DUTY_CYCLE (config.h) "
+                         "switches it on only around the reports that carry gas: ESTIMATE ~1,190 instead of "
+                         "~3,640 mAh/day at 5 V (clean air; nothing is saved while the node is elevated), but a "
+                         "leak between wakes is seen up to one period late, it needs a free GPIO for the MOSFET, "
+                         "and it is refused on a siren node (gas is an offline-siren trigger). ")
+                      + "The datasheet gives no re-heating time after a short off-time - MEASURE.</li>")
+        if c.get("ENABLE_PMS5003"):
+            li.append("<li><strong>PMS5003</strong>: active current max 100 mA, standby max 200 µA; stable data at least "
+                      "30 s after a wake from sleep (fan)" + _src("pms5003") + ". "
+                      + ("Duty cycle on (PMS5003_DUTY_CYCLE): awake 45 s per 300 s by design, simulated 15.4 % - "
+                         "ESTIMATE ~375 instead of ~2,400 mAh/day at 5 V."
+                         if c.get("PMS5003_DUTY_CYCLE") else
+                         "Runs continuously (~2,400 mAh/day at 5 V at the maximum); PMS5003_DUTY_CYCLE (config.h) "
+                         "sleeps it between reports by its serial command - no extra wire - ESTIMATE ~375 mAh/day.")
+                      + "</li>")
         li.append("<li><strong>Panel size is a design input, not a fact.</strong> The project's own estimate "
                   "(<code>planning/progress.txt</code>): an always-on gas node draws ~200 mA, ~4.8 Ah/day, so one 18650 "
                   "lasts &lt; 1 day and solar needs <em>roughly a 6 W panel</em>. Measure the node's real current with a "
@@ -756,10 +905,9 @@ def power_notes_html(board, c, mods):
               esc(", ".join(m["name"] for m in nets["3V3"]) or "none") + ") share the board regulator's current limit - "
               "add up their datasheet currents (radio transmit included). The 3V3 pin must not feed 5 V modules"
               + ((" or the " + esc(", ".join(m["name"] for m in nets["ext"]))) if nets["ext"] else "") + ".</li>")
-    if nets["ext"]:
-        li.append("<li><strong>SIM7020</strong>: its own supply that can deliver its transmit peaks, common GND with the "
-                  "ESP32. Take the voltage range and peak current from SIMCom's <em>SIM7020 Hardware Design</em> document "
-                  "for your exact module/board (not verified here).</li>")
+    for m in nets["ext"]:
+        if m.get("own_supply"):
+            li.append(m["own_supply"][1])
     li.append("<li><strong>One supply at a time</strong>: Espressif - the DevKitC must be powered from one and only one of "
               "USB, the 5V pin or the 3V3 pin, otherwise the board and/or the supply can be damaged."
               + (" Disconnect the MT3608 before plugging in USB for Serial / flashing." if board == "node" else "")
@@ -813,6 +961,11 @@ def page(boards):
             out.append(f"<tr><td>{esc(name)}</td><td>{esc(supply)}</td><td>{esc(pin_name)}</td><td>GPIO{esc(gpio)}</td>"
                        f"<td><code>{esc(key)}</code></td><td>{esc(direction)}</td><td>{esc(via)}</td></tr>")
         out.append("</tbody></table></div>")
+        free, free_strap = free_output_pins(c, mods)
+        out.append("<p class='muted'>Free output-capable GPIOs: "
+                   + (", ".join(f"GPIO{p}" for p in free) or "none")
+                   + "; free strapping pins (keep their boot level): "
+                   + (", ".join(f"GPIO{p}" for p in free_strap) or "none") + ".</p>")
         items = parts_list(c, mods)
         if items:
             out.append("<h3>Extra parts</h3><ul>" + "".join(f"<li>{esc(i)}</li>" for i in items) + "</ul>")
@@ -834,9 +987,22 @@ def page(boards):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--check", action="store_true", help="run the checks only, write nothing")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="try a node config.h change without editing it, e.g. --set ENABLE_PH=0 --set "
+                         "MQ135_HEATER_PIN=33 (checks only - the docs always follow config.h)")
     args = ap.parse_args()
 
     node_c, gw_c = parse_config(NODE_CFG), parse_config(GATEWAY_CFG)
+    for item in args.set:
+        name, _, raw = item.partition("=")
+        if name not in node_c:
+            print(f"--set {item}: {name} is not a #define in the node's config.h")
+            return 2
+        try:
+            node_c[name] = int(raw, 0)
+        except ValueError:
+            node_c[name] = raw
+        args.check = True
     node_m, gw_m = node_modules(node_c), gateway_modules(gw_c)
     transport = "LoRa" if node_c.get("TRANSPORT") == node_c.get("TRANSPORT_LORA") else "WiFi"
     sleep = ", deep sleep" if node_c.get("DEEP_SLEEP_ENABLED") else ""
@@ -853,6 +1019,10 @@ def main():
             errors += level == "ERROR"
         if not results:
             print("   no problems found")
+        if _kind == "node":
+            free, free_strap = free_output_pins(_c, _m)
+            print(f"   free output-capable GPIOs: {', '.join(f'GPIO{p}' for p in free) or 'none'}"
+                  f" (strapping, keep their boot level: {', '.join(f'GPIO{p}' for p in free_strap) or 'none'})")
     if not args.check:
         os.makedirs(DOCS, exist_ok=True)
         with open(os.path.join(DOCS, "wiring.html"), "w", encoding="utf-8") as f:

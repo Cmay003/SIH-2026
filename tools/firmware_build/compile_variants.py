@@ -35,7 +35,9 @@ VAR_DIR = os.environ.get("SANJEEVNI_VAR_DIR") or os.path.join(REPO, "var")  # as
 BUILD_ROOT = os.path.join(VAR_DIR, "fw_build")
 FQBN = "esp32:esp32:esp32"
 
-DEEP_SLEEP_BATTERY = {"DEEP_SLEEP_ENABLED": "1", "ENABLE_GAS": "0", "ENABLE_PMS5003": "0"}
+# A siren node can't deep-sleep (config.h static_assert), so the battery
+# variants have none.
+DEEP_SLEEP_BATTERY = {"DEEP_SLEEP_ENABLED": "1", "ENABLE_GAS": "0", "ENABLE_PMS5003": "0", "SIREN_PIN": "-1"}
 
 # name, sketch, #define overrides, expected error text (None = must compile)
 VARIANTS = [
@@ -49,9 +51,70 @@ VARIANTS = [
      {"ENABLE_WATER_LEVEL": "0", "ENABLE_DHT": "0", "ENABLE_GAS": "0", "ENABLE_FLAME": "0",
       "ENABLE_RAIN_GAUGE": "0", "ENABLE_SOIL": "0", "ENABLE_PMS5003": "0", "ENABLE_PH": "0",
       "ENABLE_TURBIDITY": "0", "SELF_TEST_ON_POWER_ON": "0"}, None),
-    ("node-deepsleep-with-mq135", "sanjeevni_lora_node", {"DEEP_SLEEP_ENABLED": "1", "ENABLE_PMS5003": "0"},
-     "DEEP_SLEEP_ENABLED needs ENABLE_GAS 0"),
+    # always-on LoRa node without the village siren (the #else stubs)
+    ("node-no-siren", "sanjeevni_lora_node", {"SIREN_PIN": "-1"}, None),
+    # decision 2026-10-09: a node without a siren sends its normal summary
+    # every 5 min (60 samples per window) - pinned here, so a changed default
+    # still builds the 300 s case
+    ("node-no-siren-5min", "sanjeevni_lora_node",
+     {"SIREN_PIN": "-1", "NO_SIREN_REPORT_INTERVAL_MS": "300000UL"}, None),
+    # anomaly checks not reported (the #if !EDGE_ANOMALY_ENABLE branch; the rise rate still runs)
+    ("node-anomaly-off", "sanjeevni_lora_node", {"EDGE_ANOMALY_ENABLE": "0"}, None),
+    # a river-scale node: the rise / anomaly limits in cm instead of bench fractions
+    ("node-river-scale", "sanjeevni_lora_node", {"EDGE_BENCH_SCALE_MODEL": "false"}, None),
+    # the minute reports without the summary (the #if SUMMARY_ENABLE branches)
+    ("node-summary-off", "sanjeevni_lora_node", {"SUMMARY_ENABLE": "0"}, None),
+    # a SIREN node must report at least every 60 s (its commands ride on the
+    # ACKs) - the 5-min interval of a node without a siren is refused for it
+    ("node-slow-report", "sanjeevni_lora_node", {"SIREN_PIN": "12", "SIREN_REPORT_INTERVAL_MS": "300000UL"},
+     "SIREN_PIN: a siren node must report at least every 60 s"),
+    ("node-deepsleep-with-mq135", "sanjeevni_lora_node",
+     {"DEEP_SLEEP_ENABLED": "1", "ENABLE_PMS5003": "0", "SIREN_PIN": "-1"}, "DEEP_SLEEP_ENABLED needs ENABLE_GAS 0"),
+    ("node-deepsleep-with-siren", "sanjeevni_lora_node", {**DEEP_SLEEP_BATTERY, "SIREN_PIN": "12"},
+     "SIREN_PIN needs DEEP_SLEEP_ENABLED 0"),
+    # mains/solar LoRa node with the offline SOS Wi-Fi: links the Wi-Fi stack
+    # into the LoRa node - watch its flash figure
+    ("node-hotspot", "sanjeevni_lora_node", {"SOS_HOTSPOT_ENABLE": "1"}, None),
+    ("node-deepsleep-with-hotspot", "sanjeevni_lora_node", {**DEEP_SLEEP_BATTERY, "SOS_HOTSPOT_ENABLE": "1"},
+     "SOS_HOTSPOT_ENABLE needs DEEP_SLEEP_ENABLED 0"),
+    ("node-wifi-with-hotspot", "sanjeevni_lora_node", {"TRANSPORT": "TRANSPORT_WIFI", "SOS_HOTSPOT_ENABLE": "1"},
+     "SOS_HOTSPOT_ENABLE needs TRANSPORT_LORA"),
+    # gas / PM duty cycle for solar nodes (sj_duty.h; off in config.h as committed).
+    # PMS5003 slept by its serial command - no new pin - on a 5-min node:
+    ("node-duty-pms", "sanjeevni_lora_node", {"PMS5003_DUTY_CYCLE": "1", "SIREN_PIN": "-1"}, None),
+    # both, the MQ135 heater on a MOSFET at GPIO33 (freed by dropping the pH probe):
+    ("node-duty-gas-pm", "sanjeevni_lora_node",
+     {"PMS5003_DUTY_CYCLE": "1", "MQ135_DUTY_CYCLE": "1", "ENABLE_PH": "0", "MQ135_HEATER_PIN": "33",
+      "SIREN_PIN": "-1"}, None),
+    # siren node (1-min reports), PMS5003 SET pin on GPIO32 (freed by dropping the soil sensor):
+    ("node-duty-pms-set-pin", "sanjeevni_lora_node",
+     {"PMS5003_DUTY_CYCLE": "1", "ENABLE_SOIL": "0", "PMS5003_SET_PIN": "32"}, None),
+    # (SIREN_PIN -1 in the next two: each must fail for its OWN reason only)
+    ("node-duty-gas-no-pin", "sanjeevni_lora_node", {"MQ135_DUTY_CYCLE": "1", "SIREN_PIN": "-1"},
+     "MQ135_DUTY_CYCLE needs MQ135_HEATER_PIN"),
+    ("node-duty-heater-pin-taken", "sanjeevni_lora_node",
+     {"MQ135_DUTY_CYCLE": "1", "MQ135_HEATER_PIN": "33", "SIREN_PIN": "-1"},
+     "MQ135_HEATER_PIN: that GPIO is already used"),
+    # a siren node (SIREN_PIN 12, as shipped) may not duty-cycle its MQ135: gas is
+    # an offline-siren trigger - otherwise the node-duty-gas-pm pins, which build
+    ("node-duty-gas-siren", "sanjeevni_lora_node",
+     {"PMS5003_DUTY_CYCLE": "1", "MQ135_DUTY_CYCLE": "1", "ENABLE_PH": "0", "MQ135_HEATER_PIN": "33"},
+     "MQ135_DUTY_CYCLE needs SIREN_PIN -1"),
+    ("node-duty-set-strapping", "sanjeevni_lora_node",
+     {"PMS5003_DUTY_CYCLE": "1", "SIREN_PIN": "-1", "PMS5003_SET_PIN": "12"},
+     "PMS5003_SET_PIN: an output-capable GPIO; not 0, 2 or 12"),
+    # edge models (config.h EDGE_MODEL; the deep-sleep, tilt-only and gas
+    # duty-cycle variants above already get the LITE model by EDGE_MODEL_AUTO):
+    # the lite model forced on the full kit, no model at all (TFLite not
+    # linked - the #else stubs), and the main model refused without gas
+    ("node-edge-lite", "sanjeevni_lora_node", {"EDGE_MODEL": "EDGE_MODEL_LITE"}, None),
+    ("node-edge-none", "sanjeevni_lora_node", {"EDGE_MODEL": "EDGE_MODEL_NONE"}, None),
+    ("node-edge-main-no-gas", "sanjeevni_lora_node", {"EDGE_MODEL": "EDGE_MODEL_MAIN", "ENABLE_GAS": "0"},
+     "EDGE_MODEL_MAIN needs water level, DHT, gas and flame"),
     ("gateway", "sanjeevni_lora_gateway", {}, None),
+    # the gateway's #else stubs, and the hotspot with NB-IoT as the only backhaul
+    ("gateway-no-hotspot", "sanjeevni_lora_gateway", {"SOS_HOTSPOT_ENABLE": "0"}, None),
+    ("gateway-nbiot-only", "sanjeevni_lora_gateway", {"ENABLE_WIFI": "0"}, None),
 ]
 
 

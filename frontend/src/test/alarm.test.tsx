@@ -16,7 +16,10 @@ import {
   alarmItemsFromHazards,
   alarmItemsFromZones,
   alarmSoundPref,
+  forecastAlarmKey,
   hazardTitle,
+  nodeListText,
+  showKeyOf,
   readAcks,
   refreshAcks,
   SOUND_STORAGE_KEY,
@@ -62,6 +65,7 @@ const item = (over: Partial<AlarmItem> = {}): AlarmItem => ({
   key: "NODE-04|flood",
   severity: "HIGH",
   title: "Flood",
+  hazardType: "flood",
   location: "Sector 4",
   nodeId: "NODE-04",
   riskScore: 0.82,
@@ -251,13 +255,13 @@ describe("alarm decision logic", () => {
       zone({ node_id: "N4", hazard_type: "gas leak", severity: "CRITICAL", risk_score: 0.91 }),
     ]);
     expect(items.map((i) => i.key)).toEqual(["NODE-04|flood", "N4|gas leak"]);
-    expect(items[1]).toEqual({ key: "N4|gas leak", severity: "CRITICAL", title: "Gas leak", location: "N4", nodeId: "N4",
+    expect(items[1]).toEqual({ key: "N4|gas leak", severity: "CRITICAL", title: "Gas leak", hazardType: "gas leak", location: "N4", nodeId: "N4",
                                riskScore: 0.91, detail: null });
   });
 
   it("hazards: keeps HIGH/CRITICAL, maps location and prediction text", () => {
     const items = alarmItemsFromHazards([hazard(), hazard({ node_id: "N2", severity: "MEDIUM" }), hazard({ node_id: "N3", severity: "LOW" })]);
-    expect(items).toEqual([{ key: "NODE-04|flood", severity: "HIGH", title: "Flood", location: "Sector 4", nodeId: "NODE-04",
+    expect(items).toEqual([{ key: "NODE-04|flood", severity: "HIGH", title: "Flood", hazardType: "flood", location: "Sector 4", nodeId: "NODE-04",
                              riskScore: 0.82, detail: "Stable" }]);
   });
 
@@ -762,8 +766,14 @@ describe("EmergencyAlarm pop-up", () => {
     const ack = screen.getByRole("button", { name: "Acknowledge" });
     const showBtn = screen.getByRole("button", { name: /^Show/ });
     await waitFor(() => expect(ack).toHaveFocus());
+    // the first control is the item's "What the public is told" toggle - the trap
+    // used to skip it and wrap to Show (W2 browser check)
+    const adviceToggle = screen.getByRole("alertdialog").querySelector("details > summary") as HTMLElement;
     await user.tab();
-    expect(showBtn).toHaveFocus(); // wrapped to the first control
+    expect(adviceToggle).toHaveFocus(); // wrapped to the first control
+    await user.tab();
+    expect(showBtn).toHaveFocus();
+    await user.tab({ shift: true });
     await user.tab({ shift: true });
     expect(ack).toHaveFocus(); // wrapped back to the last
     await user.click(ack);
@@ -842,5 +852,77 @@ describe("AlarmSoundToggle", () => {
     render(<AlarmSoundToggle />);
     expect(screen.getByText(/Alarm sound unavailable/)).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+});
+
+// ======================================================================
+// Forecast-based alerts (severity from the weather forecast, raised at every
+// node in the forecast area): ONE area-wide item per hazard type.
+describe("area-wide forecast items", () => {
+  const rain = (nodeId: string, over: Partial<Hazard> = {}) =>
+    hazard({ node_id: nodeId, location: `Site ${nodeId}`, hazard_type: "heavy_rain", forecast_based: true, risk_score: 0.7, ...over });
+
+  it("groups forecast alerts of one hazard type into one item; measured alerts stay one per node", () => {
+    const items = alarmItemsFromHazards([
+      rain("N1"), rain("N2", { risk_score: 0.78 }), rain("N3"),
+      // a MEASURED heavy rain (the node's own gauge) and a measured flood stay their own items
+      hazard({ node_id: "N2", hazard_type: "heavy_rain", risk_score: 0.75 }),
+      hazard(),
+    ]);
+    expect(items.map((i) => i.key).sort()).toEqual(["N2|heavy_rain", "NODE-04|flood", forecastAlarmKey("heavy_rain")].sort());
+    const group = items.find((i) => i.key === "forecast|heavy_rain")!;
+    expect(group.title).toBe("Heavy rain forecast - 3 nodes");
+    expect(group.severity).toBe("HIGH");
+    expect(group.riskScore).toBe(0.78); // the most severe member's
+    expect(group.nodeId).toBe("N2");
+    expect(group.forecastNodeIds).toEqual(["N2", "N1", "N3"]);
+    expect(showKeyOf(group)).toBe("N2|heavy_rain");
+    expect(group.detail).toMatch(/weather forecast for the area, not measured by the nodes. Raised at N2, N1, N3\./);
+    // measured items are exactly as before (no forecast fields)
+    expect(items.find((i) => i.key === "NODE-04|flood")).toEqual(alarmItemsFromHazards([hazard()])[0]);
+  });
+
+  it("one item per forecast hazard type, at the most severe member's severity; stale members left out", () => {
+    const items = alarmItemsFromHazards([
+      rain("N1"), rain("N2", { severity: "CRITICAL" }), rain("N3", { stale: true }),
+      hazard({ node_id: "N1", hazard_type: "high_wind", forecast_based: true }),
+    ]);
+    expect(items).toHaveLength(2);
+    const rainItem = items.find((i) => i.key === "forecast|heavy_rain")!;
+    expect(rainItem.severity).toBe("CRITICAL");
+    expect(rainItem.forecastNodeIds).toEqual(["N2", "N1"]);
+    expect(items.find((i) => i.key === "forecast|high_wind")!.title).toBe("High wind forecast - 1 node");
+  });
+
+  it("zones on the officer map are grouped the same way (pending ones still never alarm)", () => {
+    const items = alarmItemsFromZones([
+      zone({ node_id: "N1", hazard_type: "heavy_rain", forecast_based: true }),
+      zone({ node_id: "N2", hazard_type: "heavy_rain", forecast_based: true }),
+      zone({ node_id: "N3", hazard_type: "heavy_rain", forecast_based: true, confirmed: false }),
+      zone(),
+    ]);
+    expect(items.map((i) => i.key).sort()).toEqual(["NODE-04|flood", "forecast|heavy_rain"]);
+    expect(items.find((i) => i.key === "forecast|heavy_rain")!.title).toBe("Heavy rain forecast - 2 nodes");
+  });
+
+  it("a node joining an acknowledged forecast does not re-alarm; an escalation does", () => {
+    const acks = acknowledgeItems({}, alarmItemsFromHazards([rain("N1"), rain("N2")]), 1000);
+    expect(alarmingItems(alarmItemsFromHazards([rain("N1"), rain("N2"), rain("N3")]), acks)).toEqual([]);
+    expect(alarmingItems(alarmItemsFromHazards([rain("N1"), rain("N2", { severity: "CRITICAL" })]), acks)).toHaveLength(1);
+  });
+
+  it("nodeListText names five nodes, then 'and N more'", () => {
+    expect(nodeListText(["A", "B"])).toBe("A, B");
+    expect(nodeListText(["A", "B", "C", "D", "E", "F", "G"])).toBe("A, B, C, D, E and 2 more");
+  });
+
+  it("the pop-up shows ONE area-wide item instead of one per node", () => {
+    const items = alarmItemsFromHazards([rain("N1"), rain("N2"), rain("N3")]);
+    render(<EmergencyAlarm items={items} onShow={() => {}} />);
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getAllByRole("heading", { level: 3 }).map((h) => h.textContent)).toEqual(["Heavy rain forecast - 3 nodes"]);
+    expect(dialog).toHaveAccessibleDescription(/Heavy rain forecast - 3 nodes: HIGH risk across the forecast area \(N1, N2, N3\)/);
+    expect(within(dialog).getByText("Forecast area: N1, N2, N3")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: /^Show Heavy rain forecast - 3 nodes across the forecast area/ })).toBeInTheDocument();
   });
 });

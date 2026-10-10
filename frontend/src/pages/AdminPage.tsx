@@ -12,11 +12,22 @@ import { ModelCardSection } from "../components/ModelCardSection";
 import { PickPosition } from "../components/PickPosition";
 import styles from "../components/Admin.module.css";
 import {
-  curveNumberHint, DEFAULT_REPORT_INTERVAL_SECONDS, emptyNodeForm, formFromNode, LAND_USES, landUseLabel,
+  autoIntervalText, curveNumberHint, emptyNodeForm, formFromNode, LAND_USES, landUseLabel,
   validateNodeForm, type NodeForm, type NodeFormErrors,
 } from "../lib/nodes";
 
 const DEFAULT_CENTER: [number, number] = [29.3919, 79.4542];
+
+/**
+ * The picker's dots carry a Tooltip, and Leaflet's tooltip focus listeners make
+ * the SVG path a Tab stop in Chromium - with no name, and invisible when the dot
+ * is outside the map view (W2 browser check). The keyboard path is the latitude /
+ * longitude fields (the map region says so), so the dots leave the Tab order;
+ * hover tooltips still work.
+ */
+const OUT_OF_TAB_ORDER = { add: (e: { target: { getElement?: () => Element | undefined } }) => {
+  e.target.getElement?.()?.setAttribute("tabindex", "-1");
+} };
 
 type Editing = { mode: "new" } | { mode: "edit"; nodeId: string } | null;
 
@@ -153,7 +164,8 @@ function NodeTable({ ids, registry, health, busy, onEdit, onDelete }: {
         <tbody>
           {ids.map((id) => {
             const n = registry[id];
-            const s = statusText(health.get(id));
+            const h = health.get(id);
+            const s = statusText(h);
             return (
               <tr key={id}>
                 <th scope="row">{id}</th>
@@ -161,7 +173,7 @@ function NodeTable({ ids, registry, health, busy, onEdit, onDelete }: {
                 <td>{landUseLabel(n.land_use)} ({n.curve_number})</td>
                 <td>{n.latitude.toFixed(4)}, {n.longitude.toFixed(4)}</td>
                 <td>{n.upstream_node ?? "-"}</td>
-                <td>{n.report_interval_seconds == null ? `${DEFAULT_REPORT_INTERVAL_SECONDS} s (default)` : `${n.report_interval_seconds} s`}</td>
+                <td>{n.report_interval_seconds == null ? autoIntervalText(h?.expected_interval_seconds) : `${n.report_interval_seconds} s`}</td>
                 <td className={s.className}>{s.text}</td>
                 <td className={styles.actions}>
                   <button type="button" onClick={() => onEdit(id)} aria-label={`Edit ${id}`}>Edit</button>
@@ -259,9 +271,9 @@ function NodeEditor({ editing, registry, onCancel, onSaved }: {
             </select>
           </Field>
           <Field id="node-report_interval_seconds" label="Reports every (seconds)" error={errors.report_interval_seconds}
-                 hint={`Empty = ${DEFAULT_REPORT_INTERVAL_SECONDS} s (always-on node). LoRa heartbeat nodes: 60. Sleeping nodes: their wake interval.`}>
+                 hint="Empty = automatic: 5 min, 1 min for a node with a siren, slower if its readings show a slower cadence. Set it only for a deep-sleep node with a longer wake interval - a value shorter than the node's real interval shows it offline.">
             <input value={form.report_interval_seconds} onChange={(e) => set("report_interval_seconds", e.target.value)}
-                   inputMode="decimal" placeholder={String(DEFAULT_REPORT_INTERVAL_SECONDS)} />
+                   inputMode="decimal" placeholder="automatic" />
           </Field>
         </div>
 
@@ -272,13 +284,13 @@ function NodeEditor({ editing, registry, onCancel, onSaved }: {
             <MapContainer center={hasPosition ? [lat, lon] : DEFAULT_CENTER} zoom={13} className={styles.map} worldCopyJump>
               <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
               {Object.entries(registry).filter(([id]) => id !== nodeId).map(([id, n]) => (
-                <CircleMarker key={id} center={[n.latitude, n.longitude]} radius={6}
+                <CircleMarker key={id} center={[n.latitude, n.longitude]} radius={6} eventHandlers={OUT_OF_TAB_ORDER}
                               pathOptions={{ color: "#333", weight: 1, fillColor: "#9aa1ab", fillOpacity: 0.9 }}>
                   <Tooltip>{id}</Tooltip>
                 </CircleMarker>
               ))}
               {hasPosition && (
-                <CircleMarker center={[lat, lon]} radius={9}
+                <CircleMarker center={[lat, lon]} radius={9} eventHandlers={OUT_OF_TAB_ORDER}
                               pathOptions={{ color: "#1b5e20", weight: 3, fillColor: "#43a047", fillOpacity: 0.9 }}>
                   <Tooltip permanent direction="top">{nodeId || "new node"}</Tooltip>
                 </CircleMarker>

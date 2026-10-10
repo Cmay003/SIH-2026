@@ -1,0 +1,37 @@
+/* Confidence line under an alert. Inherits the text colour of the card it
+   sits in (dashboard card, red critical callout, map popup, alarm pop-up),
+   so it reads in both themes without its own palette. Low confidence gets
+   a dashed outline - a shape cue, the word "Low" carries the meaning. */
+.confidence {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.text {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+.bars {
+  letter-spacing: -1px;
+  font-size: 11px;
+}
+.level_Low .text {
+  border-style: dashed;
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+.reasons {
+  color: var(--text-muted);
+  font-size: 12.5px;
+}

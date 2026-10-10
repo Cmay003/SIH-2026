@@ -37,6 +37,41 @@
         }
       }
     },
+    "flash_flood": {
+      "_review": "added 2026-10-09: generic, widely given safety steps written for this project (not quoted from an official SOP) - needs a domain expert's check against the district SOP, and the Hindi needs native-speaker review",
+      "source": "flash_flood_response.txt",
+      "name": { "en": "Flash flood", "hi": "अचानक बाढ़" },
+      "whatsapp": {
+        "en": "River rising fast: move away from the riverbank to higher ground now; do not cross flowing water.",
+        "hi": "नदी तेज़ी से बढ़ रही है: अभी नदी किनारे से हटकर ऊँचे स्थान पर जाएँ; बहते पानी को पार न करें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Keep away from the riverbank, stream beds and low crossings.",
+            "Be ready to move to higher ground quickly if the water keeps rising.",
+            "Watch for further updates from local authorities."
+          ],
+          "hi": [
+            "नदी किनारे, नालों की तलहटी और निचले रास्तों से दूर रहें।",
+            "पानी बढ़ता रहे तो तुरंत ऊँचे स्थान पर जाने के लिए तैयार रहें।",
+            "स्थानीय प्रशासन की आगे की सूचनाओं पर ध्यान दें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Move away from the riverbank and low ground to higher ground now - do not wait for the water to arrive.",
+            "Do not walk, swim or drive through flowing water, or cross bridges and causeways with water over them.",
+            "If you are trapped, go to the highest safe place nearby and call 112."
+          ],
+          "hi": [
+            "अभी नदी किनारे और निचली ज़मीन से हटकर ऊँचे स्थान पर जाएँ - पानी आने का इंतज़ार न करें।",
+            "बहते पानी में पैदल, तैरकर या गाड़ी से न जाएँ, और जिन पुलों या रपटों पर पानी हो उन्हें पार न करें।",
+            "फँस जाएँ तो पास की सबसे ऊँची सुरक्षित जगह पर जाएँ और 112 पर कॉल करें।"
+          ]
+        }
+      }
+    },
     "gas leak": {
       "source": "gas_leak_response.txt",
       "name": { "en": "Gas leak", "hi": "गैस रिसाव" },
@@ -99,6 +134,41 @@
             "यदि आप आग से 2 किमी के भीतर हैं, तो अभी निकल जाएँ।",
             "सुरक्षित घोषित होने तक प्रभावित क्षेत्र से दूर रहें।",
             "दमकल सेवा और वन विभाग के निर्देशों का पालन करें।"
+          ]
+        }
+      }
+    },
+    "smoke": {
+      "_review": "added 2026-10-09: generic, widely given safety steps written for this project (not quoted from an official SOP) - needs a domain expert's check against the district SOP, and the Hindi needs native-speaker review",
+      "source": "smoke_response.txt",
+      "name": { "en": "Smoke", "hi": "धुआँ" },
+      "whatsapp": {
+        "en": "Smoke detected nearby: stay indoors with windows closed; if you see fire, leave and call 112.",
+        "hi": "पास में धुआँ मिला है: खिड़कियाँ बंद रखकर घर के अंदर रहें; आग दिखे तो वहाँ से निकलें और 112 पर कॉल करें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Stay indoors and keep doors and windows closed.",
+            "Children, elderly people and people with asthma, lung or heart disease should avoid going outside.",
+            "If you see a fire, move away from it and call 112."
+          ],
+          "hi": [
+            "घर के अंदर रहें और दरवाज़े-खिड़कियाँ बंद रखें।",
+            "बच्चे, बुज़ुर्ग और दमा, फेफड़े या हृदय रोग वाले लोग बाहर जाने से बचें।",
+            "आग दिखे तो उससे दूर जाएँ और 112 पर कॉल करें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "If you see fire or smoke is filling your building, leave by the safest route away from the smoke and call 112.",
+            "While moving through smoke, stay low, where the air is clearer.",
+            "Everyone else: stay indoors with doors and windows closed until the area is declared safe."
+          ],
+          "hi": [
+            "आग दिखे या इमारत में धुआँ भरने लगे, तो धुएँ से दूर सबसे सुरक्षित रास्ते से निकलें और 112 पर कॉल करें।",
+            "धुएँ के बीच से निकलते समय नीचे झुककर चलें, जहाँ हवा साफ़ होती है।",
+            "बाकी सभी: क्षेत्र सुरक्षित घोषित होने तक दरवाज़े-खिड़कियाँ बंद रखकर घर के अंदर रहें।"
           ]
         }
       }
@@ -229,6 +299,76 @@
             "इस स्रोत का पानी पीने या खाना बनाने के लिए इस्तेमाल न करें।",
             "दूसरी सुरक्षित जल आपूर्ति का उपयोग करें, जैसे स्थानीय प्रशासन के टैंकर।",
             "दस्त या पेट की कोई और बीमारी हो तो डॉक्टर को दिखाएँ।"
+          ]
+        }
+      }
+    },
+    "heavy_rain": {
+      "_review": "added 2026-10-09: generic, widely given safety steps written for this project (not quoted from an official SOP) - needs a domain expert's check against the district SOP, and the Hindi needs native-speaker review. A forecast-based alert has not been measured by SANJEEVNI sensors.",
+      "source": "heavy_rain_response.txt",
+      "name": { "en": "Heavy rain", "hi": "भारी बारिश" },
+      "whatsapp": {
+        "en": "Heavy rain: avoid travel, keep away from rivers, streams and steep slopes; do not cross flooded roads.",
+        "hi": "भारी बारिश: यात्रा से बचें, नदी, नालों और खड़ी ढलानों से दूर रहें; पानी भरी सड़कें पार न करें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Avoid unnecessary travel and keep away from rivers, streams and steep slopes.",
+            "Keep drains near your home clear and keep a torch, phone charger, drinking water and medicines ready.",
+            "Watch for official IMD warnings and updates from local authorities."
+          ],
+          "hi": [
+            "बिना ज़रूरत यात्रा न करें और नदी, नालों व खड़ी ढलानों से दूर रहें।",
+            "घर के पास की नालियाँ साफ़ रखें और टॉर्च, फ़ोन चार्जर, पीने का पानी और दवाइयाँ तैयार रखें।",
+            "IMD की आधिकारिक चेतावनियों और स्थानीय प्रशासन की सूचनाओं पर ध्यान दें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Stay indoors in a safe building; do not walk or drive through flooded roads, streams or causeways.",
+            "Move away from slopes showing cracks, falling stones or muddy water, and from riverbanks.",
+            "Follow instructions from local authorities and call 112 in an emergency."
+          ],
+          "hi": [
+            "किसी सुरक्षित इमारत के अंदर रहें; पानी भरी सड़कों, नालों या रपटों से पैदल या गाड़ी से न गुज़रें।",
+            "जिन ढलानों में दरारें हों, पत्थर गिर रहे हों या मटमैला पानी बह रहा हो, उनसे और नदी किनारे से दूर हटें।",
+            "स्थानीय प्रशासन के निर्देशों का पालन करें और आपात स्थिति में 112 पर कॉल करें।"
+          ]
+        }
+      }
+    },
+    "high_wind": {
+      "_review": "added 2026-10-09: generic, widely given safety steps written for this project (not quoted from an official SOP) - needs a domain expert's check against the district SOP, and the Hindi needs native-speaker review. This alert is always forecast-based: SANJEEVNI nodes do not measure wind.",
+      "source": "high_wind_response.txt",
+      "name": { "en": "High wind", "hi": "तेज़ हवा" },
+      "whatsapp": {
+        "en": "Strong wind expected: stay indoors, keep away from trees, poles, hoardings and fallen power lines.",
+        "hi": "तेज़ हवा की संभावना: घर के अंदर रहें, पेड़ों, खंभों, होर्डिंग और गिरे हुए बिजली के तारों से दूर रहें।"
+      },
+      "actions": {
+        "MEDIUM": {
+          "en": [
+            "Secure loose objects such as tin sheets, signboards and items on roofs.",
+            "Avoid standing under trees, hoardings, electric poles and weak walls.",
+            "Watch for official IMD warnings and updates from local authorities."
+          ],
+          "hi": [
+            "टीन की चादरें, साइनबोर्ड और छत पर रखा ढीला सामान कसकर बाँधें या अंदर रखें।",
+            "पेड़ों, होर्डिंग, बिजली के खंभों और कमज़ोर दीवारों के नीचे खड़े न हों।",
+            "IMD की आधिकारिक चेतावनियों और स्थानीय प्रशासन की सूचनाओं पर ध्यान दें।"
+          ]
+        },
+        "HIGH": {
+          "en": [
+            "Stay indoors in a strong building, away from windows.",
+            "Keep away from trees, poles, hoardings and fallen power lines; do not touch fallen wires.",
+            "Do not travel unless necessary; call 112 in an emergency."
+          ],
+          "hi": [
+            "किसी मज़बूत इमारत के अंदर, खिड़कियों से दूर रहें।",
+            "पेड़ों, खंभों, होर्डिंग और गिरे हुए बिजली के तारों से दूर रहें; गिरे तारों को न छुएँ।",
+            "बहुत ज़रूरी न हो तो यात्रा न करें; आपात स्थिति में 112 पर कॉल करें।"
           ]
         }
       }

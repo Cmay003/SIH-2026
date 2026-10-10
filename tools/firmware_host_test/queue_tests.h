@@ -35,12 +35,13 @@ inline bool intact(const Big& b) {
   return true;
 }
 
-// Same layout as the gateway's GatewayQueued (64 bytes)
-struct Gw {
+// Same layout as the gateway's GatewayQueued (72 bytes)
+struct Gw {  // the gateway's GatewayQueued
   SjReading reading;
   uint32_t rxAtS;
   uint16_t gwSession;
   int16_t rssi;
+  SjSummary summary;
 };
 
 // Direct access to the stand-in's stored files, behind the queue's back
@@ -158,14 +159,14 @@ inline void testWear() {
   CHECK(g_fsBytesProgrammed - before == 4000 * 64);  // what one old-layout push cost
   hostRemove(big);
 
-  // Gateway-sized queue (4000 x 64 B): every push now rewrites one
+  // Gateway-sized queue (4000 x 104 B): every push now rewrites one
   // segment (<= one 4 KB block) + the header - two commits.
   const std::string d = "/gw.bin", h = "/gw.hdr";
   wipe(d, h);
   SjFileQueue<Gw> q;
-  CHECK(sizeof(Gw) == 64);
+  CHECK(sizeof(Gw) == 104);
   CHECK(q.begin(d.c_str(), h.c_str(), 4000));
-  CHECK(countSegs(d, 0) == 67);  // 60 slots of 68 B per segment
+  CHECK(countSegs(d, 0) == 109);  // 37 slots of 108 B per segment (gateway config.h)
   unsigned long worstBytes = 0, worstCommits = 0;
   for (uint32_t i = 0; i < 300; i++) {
     Gw g;
@@ -369,7 +370,7 @@ inline void testLegacy() {
     CHECK(q.begin(d.c_str(), h.c_str(), 2000));
     CHECK(logged("converting"));
     CHECK((recSeqs(q) == std::vector<uint32_t>{11, 12, 13, 14}) && q.dropped() == 2);
-    CHECK(!hostExists(d) && countSegs(d, 0) == 32);  // 2000 / 64 per segment
+    CHECK(!hostExists(d) && countSegs(d, 0) == 36);  // 2000 / 56 per segment (node config.h)
   }
   {  // converted once; a reboot finds the new format
     g_serialLog.clear();
@@ -545,10 +546,10 @@ inline void testFlashFull() {
   {
     std::vector<uint32_t> ring(200, 0);
     for (uint32_t s = 0; s < 50; s++) ring[s] = s + 1;
-    writeLegacy(d, h, 200, 0, ring, 50, 0);  // 12000 B
+    writeLegacy(d, h, 200, 0, ring, 50, 0);  // 13600 B
   }
-  // capacity 2000 = 128000 B: no room next to the old 12000 B file, room without it
-  g_fsByteQuota = (long)fsStoredBytes() + 124000;
+  // capacity 2000 = 144000 B: no room next to the old 13600 B file, room without it
+  g_fsByteQuota = (long)fsStoredBytes() + 140000;
   g_serialLog.clear();
   {
     SjFileQueue<Rec> q;

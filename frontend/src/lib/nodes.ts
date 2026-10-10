@@ -5,7 +5,27 @@ import type { LandUse, NodeConfig } from "../api/types";
 
 /** LoRa packets carry the node id in 12 bytes (SJ_NODE_ID_LEN in sj_packet.h) */
 export const NODE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$/;
-export const DEFAULT_REPORT_INTERVAL_SECONDS = 5;
+/**
+ * A node with no pinned interval is timed automatically by the backend
+ * (backend_server.py nominal_report_interval, user decision 2026-10-09): a
+ * normal-time summary every 5 min, every 1 min on a node with a siren (it
+ * says siren_fitted), or slower when its readings show a slower cadence
+ * (deep sleep). Pinning 60 on a 5-min node would flag it offline after 6 min.
+ */
+export const NODE_REPORT_INTERVAL_SECONDS = 300;
+export const SIREN_NODE_REPORT_INTERVAL_SECONDS = 60;
+
+/** 300 -> "5 min", 90 -> "90 s" */
+export function formatInterval(seconds: number): string {
+  return seconds >= 60 && seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`;
+}
+
+/** What the admin table shows for a node with no pinned interval */
+export function autoIntervalText(expectedSeconds?: number | null): string {
+  return expectedSeconds && expectedSeconds > 0
+    ? `auto (${formatInterval(expectedSeconds)})`
+    : `auto (${formatInterval(NODE_REPORT_INTERVAL_SECONDS)}; ${formatInterval(SIREN_NODE_REPORT_INTERVAL_SECONDS)} with a siren)`;
+}
 
 /** Typical SCS-CN ranges - the ones the flood model was trained with (flood_risk_model.py) */
 export const LAND_USES: { value: LandUse; label: string; cn: [number, number] }[] = [

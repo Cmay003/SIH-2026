@@ -79,6 +79,7 @@ class TempDbMixin:
 
     @classmethod
     def tearDownClass(cls):
+        bs.close_ingest_connection()  # its kept-open DB handle (Windows cannot delete an open file)
         bs.DB_PATH = cls._real_db
         bs.requests.get = cls._real_get
         shutil.rmtree(cls._tmp, ignore_errors=True)
@@ -300,8 +301,11 @@ class NodeHealthIntervalTests(unittest.TestCase):
         _reset_nodes()
 
     def report(self, at):
+        # A siren node: its normal-time summary is every 60 s (user
+        # decision (1), 2026-10-09; a node without a siren reports every
+        # 300 s - tests/test_false_alarms.py NodeHealthDecisionTests).
         bs.node_history["NODE-07"].append({"timestamp": at})
-        bs.update_node_health(bs.RawReading(node_id="NODE-07", temp_c=25), at, at, [])
+        bs.update_node_health(bs.RawReading(node_id="NODE-07", temp_c=25, siren_fitted=True), at, at, [])
 
     def status_at(self, now):
         return next(n for n in bs.compute_node_health(now) if n["node_id"] == "NODE-07")

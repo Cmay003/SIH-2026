@@ -130,6 +130,8 @@ def severity_band(risk_score: float) -> str:
 # Keep the keys lowercase - lookup below lowercases the input to match.
 HAZARD_SOURCE_MAP = {
     "flood": "flood_response.txt",
+    "flash_flood": "flash_flood_response.txt",
+    "smoke": "smoke_response.txt",
     "forest fire": "fire_response.txt",
     "fire": "fire_response.txt",
     "gas leak": "gas_leak_response.txt",
@@ -138,6 +140,8 @@ HAZARD_SOURCE_MAP = {
     "landslide": "landslide_response.txt",
     "air pollution": "air_pollution_response.txt",
     "water quality degradation": "water_quality_response.txt",
+    "heavy_rain": "heavy_rain_response.txt",
+    "high_wind": "high_wind_response.txt",
 }
 
 
@@ -184,11 +188,15 @@ def generate_alert_message(
 
     detail_text = f"{detail} " if detail else ""
     if not use_llm:
+        # The headline paragraph ends before the first blank line, so the
+        # backend can add the confidence line to it after the multi-node
+        # check (alert_confidence.add_confidence_to_message) - read before
+        # the long SOP guidance, not after it.
         return (
             f"[{severity} ALERT] {hazard_type.upper()} risk detected in {location}. "
             f"{detail_text}"
             f"Risk score: {risk_score:.2f}. Follow standard {severity.lower()}-severity "
-            f"procedure. Relevant guidance:\n\n{context_text}"
+            f"procedure.\n\nRelevant guidance:\n\n{context_text}"
         )
 
     try:

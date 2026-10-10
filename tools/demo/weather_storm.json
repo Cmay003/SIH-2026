@@ -1,0 +1,36 @@
+{
+  "_note": ["SANJEEVNI judge demo - a SIMULATED Open-Meteo /v1/forecast answer, NOT real weather.", "tools/demo/run_demo.js --fresh writes it to SANJEEVNI_WEATHER_MOCK at cue 11 (a calm copy before that), with hourly.time and current.time rebased so that hourly index 2 is the current UTC hour.", "Next 24 h from the current hour: 151 mm of rain (IMD 24-h category 'very heavy rain', 115.6-204.4 mm), 79 mm of it in the first 6 h; gusts up to 95 km/h, wind up to 62 km/h. Demo values, not a forecast of any real place.", "Variable names and units as documented at https://open-meteo.com/en/docs (accessed 2026-10-09)."],
+  "latitude": 29.3919,
+  "longitude": 79.4542,
+  "generationtime_ms": 0.1,
+  "utc_offset_seconds": 0,
+  "timezone": "UTC",
+  "timezone_abbreviation": "UTC",
+  "elevation": 520,
+  "current_units": {
+    "time": "iso8601",
+    "interval": "seconds",
+    "precipitation": "mm",
+    "wind_speed_10m": "km/h",
+    "wind_gusts_10m": "km/h"
+  },
+  "current": {
+    "time": "2026-07-15T02:00",
+    "interval": 900,
+    "precipitation": 3,
+    "wind_speed_10m": 45,
+    "wind_gusts_10m": 72
+  },
+  "hourly_units": {
+    "time": "iso8601",
+    "precipitation": "mm",
+    "wind_speed_10m": "km/h",
+    "wind_gusts_10m": "km/h"
+  },
+  "hourly": {
+    "time": ["2026-07-15T00:00", "2026-07-15T01:00", "2026-07-15T02:00", "2026-07-15T03:00", "2026-07-15T04:00", "2026-07-15T05:00", "2026-07-15T06:00", "2026-07-15T07:00", "2026-07-15T08:00", "2026-07-15T09:00", "2026-07-15T10:00", "2026-07-15T11:00", "2026-07-15T12:00", "2026-07-15T13:00", "2026-07-15T14:00", "2026-07-15T15:00", "2026-07-15T16:00", "2026-07-15T17:00", "2026-07-15T18:00", "2026-07-15T19:00", "2026-07-15T20:00", "2026-07-15T21:00", "2026-07-15T22:00", "2026-07-15T23:00", "2026-07-16T00:00", "2026-07-16T01:00", "2026-07-16T02:00", "2026-07-16T03:00", "2026-07-16T04:00", "2026-07-16T05:00", "2026-07-16T06:00", "2026-07-16T07:00", "2026-07-16T08:00", "2026-07-16T09:00", "2026-07-16T10:00", "2026-07-16T11:00", "2026-07-16T12:00", "2026-07-16T13:00", "2026-07-16T14:00", "2026-07-16T15:00", "2026-07-16T16:00", "2026-07-16T17:00", "2026-07-16T18:00", "2026-07-16T19:00", "2026-07-16T20:00", "2026-07-16T21:00", "2026-07-16T22:00", "2026-07-16T23:00"],
+    "precipitation": [4, 6, 12, 14, 16, 15, 12, 10, 8, 7, 6, 6, 5, 5, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0.5, 0.5, 0.5, 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "wind_speed_10m": [30, 35, 45, 52, 58, 62, 60, 55, 50, 46, 42, 38, 35, 32, 30, 28, 26, 24, 22, 20, 20, 18, 18, 16, 16, 15, 14, 14, 13, 13, 12, 12, 12, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8, 8, 8, 8],
+    "wind_gusts_10m": [50, 58, 72, 85, 92, 95, 90, 82, 75, 68, 62, 56, 52, 48, 45, 42, 40, 36, 34, 32, 30, 28, 28, 26, 25, 24, 22, 22, 21, 21, 20, 20, 19, 19, 18, 18, 17, 17, 16, 16, 16, 15, 15, 15, 14, 14, 14, 14]
+  }
+}

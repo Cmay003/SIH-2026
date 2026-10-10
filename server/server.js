@@ -71,6 +71,12 @@ const auth = setupAuth(app, db, { officerApiKey: OFFICER_API_KEY });
 const requireOfficerAuth = auth.requireOfficer;
 // Sensor ingestion needs a device key (review R1) - see device_auth.js
 const device = require("./device_auth").setupDeviceAuth(db);
+// Village siren on nodes: desired/reported state + the auto rule - see siren.js
+const siren = require("./siren");
+const sirens = siren.setupSirens(db);
+const { setupOfficerAlerts } = require("./officer_alerts");
+// Confidence score per alert (worked out by the AI backend, cleaned here) - see confidence.js
+const { confidenceColumns, confidenceFromRow, confidenceSummary } = require("./confidence");
 
 // --- Pages -------------------------------------------------------------
 // The React build (frontend/dist - `npm run build` in frontend/) is served
@@ -104,6 +110,8 @@ const PROTECTED_PAGES = new Map([
   ["index.html", { file: "index.html", roles: null }],
   ["officer.html", { file: "officer.html", roles: auth.OFFICER_ROLES }],
   ["admin.html", { file: "admin.html", roles: auth.ADMIN_ROLES, denied: "admin" }], // React only
+  // risk trends, district summary report, CAP/PDF/timeline per alert (step W2) - React only
+  ["trends.html", { file: "trends.html", roles: auth.OFFICER_ROLES }],
 ]);
 app.use((req, res, next) => {
   if (req.method !== "GET" && req.method !== "HEAD") return next();
@@ -213,13 +221,28 @@ db.exec(`
     timestamp TEXT
   )
 `);
+// How sure the AI backend is about each alert (0..1, its High/Medium/Low
+// label and the short reasons behind it, as a JSON array) - see
+// confidence.js. Added after the table existed, so an older sanjeevni.db
+// gets the columns here; its old rows stay NULL ("no confidence given").
+{
+  const existingCols = db.prepare("PRAGMA table_info(sensor_data)").all().map((r) => r.name);
+  if (!existingCols.includes("confidence")) db.exec("ALTER TABLE sensor_data ADD COLUMN confidence REAL");
+  if (!existingCols.includes("confidence_label")) db.exec("ALTER TABLE sensor_data ADD COLUMN confidence_label TEXT");
+  if (!existingCols.includes("confidence_reasons")) db.exec("ALTER TABLE sensor_data ADD COLUMN confidence_reasons TEXT");
+  // 1 = the alert's severity came from the WEATHER FORECAST, not from this
+  // node's sensors (siren.js isForecastResult). The officer alarm groups
+  // those into one area-wide item per hazard type (frontend lib/alarm.ts).
+  // Older rows stay NULL = measured.
+  if (!existingCols.includes("forecast_based")) db.exec("ALTER TABLE sensor_data ADD COLUMN forecast_based INTEGER");
+}
 
 const insertReading = db.prepare(`
   INSERT INTO sensor_data
   (node_id, location, hazard_type, severity, risk_score, river_level_m, temp_c,
    humidity_pct, gas_ppm, status, message, eta_minutes, predicted_time,
-   latitude, longitude, timestamp)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   latitude, longitude, timestamp, confidence, confidence_label, confidence_reasons, forecast_based)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const selectSensors = db.prepare(
@@ -242,7 +265,7 @@ const selectHistory = db.prepare(
 const ACTIVE_HAZARD_SQL = (statuses, onlyRegistered) => `
   SELECT sd.node_id, sd.location, sd.hazard_type, sd.severity, sd.risk_score,
          sd.eta_minutes, sd.predicted_time, sd.latitude, sd.longitude, sd.status,
-         sd.timestamp
+         sd.timestamp, sd.confidence, sd.confidence_label, sd.confidence_reasons, sd.forecast_based
   FROM sensor_data sd
   INNER JOIN (
     SELECT node_id, MAX(id) as max_id FROM sensor_data GROUP BY node_id
@@ -310,17 +333,86 @@ db.exec(`
   }
   // Where the coordinates came from: 'gps' (the phone's location), 'manual'
   // (the person tapped a point on the SOS page map because location was
-  // denied, unavailable or too slow - approximate, officers must be told) or
-  // 'whatsapp'. Rows from before this column existed stay NULL (unknown).
+  // denied, unavailable or too slow - approximate, officers must be told),
+  // 'whatsapp' or 'node' (the SOS button on a sensor node - the node's
+  // registered position). Rows from before this column existed stay NULL.
   if (!existingCols.includes("location_source")) {
     db.exec("ALTER TABLE sos_requests ADD COLUMN location_source TEXT");
+  }
+  // How far off a device fix may be (the browser's coords.accuracy, metres).
+  // A phone or laptop without GPS still answers with a Wi-Fi / cell / IP
+  // position that can be kilometres off - officers must see that, not a pin
+  // that looks exact. NULL = unknown (manual point, WhatsApp, sensor node,
+  // an older page, or an SOS from before this column).
+  if (!existingCols.includes("location_accuracy_m")) {
+    db.exec("ALTER TABLE sos_requests ADD COLUMN location_accuracy_m REAL");
+  }
+  // 1 = filed from a simulated reading (simulation.js / the judge demo, see
+  // createNodeButtonSos). A test node SOS and a real press share the device
+  // id "node:<NODE>", so a real press must be able to tell that the open SOS
+  // it would otherwise join is only a test. NULL/0 = real.
+  if (!existingCols.includes("simulated")) {
+    db.exec("ALTER TABLE sos_requests ADD COLUMN simulated INTEGER");
+  }
+  // Offline SOS Wi-Fi page (location_source 'hotspot'): how many people and
+  // what they need ("trapped,injured" from a fixed list). NULL for every
+  // other channel - they have no such fields.
+  if (!existingCols.includes("people")) {
+    db.exec("ALTER TABLE sos_requests ADD COLUMN people INTEGER");
+  }
+  if (!existingCols.includes("needs")) {
+    db.exec("ALTER TABLE sos_requests ADD COLUMN needs TEXT");
   }
 }
 
 const insertSos = db.prepare(
-  `INSERT INTO sos_requests (device_id, latitude, longitude, note, status, timestamp, location_source)
-   VALUES (?, ?, ?, ?, 'open', ?, ?)`,
+  `INSERT INTO sos_requests (device_id, latitude, longitude, note, status, timestamp, location_source, location_accuracy_m, simulated)
+   VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
 );
+// A device fix less exact than this is "approximate": the SOS page tells the
+// person and offers the map, the officer views warn. Same value in
+// frontend/src/lib/sos.ts and the classic pages.
+const APPROX_LOCATION_M = 500;
+
+// One row per SOS-button press a sensor node reported (see
+// createNodeButtonSos). A press arrives as an ordinary reading, so a
+// store-and-forward retry, a gateway replay or a 502 answer (backend down -
+// the node keeps the reading queued and sends it again) repeats it. Keyed on
+// (node_id, reading_uid) and kept even when the press was folded into an
+// already-open SOS: a column on sos_requests could not remember those, and a
+// replay after the officer resolved that SOS would open a second one.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS node_sos_presses (
+    node_id TEXT NOT NULL,
+    reading_uid TEXT NOT NULL,
+    sos_id INTEGER,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (node_id, reading_uid)
+  )
+`);
+const selectNodeSosPress = db.prepare("SELECT sos_id FROM node_sos_presses WHERE node_id=? AND reading_uid=?");
+const insertNodeSosPress = db.prepare(
+  "INSERT OR IGNORE INTO node_sos_presses (node_id, reading_uid, sos_id, received_at) VALUES (?, ?, ?, ?)",
+);
+// One row per offline-hotspot SOS (POST /api/ingest/sos), for the same
+// reason as node_sos_presses: the gateway keeps a request queued until it
+// gets a 2xx, so a lost answer brings the same request again. Keyed on
+// (node_id, sos_uid) - the uid is made on the gateway/node per request.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS hotspot_sos (
+    node_id TEXT NOT NULL,
+    sos_uid TEXT NOT NULL,
+    sos_id INTEGER,
+    client_id TEXT,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (node_id, sos_uid)
+  )
+`);
+const selectHotspotSos = db.prepare("SELECT sos_id FROM hotspot_sos WHERE node_id=? AND sos_uid=?");
+const insertHotspotSos = db.prepare(
+  "INSERT OR IGNORE INTO hotspot_sos (node_id, sos_uid, sos_id, client_id, received_at) VALUES (?, ?, ?, ?, ?)",
+);
+const updateSosDetails = db.prepare("UPDATE sos_requests SET people=?, needs=? WHERE id=?");
 // One-open-SOS-per-device check - a device can't file a second SOS while
 // an earlier one from the same device is still unresolved.
 const selectOpenSosByDevice = db.prepare(
@@ -584,6 +676,8 @@ function storeDashboardRow(sensorData, aiResult) {
     aiResult.latitude ?? info.latitude ?? null,
     aiResult.longitude ?? info.longitude ?? null,
     aiResult.timestamp || new Date().toISOString(),
+    ...confidenceColumns(aiResult),
+    siren.isForecastResult(aiResult) ? 1 : 0,
   );
 
   // Confirmed alerts -> opted-in WhatsApp subscribers nearby. Not awaited:
@@ -595,6 +689,49 @@ function storeDashboardRow(sensorData, aiResult) {
   if (aiResult.status === "alert_dispatched" && (!simulated || WHATSAPP_ALERTS_FOR_SIMULATED)) {
     queueSubscriberAlert({ ...aiResult, node_id: aiResult.node_id || sensorData.node_id });
   }
+
+  // Village siren auto rule (confirmed CRITICAL evacuation hazards only,
+  // SIREN_AUTO_HAZARDS - see siren.js). A
+  // siren bug must never cost the reading or the alerts above.
+  let sirenFired = null;
+  try {
+    sirenFired = sirens.onAiResult(sensorData, aiResult) || null;
+  } catch (e) {
+    console.error(`[siren] auto rule failed for ${sensorData.node_id}: ${e.message}`);
+  }
+
+  // Officers' phones (officer_alerts.js): confirmed HIGH/CRITICAL once per
+  // hazard episode, and automatic sirens. Sending is queued, never awaited.
+  try {
+    officerAlerts.onAiResult(sensorData, aiResult, { siren: sirenFired });
+  } catch (e) {
+    console.error(`[officer-alert] failed for ${sensorData.node_id}: ${e.message}`);
+  }
+}
+
+// Siren bookkeeping around ingestion. Never throws: a siren problem must
+// not stop readings (or an SOS) from being stored.
+// single: the /api/ingest route, where a reading without timestamp /
+// age_seconds is live; in a batch it is an untimed backlog reading, as the
+// backend treats it.
+function recordSirenReports(readings, single = false) {
+  try {
+    sirens.recordReported(readings, Date.now(), { untimedIsNow: single });
+  } catch (e) {
+    console.error(`[siren] could not store reported siren state: ${e.message}`);
+  }
+}
+// Adds "commands" (desired siren state for the siren-fitted nodes in this
+// request whose reported state differs) to an ingest answer. Left out when
+// there is nothing to send, so the answer is unchanged for older gateways.
+function withSirenCommands(body, readings) {
+  try {
+    const commands = sirens.commandsFor(readings);
+    if (commands.length) return { ...body, commands };
+  } catch (e) {
+    console.error(`[siren] could not work out siren commands: ${e.message}`);
+  }
+  return body;
 }
 
 // Passes the Python backend's own status code through (e.g. 400 for an
@@ -615,19 +752,23 @@ function upstreamAuthRejected(error) {
 const UPSTREAM_AUTH_MESSAGE =
   "The AI backend rejected this server's OFFICER_API_KEY. Set the same key for both servers in .env and restart both.";
 
-function sendPipelineError(res, error) {
+// `readings`: the request's allowed readings, if any. Siren commands ride
+// on error answers too, so an officer can still silence a siren while the
+// AI backend is down (a gateway may read them whatever the HTTP status).
+function sendPipelineError(res, error, readings = []) {
   if (upstreamAuthRejected(error)) {
-    return res.status(502).json({ status: "error", detail: UPSTREAM_AUTH_MESSAGE });
+    return res.status(502).json(withSirenCommands({ status: "error", detail: UPSTREAM_AUTH_MESSAGE }, readings));
   }
   const status = error.response ? error.response.status : 502;
   const detail = error.response ? error.response.data : error.message;
   console.error("Pipeline error:", status, error.message);
-  res.status(status).json({ status: "error", detail });
+  res.status(status).json(withSirenCommands({ status: "error", detail }, readings));
 }
 
 // 1. Ingestion endpoint - ESP32 / simulator sends raw readings here.
 // Requires a device key (device_auth.js) allowed to report for this node.
 app.post("/api/ingest", device.requireDeviceKey, async (req, res) => {
+  let sensorData = null;
   try {
     if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
       return res.status(400).json({ error: "body must be one reading object" });
@@ -635,16 +776,21 @@ app.post("/api/ingest", device.requireDeviceKey, async (req, res) => {
     if (!device.nodeAllowed(req.device, req.body.node_id)) {
       return res.status(403).json({ error: `Device key '${req.device.name}' may not report for ${req.body.node_id}` });
     }
-    const sensorData = device.applyKeyPolicy(req.device, req.body);
+    sensorData = device.applyKeyPolicy(req.device, req.body);
+    // Before forwarding: the SOS must not depend on the AI backend being up
+    // or accepting the reading (it may reject it for an unrelated value).
+    // The same goes for the siren state the node reports.
+    nodeSosFromReadings([sensorData]);
+    recordSirenReports([sensorData], true);
     const pythonResponse = await axios.post(
       `${PYTHON_BACKEND_URL}/api/ingest`,
       sensorData,
     );
     const aiResult = pythonResponse.data;
     storeDashboardRow(sensorData, aiResult);
-    res.status(200).json({ status: "success", ai_action: aiResult.status });
+    res.status(200).json(withSirenCommands({ status: "success", ai_action: aiResult.status }, [sensorData]));
   } catch (error) {
-    sendPipelineError(res, error);
+    sendPipelineError(res, error, sensorData ? [sensorData] : []);
   }
 });
 
@@ -653,6 +799,7 @@ app.post("/api/ingest", device.requireDeviceKey, async (req, res) => {
 // lists one status per reading, in the same order, so the sender knows
 // which queue entries it can delete.
 app.post("/api/ingest/batch", device.requireDeviceKey, async (req, res) => {
+  let readings = [];
   try {
     const submitted = Array.isArray(req.body?.readings) ? req.body.readings : null;
     if (!submitted || submitted.some((r) => !r || typeof r !== "object" || Array.isArray(r))) {
@@ -684,7 +831,12 @@ app.post("/api/ingest/batch", device.requireDeviceKey, async (req, res) => {
       const nodes = [...new Set(submitted.map((r) => String(r.node_id)))].join(", ");
       return res.status(403).json({ error: `Device key '${req.device.name}' may not report for ${nodes}` });
     }
-    const readings = allowedIdx.map((i) => device.applyKeyPolicy(req.device, submitted[i]));
+    readings = allowedIdx.map((i) => device.applyKeyPolicy(req.device, submitted[i]));
+    // Only readings this key may send (a stolen key for one node can't raise
+    // SOS for another, or get its siren commands), and before forwarding -
+    // see /api/ingest.
+    nodeSosFromReadings(readings);
+    recordSirenReports(readings);
     if (readings.length) {
       const pythonResponse = await axios.post(
         `${PYTHON_BACKEND_URL}/api/ingest/batch`,
@@ -700,16 +852,16 @@ app.post("/api/ingest/batch", device.requireDeviceKey, async (req, res) => {
       .map((sensorData, k) => ({ sensorData, aiResult: results[allowedIdx[k]] }))
       .sort((a, b) => String(a.aiResult?.timestamp ?? "").localeCompare(String(b.aiResult?.timestamp ?? "")))
       .forEach(({ sensorData, aiResult }) => storeDashboardRow(sensorData, aiResult));
-    res.status(200).json({
+    res.status(200).json(withSirenCommands({
       status: "success",
       results: results.map((r) => ({
         node_id: r.node_id,
         reading_uid: r.reading_uid ?? null,
         ai_action: r.status,
       })),
-    });
+    }, readings));
   } catch (error) {
-    sendPipelineError(res, error);
+    sendPipelineError(res, error, readings);
   }
 });
 
@@ -728,6 +880,7 @@ app.get("/api/sensors", auth.requireLogin, (req, res) => {
     risk: r.severity || "LOW",
     risk_score: r.risk_score,
     timestamp: r.timestamp,
+    ...confidenceFromRow(r),
   }));
 
   res.json({ success: true, count: rows.length, data });
@@ -735,7 +888,8 @@ app.get("/api/sensors", auth.requireLogin, (req, res) => {
 
 // 3. Raw history (unshaped)
 app.get("/api/history", auth.requireLogin, (req, res) => {
-  res.json(selectHistory.all());
+  // confidence_reasons is stored as JSON text - hand it out as the array
+  res.json(selectHistory.all().map((r) => ({ ...r, ...confidenceFromRow(r) })));
 });
 
 // 4. Nearest hospital + directions link for a given sensor node
@@ -770,9 +924,10 @@ app.get("/api/nearest-hospital", (req, res) => {
 // /api/sos AND the new WhatsApp webhook below - one source of truth
 // for "what happens when someone reports an SOS", regardless of which
 // channel it came in through.
-// locationSource: "gps" | "manual" | "whatsapp" (see the sos_requests
-// location_source column).
-function createSosRequest(deviceId, latitude, longitude, note, locationSource) {
+// locationSource: "gps" | "manual" | "whatsapp" | "node" (see the
+// sos_requests location_source column). accuracyM: the device fix's
+// accuracy in metres, or null when unknown / not a device fix.
+function createSosRequest(deviceId, latitude, longitude, note, locationSource, accuracyM = null, simulated = false) {
   const existing = selectOpenSosByDevice.get(deviceId);
   // An open row without real coordinates (only possible from before B47) is
   // never shown to officers and can't be routed to, so it must not block
@@ -802,6 +957,8 @@ function createSosRequest(deviceId, latitude, longitude, note, locationSource) {
     note || null,
     timestamp,
     locationSource,
+    accuracyM,
+    simulated ? 1 : 0,
   );
   return {
     httpStatus: 201,
@@ -811,6 +968,256 @@ function createSosRequest(deviceId, latitude, longitude, note, locationSource) {
       ...hospitalFor(latitude, longitude),
     },
   };
+}
+
+// --- SOS push-button on a LoRa sensor node --------------------------------
+// For people with no phone at all: holding the button on a node makes its
+// next reading carry sos_button: true (firmware SJ_SOS_PRESSED). The SOS is
+// filed HERE, not by the AI backend, so it goes through even when the
+// backend is down or rejects the reading for another reason.
+// Location = the node's registered position (the person is at the node).
+const NODE_SOS_PREFIX = "node:";
+const NODE_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+// Files the SOS for every reading with sos_button === true. Callers pass
+// only readings the device key is allowed to send. Never throws: a failed
+// SOS is logged, and ingestion of the readings themselves carries on.
+function nodeSosFromReadings(readings) {
+  for (const reading of readings) {
+    if (reading.sos_button !== true) continue;
+    try {
+      createNodeButtonSos(reading);
+    } catch (e) {
+      console.error(`[sos] !!! SOS button on node ${reading.node_id} could NOT be stored: ${e.message}`);
+    }
+  }
+}
+
+function createNodeButtonSos(reading) {
+  const nodeId = reading.node_id;
+  if (typeof nodeId !== "string" || !NODE_ID_PATTERN.test(nodeId)) {
+    console.error(`[sos] !!! SOS button reading with an unusable node_id (${JSON.stringify(nodeId)}) - no SOS filed`);
+    return null;
+  }
+  const simulated = reading.simulated === true;
+  // One press = one SOS. Without a reading_uid a replay can't be told from
+  // a new press; the one-open-SOS-per-device rule still stops duplicates
+  // while the first SOS is open. Simulated presses are remembered under
+  // their own key ("sim:<uid>"), so a test uid can never swallow a real
+  // press that happens to carry the same uid.
+  const rawUid = reading.reading_uid == null ? null : String(reading.reading_uid).slice(0, 200);
+  const uid = rawUid !== null && simulated ? `sim:${rawUid}` : rawUid;
+  if (uid !== null) {
+    const seen = selectNodeSosPress.get(nodeId, uid);
+    if (seen) return { status: "duplicate", sos_id: seen.sos_id };
+  }
+
+  const info = nodeInfo(nodeId);
+  const coords = info ? parseCoordinates(info.latitude, info.longitude) : null;
+  const deviceId = NODE_SOS_PREFIX + nodeId;
+  const where = info && info.location ? ` (${info.location})` : coords ? "" : " (NO REGISTERED POSITION)";
+  let note = `SOS button pressed on sensor node ${nodeId}${where}`;
+  const age = Number(reading.age_seconds);
+  if (Number.isFinite(age) && age > 120) note += ` - pressed about ${Math.round(age / 60)} min ago`;
+  // simulation.js / the judge demo: officers must be able to tell a test press from a real one
+  if (simulated) note += " - SIMULATED (test/demo reading)";
+
+  // A real press must never be folded into a TEST SOS (same device id): the
+  // officer would resolve that row as a test, and the press - recorded
+  // against it - would then count as already handled, so no SOS would ever
+  // open for the real person. The test SOS is closed as 'superseded' and the
+  // real press files its own. (The reverse - a test press while a real SOS
+  // is open - joins the real one, which is harmless.) The device id stays
+  // "node:<NODE>" for both, as the officer views and the judge demo expect.
+  if (!simulated) supersedeSimulatedSos(deviceId, `on node ${nodeId}`, "a REAL SOS button press arrived");
+
+  let sosId;
+  let status;
+  if (coords) {
+    const { httpStatus, body } = createSosRequest(deviceId, coords.latitude, coords.longitude, note, "node", null, simulated);
+    sosId = body.sos_id;
+    status = httpStatus === 201 ? "received" : "already_active";
+  } else {
+    // A node missing from the registry (or registered without a position)
+    // has nowhere to put a pin - but a press is someone asking for help and
+    // must not vanish. Stored with NULL coordinates; GET /api/sos lists
+    // these separately (unlocated_node_sos) so the officer views show a
+    // banner, and the next press after the node gets a position replaces it
+    // with a mapped SOS (createSosRequest closes the unmapped one).
+    console.error(`[sos] !!! SOS button pressed on node ${nodeId}, which has NO registered position - ` +
+      "stored without a map pin and shown to officers as an unlocated SOS. Register the node's position (admin page).");
+    ({ status, sos_id: sosId } = storeUnlocatedSos(deviceId, note, "node", simulated));
+  }
+  if (uid !== null) insertNodeSosPress.run(nodeId, uid, sosId, new Date().toISOString());
+  console.warn(`[sos] SOS button on node ${nodeId} (reading ${uid ?? "without uid"}${simulated ? ", simulated" : ""}) -> SOS #${sosId} ${status}`);
+  return { status, sos_id: sosId };
+}
+
+// Closes an open SIMULATED SOS under deviceId so a real request files its
+// own (see createNodeButtonSos for why a real one must never join a test).
+function supersedeSimulatedSos(deviceId, where, why) {
+  const open = selectOpenSosByDevice.get(deviceId);
+  if (open && open.simulated === 1) {
+    updateSosStatus.run("superseded", open.id);
+    console.warn(`[sos] simulated SOS #${open.id} ${where} closed as 'superseded' - ${why}`);
+  }
+}
+
+// Stores an SOS that has no usable position (node/gateway not registered,
+// or registered without coordinates): one open row per device id, NULL
+// coordinates, listed to officers as "unlocated" (GET /api/sos). Returns
+// { status: "received" | "already_active", sos_id }.
+function storeUnlocatedSos(deviceId, note, locationSource, simulated) {
+  const existing = selectOpenSosByDevice.get(deviceId);
+  if (existing) return { status: "already_active", sos_id: existing.id };
+  const sosId = insertSos.run(deviceId, null, null, note, new Date().toISOString(), locationSource, null, simulated ? 1 : 0)
+    .lastInsertRowid;
+  return { status: "received", sos_id: sosId };
+}
+
+// --- Offline SOS Wi-Fi ("SANJEEVNI-SOS" hotspot) ---------------------------
+// A gateway (and optionally a mains/solar node) runs an open Wi-Fi with a
+// tiny SOS page for people whose phone has no mobile data. Browsers do not
+// give a plain-http page the phone's location, so the position is the
+// node's registered one (the person is within Wi-Fi range of it) unless
+// they typed coordinates. The gateway forwards each request here with its
+// device key and retries until it gets a 2xx.
+const HOTSPOT_SOS_PREFIX = "hotspot:";
+const HOTSPOT_NEEDS = new Set(["trapped", "injured", "medical", "fire"]);
+const HOTSPOT_NOTE_MAX = 160; // the page's own cap (contract)
+const HOTSPOT_PEOPLE_MAX = 999; // sanity cap, not a known limit
+// Rough Wi-Fi range of an ESP32 SoftAP in the open - a configurable demo
+// figure for the officer label ("within ~150 m"), not a measured one.
+const HOTSPOT_POSITION_ACCURACY_M = 150;
+// Typed coordinates further than this from the hotspot's registered
+// position are not used for the pin (see createHotspotSos). A configurable
+// demo default: Wi-Fi range plus room for a node relaying from a little
+// further away - not a measured figure.
+const HOTSPOT_TYPED_MAX_M = Number(process.env.HOTSPOT_TYPED_MAX_M) > 0 ? Number(process.env.HOTSPOT_TYPED_MAX_M) : 2000;
+const HOTSPOT_UID_PATTERN = /^[\x21-\x7e]{1,64}$/; // printable ASCII, no spaces
+const HOTSPOT_CLIENT_PATTERN = /[^A-Za-z0-9_-]/g;
+
+// The phone's short id -> safe part of the device id. A missing or odd id
+// must never lose the SOS (a 4xx would make the gateway drop it), and must
+// not lump different people into one device id either - so it falls back
+// to the request's own uid.
+function hotspotClientId(clientId, sosUid) {
+  const cleaned = typeof clientId === "string" ? clientId.replace(HOTSPOT_CLIENT_PATTERN, "").slice(0, 32) : "";
+  return cleaned || `uid-${sosUid.replace(HOTSPOT_CLIENT_PATTERN, "").slice(0, 32) || "unknown"}`;
+}
+
+// Free text from a stranger's phone: control characters out, length capped.
+// (Every officer view escapes it again when it is shown.)
+const cleanHotspotText = (text) =>
+  typeof text === "string" ? text.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, HOTSPOT_NOTE_MAX) : "";
+
+// A second request from the same phone while its SOS is open is a
+// follow-up ("now 5 people, one injured"): it joins the open SOS, and what
+// it adds must reach officers - the larger people count, the union of the
+// needs, and its description appended to the note. A test request never
+// edits a real person's SOS. The note is capped so a phone resending over
+// and over cannot grow it without end.
+const HOTSPOT_NOTE_TOTAL_MAX = 1500;
+const selectSosDetails = db.prepare("SELECT note, people, needs, simulated FROM sos_requests WHERE id=?");
+const updateSosFollowUp = db.prepare("UPDATE sos_requests SET note=?, people=?, needs=? WHERE id=?");
+function mergeHotspotFollowUp(sosId, { people, needs, text, simulated, client }) {
+  const open = selectSosDetails.get(sosId);
+  if (!open || (simulated && open.simulated !== 1)) return;
+  const oldNeeds = open.needs ? String(open.needs).split(",").filter(Boolean) : [];
+  const mergedNeeds = [...new Set([...oldNeeds, ...needs])];
+  const mergedPeople = people != null && (open.people == null || people > open.people) ? people : open.people;
+  let note = open.note || "";
+  if (text && note.length < HOTSPOT_NOTE_TOTAL_MAX) {
+    note = `${note} | update: "${text}"`.slice(0, HOTSPOT_NOTE_TOTAL_MAX);
+  }
+  const changed = note !== (open.note || "") || mergedPeople !== open.people || mergedNeeds.length !== oldNeeds.length;
+  if (!changed) return;
+  updateSosFollowUp.run(note || null, mergedPeople, mergedNeeds.length ? mergedNeeds.join(",") : null, sosId);
+  console.warn(`[sos] offline SOS Wi-Fi follow-up from client ${client} -> SOS #${sosId} updated ` +
+    `(people ${mergedPeople ?? "?"}, needs ${mergedNeeds.join(",") || "none"}${text ? ", new description" : ""})`);
+}
+
+function createHotspotSos(data, nodeId, sosUid) {
+  const simulated = data.simulated === true;
+  // Simulated requests are remembered under their own key, as for node presses
+  const key = simulated ? `sim:${sosUid}` : sosUid;
+  const seen = selectHotspotSos.get(nodeId, key);
+  if (seen) return { status: "duplicate", sos_id: seen.sos_id };
+
+  const client = hotspotClientId(data.client_id, sosUid);
+  const deviceId = `${HOTSPOT_SOS_PREFIX}${nodeId}:${client}`;
+  const people = Number.isInteger(data.people) && data.people >= 1 && data.people <= HOTSPOT_PEOPLE_MAX ? data.people : null;
+  const needs = Array.isArray(data.needs) ? [...new Set(data.needs.filter((n) => HOTSPOT_NEEDS.has(n)))] : [];
+  const text = cleanHotspotText(data.note);
+
+  // Coordinates the person typed (read off another app, a signboard) win:
+  // they say where the person IS. Otherwise the node's registered position,
+  // good to about the Wi-Fi range. Typed ones are unverified, so they get no
+  // accuracy figure and the officer views say they were typed.
+  // But the person is within Wi-Fi range of the hotspot (or of the node that
+  // relayed it): typed coordinates far from it are a typo, swapped lat/lon
+  // or abuse, and a pin there would send rescuers to the wrong place. Then
+  // the known node position is kept and the typed pair only goes in the note.
+  const typedRaw = data.latitude != null && data.longitude != null ? parseCoordinates(data.latitude, data.longitude) : null;
+  const info = nodeInfo(nodeId);
+  const nodeCoords = info ? parseCoordinates(info.latitude, info.longitude) : null;
+  const typedKm = typedRaw && nodeCoords
+    ? haversineKm(typedRaw.latitude, typedRaw.longitude, nodeCoords.latitude, nodeCoords.longitude)
+    : null;
+  const typedFar = typedKm !== null && typedKm * 1000 > HOTSPOT_TYPED_MAX_M;
+  const typed = typedFar ? null : typedRaw;
+  const coords = typed || nodeCoords;
+  const accuracyM = typed ? null : nodeCoords ? HOTSPOT_POSITION_ACCURACY_M : null;
+
+  const where = info && info.location ? ` (${info.location})` : coords ? "" : " (NO REGISTERED POSITION)";
+  let note = `Offline SOS Wi-Fi at ${nodeId}${where}`;
+  note += text ? `: "${text}"` : " - no description given";
+  if (typed) note += " - location typed by the person";
+  if (typedFar) {
+    note += ` - typed location ${typedRaw.latitude},${typedRaw.longitude} is ${typedKm.toFixed(1)} km from the hotspot ` +
+      "(unverified, NOT used for the pin)";
+    console.warn(`[sos] offline SOS Wi-Fi at ${nodeId}: typed location is ${typedKm.toFixed(1)} km away - ` +
+      "kept the hotspot's position for the pin");
+  }
+  const age = Number(data.age_seconds);
+  if (Number.isFinite(age) && age > 120) note += ` - sent about ${Math.round(age / 60)} min ago`;
+  if (simulated) note += " - SIMULATED (test/demo request)";
+
+  if (!simulated) supersedeSimulatedSos(deviceId, `from ${deviceId}`, "a REAL hotspot SOS arrived");
+  let result;
+  if (coords) {
+    const { httpStatus, body } = createSosRequest(deviceId, coords.latitude, coords.longitude, note, "hotspot", accuracyM, simulated);
+    result = { status: httpStatus === 201 ? "ok" : "already_active", sos_id: body.sos_id };
+  } else {
+    console.error(`[sos] !!! offline SOS Wi-Fi request at ${nodeId}, which has NO registered position - ` +
+      "stored without a map pin and shown to officers as an unlocated SOS. Register its position (admin page).");
+    const stored = storeUnlocatedSos(deviceId, note, "hotspot", simulated);
+    result = { status: stored.status === "received" ? "ok" : "already_active", sos_id: stored.sos_id };
+  }
+  if (result.status === "ok") updateSosDetails.run(people, needs.length ? needs.join(",") : null, result.sos_id);
+  else mergeHotspotFollowUp(result.sos_id, { people, needs, text, simulated, client });
+  insertHotspotSos.run(nodeId, key, result.sos_id, client, new Date().toISOString());
+  console.warn(`[sos] offline SOS Wi-Fi at ${nodeId} (client ${client}, uid ${sosUid}${simulated ? ", simulated" : ""}) ` +
+    `-> SOS #${result.sos_id} ${result.status}`);
+  return result;
+}
+
+// The accuracy a web client reports for its device fix, in metres, or null.
+// Never a reason to refuse an SOS: a bad value is logged and dropped.
+// Only called for device fixes (manual points have no accuracy). A missing
+// value is logged too - one line per SOS, and it tells the operator that
+// an older cached page is still in use, whose pins officers can't judge.
+const MAX_LOCATION_ACCURACY_M = 1e6;
+function parseLocationAccuracy(value) {
+  if (value == null) {
+    console.warn("[sos] device-location SOS without location_accuracy_m (older page?) - accuracy stored as unknown");
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_LOCATION_ACCURACY_M) {
+    return value;
+  }
+  console.warn(`[sos] ignoring invalid location_accuracy_m (${String(JSON.stringify(value)).slice(0, 60)}) - stored as unknown`);
+  return null;
 }
 
 // Returns {latitude, longitude} as real numbers, or null if either is
@@ -864,7 +1271,11 @@ const DEVICE_ID_PATTERN = /^[A-Za-z0-9:._-]{3,100}$/;
 // victim's number, so the victim's REAL location later got "already
 // active" (409) and was never stored - and GET /api/sos/device/... handed
 // out the location of any WhatsApp user's open SOS. Web IDs are "dev-...".
-const RESERVED_DEVICE_PREFIX = /^whatsapp:/i;
+// "node:<NODE>" (SOS button on a sensor node) is reserved for the same
+// reason: a web SOS under that id would make a villager's real button press
+// "already active" and never stored.
+// "hotspot:<NODE>:<client>" (offline SOS Wi-Fi) likewise.
+const RESERVED_DEVICE_PREFIX = /^(whatsapp|node|hotspot):/i;
 // What a web client may say about its coordinates. Missing = "gps": the
 // classic sos.html and older cached pages only ever send the phone's
 // location. "whatsapp" is only set by the webhook itself.
@@ -897,12 +1308,16 @@ app.post("/api/sos", (req, res) => {
   if (!WEB_LOCATION_SOURCES.has(locationSource)) {
     return res.status(400).json({ error: "location_source must be \"gps\" or \"manual\"" });
   }
+  // Only a device fix has an accuracy; a point set by hand has none (the
+  // officer views already mark it as approximate).
+  const accuracyM = locationSource === "gps" ? parseLocationAccuracy(req.body.location_accuracy_m) : null;
   const { httpStatus, body } = createSosRequest(
     device_id,
     coords.latitude,
     coords.longitude,
     note ? note.slice(0, MAX_NOTE_LENGTH) : note,
     locationSource,
+    accuracyM,
   );
   res.status(httpStatus).json(body);
 });
@@ -931,6 +1346,68 @@ app.get("/api/sos/device/:device_id", (req, res) => {
   });
 });
 
+// 5c. Offline SOS Wi-Fi request forwarded by a gateway (see createHotspotSos).
+// Same device key and node scoping as ingestion. Status codes tell the
+// gateway what to do with its queued copy: 2xx = delete it (ok / duplicate /
+// already_active), 400 = delete it (it can never be accepted), 401/403/429/
+// 5xx = keep it and retry later.
+// Generous: a whole village may use one hotspot at once. It only stops a
+// flood from one compromised gateway; the hotspot has its own per-AP limit.
+const hotspotSosPerNode = makeRateLimiter(10 * 60 * 1000, 60);
+// key name + node id -> when the "not in the key's node list" line was last
+// logged. Emptied when it grows large: a key holder sending made-up node ids
+// must not grow it without end (worst case: a few extra log lines).
+const sosScopeLogged = new Map();
+const SOS_SCOPE_LOG_MAX = 1000;
+app.post("/api/ingest/sos", device.requireDeviceKey, (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({ error: "body must be one SOS object" });
+  }
+  const nodeId = body.node_id;
+  if (typeof nodeId !== "string" || !NODE_ID_PATTERN.test(nodeId)) {
+    return res.status(400).json({ error: "node_id is required (1-64 letters, digits, . _ -)" });
+  }
+  if (!device.nodeAllowed(req.device, nodeId)) {
+    // 403 = the gateway keeps the SOS queued and retries, so a key whose
+    // --nodes list lacks the hotspot's id (typically the GATEWAY's own id,
+    // which ingestion never needed) silently holds back every SOS from it.
+    // Say so loudly, once per key+node per 10 minutes.
+    const logKey = `${req.device.name}|${nodeId}`;
+    if (!sosScopeLogged.has(logKey) || Date.now() - sosScopeLogged.get(logKey) > 10 * 60 * 1000) {
+      if (sosScopeLogged.size >= SOS_SCOPE_LOG_MAX) sosScopeLogged.clear();
+      sosScopeLogged.set(logKey, Date.now());
+      console.error(`[sos] !!! offline SOS Wi-Fi request from ${nodeId} REFUSED: device key '${req.device.name}' ` +
+        `may not report for ${nodeId}. The gateway keeps it queued and retries. Add ${nodeId} to the key's node ` +
+        "list (node server/device_keys.js add <name> --nodes ...,<GATEWAY_ID>) - a gateway's key must list its own id " +
+        "when its SOS hotspot is on.");
+    }
+    return res.status(403).json({
+      error: `Device key '${req.device.name}' may not report for ${nodeId} - add ${nodeId} to the key's node list`,
+    });
+  }
+  const sosUid = typeof body.sos_uid === "number" && Number.isSafeInteger(body.sos_uid) ? String(body.sos_uid) : body.sos_uid;
+  if (typeof sosUid !== "string" || !HOTSPOT_UID_PATTERN.test(sosUid)) {
+    return res.status(400).json({ error: "sos_uid is required (1-64 printable characters, no spaces)" });
+  }
+  const data = device.applyKeyPolicy(req.device, body);
+  // A retry of a request already stored is answered without counting
+  // against the limit - otherwise a flaky link could lock a hotspot out.
+  const key = data.simulated === true ? `sim:${sosUid}` : sosUid;
+  const seen = selectHotspotSos.get(nodeId, key);
+  if (seen) return res.json({ status: "duplicate", sos_id: seen.sos_id });
+  if (hotspotSosPerNode(nodeId)) {
+    console.warn(`[sos] offline SOS Wi-Fi at ${nodeId}: rate limit reached - gateway told to retry later`);
+    return res.status(429).json({ error: "Too many SOS requests from this hotspot - keep it queued and retry later" });
+  }
+  try {
+    res.json(createHotspotSos(data, nodeId, sosUid));
+  } catch (e) {
+    console.error(`[sos] !!! offline SOS Wi-Fi request at ${nodeId} could NOT be stored: ${e.message}`);
+    res.status(500).json({ error: "SOS could not be stored - keep it queued and retry" });
+  }
+});
+
 // 6. Officer dashboard feed - open SOS requests, each enriched with the
 // route from the responder base to the person, and the person's nearest hospital.
 // UPGRADE: SLA / escalation timers - flags an open SOS that's been
@@ -948,6 +1425,17 @@ function computeEscalation(status, timestamp) {
   };
 }
 
+// The node behind a node-button ("node:<NODE>") or offline SOS Wi-Fi
+// ("hotspot:<NODE>:<client>") SOS; null for every other channel. Node ids
+// never contain ":" (NODE_ID_PATTERN), so the split is unambiguous.
+function sosNodeId(r) {
+  const id = String(r.device_id || "");
+  if (r.location_source === "node") return id.slice(NODE_SOS_PREFIX.length);
+  if (r.location_source === "hotspot") return id.slice(HOTSPOT_SOS_PREFIX.length).split(":")[0] || null;
+  return null;
+}
+const sosNeeds = (r) => (r.needs ? String(r.needs).split(",").filter((n) => HOTSPOT_NEEDS.has(n)) : []);
+
 const loggedInvalidSos = new Set();
 app.get("/api/sos", requireOfficerAuth, (req, res) => {
   const rows =
@@ -960,8 +1448,19 @@ app.get("/api/sos", requireOfficerAuth, (req, res) => {
   // routed to. It is left out and logged instead of breaking the feed:
   // one bad row used to hide EVERY SOS from the officers.
   const valid = rows.filter((r) => parseCoordinates(r.latitude, r.longitude));
+  // Exception: an SOS button press on a node with no registered position
+  // (createNodeButtonSos) has no coordinates either, but it is a real
+  // person asking for help - listed separately so the officer views show it
+  // as a banner instead of a pin.
+  // Only OPEN ones are banners; a resolved one (?status=all) is history.
+  // The same goes for an offline SOS Wi-Fi request at a gateway/node with no position.
+  const isUnlocatedNode = (r) =>
+    (r.location_source === "node" || r.location_source === "hotspot") && r.latitude == null && r.longitude == null;
+  const unlocatedNodeSos = rows.filter((r) => isUnlocatedNode(r) && r.status === "open");
   for (const r of rows) {
-    if (valid.includes(r) || loggedInvalidSos.has(r.id)) continue;
+    // An unlocated node SOS, open or resolved, is not "invalid coordinates":
+    // it was stored without a position on purpose (createNodeButtonSos).
+    if (valid.includes(r) || isUnlocatedNode(r) || loggedInvalidSos.has(r.id)) continue;
     loggedInvalidSos.add(r.id); // once per row, not on every 5 s poll
     console.warn(`[sos] SOS #${r.id} has invalid coordinates (${r.latitude}, ${r.longitude}) - not shown to officers; closed as 'invalid' when that device next files an SOS`);
   }
@@ -981,9 +1480,18 @@ app.get("/api/sos", requireOfficerAuth, (req, res) => {
       status: r.status,
       timestamp: r.timestamp,
       // "manual" = a point the person placed by hand on a map (approximate);
-      // the officer map and queue mark it. null = an SOS from before this
-      // was recorded.
+      // the officer map and queue mark it. "node" = the SOS button on a
+      // sensor node (the point is the node's position). null = an SOS from
+      // before this was recorded.
       location_source: r.location_source ?? null,
+      // metres; above APPROX_LOCATION_M the officer views warn. null = unknown
+      location_accuracy_m: r.location_accuracy_m ?? null,
+      // which node's SOS button (location_source "node") or whose offline SOS
+      // Wi-Fi ("hotspot"); other device ids stay private
+      node_id: sosNodeId(r),
+      // offline SOS Wi-Fi only (else null / []): people count and needs
+      people: r.people ?? null,
+      needs: sosNeeds(r),
       escalated,
       minutes_open,
       nearest_hospital: route.hospital,
@@ -1005,7 +1513,19 @@ app.get("/api/sos", requireOfficerAuth, (req, res) => {
     success: true,
     count: data.length,
     escalated_count: data.filter((d) => d.escalated).length,
+    // rows left out of `data` (no usable coordinates), unlocated node SOS included
     invalid_location_count: rows.length - valid.length,
+    unlocated_node_sos: unlocatedNodeSos.map((r) => ({
+      id: r.id,
+      node_id: sosNodeId(r),
+      location_source: r.location_source,
+      people: r.people ?? null,
+      needs: sosNeeds(r),
+      note: r.note,
+      status: r.status,
+      timestamp: r.timestamp,
+      minutes_open: computeEscalation(r.status, r.timestamp).minutes_open,
+    })),
     data,
   });
 });
@@ -1075,7 +1595,12 @@ app.get("/api/hazard-zones", requireOfficerForPending, (req, res) => {
       longitude: r.longitude,
       radius_m: HAZARD_RADIUS_M[r.severity] || 500,
       confirmed: r.status === "alert_dispatched",
+      // severity from the weather forecast (area-wide), not this node's sensors
+      forecast_based: r.forecast_based === 1,
+      // readings.id of the confirmed alert (CAP XML / PDF / timeline); null while pending
+      alert_id: r.status === "alert_dispatched" ? confirmedAlertId(r.node_id, r.hazard_type) : null,
       ...hazardAge(r.timestamp),
+      ...confidenceFromRow(r),
     }));
   res.json({ success: true, zones });
 });
@@ -1109,13 +1634,61 @@ app.get("/api/satellite-check/:node_id", requireOfficerAuth, async (req, res) =>
 
 // Node health / missing-node alerts (officer-only), computed by the
 // Python backend from each node's last report, battery, signal and drift.
+// Each node also gets its village-siren block (null = no siren reported),
+// which this server - not the backend - keeps.
 app.get("/api/node-health", requireOfficerAuth, async (req, res) => {
   try {
     const pythonResponse = await axios.get(`${PYTHON_BACKEND_URL}/api/node-health`);
-    res.json(pythonResponse.data);
+    const health = pythonResponse.data;
+    if (health && Array.isArray(health.nodes)) {
+      for (const n of health.nodes) {
+        if (n && typeof n === "object") n.siren = n.node_id ? sirens.status(String(n.node_id)) : null;
+      }
+    }
+    res.json(health);
   } catch (error) {
     sendPipelineError(res, error);
   }
+});
+
+// --- Village siren (officer) ----------------------------------------------
+// Officers (and admins) see every node that reported a siren and can sound
+// or silence it. The answer is the DESIRED state: the node gets it in its
+// next ingest answer ("commands") and the views show "sounding" only once
+// the node itself reports it. Every action is audited (siren_audit table +
+// log). Works while the AI backend is down - nothing here needs it.
+app.get("/api/sirens", requireOfficerAuth, (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({
+    auto_severity: sirens.autoSeverity, // "CRITICAL" | "off"
+    auto_hazards: sirens.autoHazards, // SIREN_AUTO_HAZARDS (normalised: "gas_leak", "flash_flood", ...)
+    default_on_seconds: sirens.defaultOnSeconds,
+    sirens: sirens.list(),
+  });
+});
+
+app.get("/api/nodes/:node_id/siren", requireOfficerAuth, (req, res) => {
+  const status = sirens.status(req.params.node_id);
+  if (!status) return res.status(404).json({ error: `${req.params.node_id} has never reported a siren` });
+  res.set("Cache-Control", "no-store");
+  res.json({ siren: status, history: sirens.history(req.params.node_id) });
+});
+
+app.post("/api/nodes/:node_id/siren", requireOfficerAuth, (req, res) => {
+  const nodeId = req.params.node_id;
+  if (!NODE_ID_PATTERN.test(nodeId)) return res.status(400).json({ error: "invalid node id" });
+  const action = req.body?.action;
+  if (action !== "on" && action !== "off") {
+    return res.status(400).json({ error: "action must be \"on\" or \"off\"" });
+  }
+  const forS = req.body?.for_s;
+  if (forS != null && (action !== "on" || !Number.isInteger(forS) || forS < siren.MIN_ON_SECONDS || forS > siren.MAX_ON_SECONDS)) {
+    return res.status(400).json({
+      error: `for_s (only with "on") must be ${siren.MIN_ON_SECONDS}-${siren.MAX_ON_SECONDS} whole seconds`,
+    });
+  }
+  const { status, body } = sirens.officerAction(nodeId, action, forS ?? null, req.user.username);
+  res.status(status).json(body);
 });
 
 // Node registry (admin page). Admin role only: a node's coordinates, land
@@ -1225,6 +1798,576 @@ app.get("/api/admin/model-card", auth.requireAdmin, async (req, res) => {
   }
 });
 
+// --- Officer analytics, reports and risk-map data (step W1) --------------
+// Officer/admin-only proxies to the AI backend's analytics and report
+// endpoints. Same rules as the proxies above: OFFICER_API_KEY is added here
+// (never in the browser), a backend that is down answers 502 JSON, one that
+// hangs answers 504 after ANALYTICS_TIMEOUT_MS, and the backend's own
+// 401/403 (a key mismatch between the two servers) becomes 502, never a 401
+// that would bounce the officer to the login page (B53).
+const ANALYTICS_TIMEOUT_MS =
+  Math.max(100, parseInt(process.env.SANJEEVNI_ANALYTICS_TIMEOUT_MS || "15000", 10) || 15000);
+const TREND_RANGES = new Set(["24h", "7d", "30d"]);
+const SUMMARY_RANGES = new Set(["7d", "30d"]);
+const HOTSPOT_RANGE_DAYS = { "7d": 7, "30d": 30 };
+const ALERT_ID_PATTERN = /^[1-9][0-9]{0,11}$/; // a readings.id
+
+function backendGet(urlPath, { params, responseType = "json" } = {}) {
+  return axios.get(`${PYTHON_BACKEND_URL}${urlPath}`, {
+    params,
+    responseType,
+    timeout: ANALYTICS_TIMEOUT_MS,
+    maxRedirects: 0, // the backend is on loopback; never follow it anywhere else
+    headers: OFFICER_API_KEY ? { "X-API-Key": OFFICER_API_KEY } : undefined,
+  });
+}
+
+/** One query value from a fixed set; `fallback` when absent; null when invalid. */
+function queryChoice(value, allowed, fallback) {
+  if (value === undefined) return fallback;
+  return typeof value === "string" && allowed.has(value) ? value : null;
+}
+
+// The FastAPI error text, also from a text/binary (XML, PDF) response.
+function upstreamDetail(error) {
+  let data = error.response && error.response.data;
+  if (data instanceof ArrayBuffer || Buffer.isBuffer(data)) data = Buffer.from(data).toString("utf8");
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      return data.slice(0, 300) || null;
+    }
+  }
+  const detail = data && data.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) return detail.map((d) => d && d.msg).filter(Boolean).join("; ") || null;
+  return null;
+}
+
+function sendProxyError(res, error, what) {
+  if (!error.response) {
+    const timedOut = error.code === "ECONNABORTED" || error.code === "ETIMEDOUT" || /timeout/i.test(error.message || "");
+    console.error(`[proxy] ${what}: AI backend ${timedOut ? "timed out" : "unreachable"} - ${error.message}`);
+    return timedOut
+      ? res.status(504).json({ error: `The AI backend took too long to answer (${what}) - try again.`, code: "backend_timeout" })
+      : res.status(502).json({
+          error: `Can't reach the AI backend for ${what} - start backend_server.py, then try again.`,
+          code: "backend_unreachable",
+        });
+  }
+  if (upstreamAuthRejected(error)) return res.status(502).json({ error: UPSTREAM_AUTH_MESSAGE, code: "backend_auth" });
+  const status = error.response.status;
+  const detail = upstreamDetail(error);
+  // FastAPI's bare "Not Found" = a backend from before this endpoint existed
+  if (status === 404 && detail === "Not Found") {
+    return res.status(502).json({
+      error: `This AI backend has no endpoint for ${what} yet - update and restart backend_server.py.`,
+      code: "backend_outdated",
+    });
+  }
+  if (status >= 400 && status < 500) return res.status(status).json({ error: detail || `Request failed (HTTP ${status})` });
+  console.error(`[proxy] ${what}: AI backend answered HTTP ${status}${detail ? ` - ${detail}` : ""}`);
+  res.status(502).json({ error: `The AI backend failed on ${what} (HTTP ${status}).`, code: "backend_error" });
+}
+
+// Hotspots = where hazards keep coming back, as per-node, per-day counts.
+//   intensity = (elevated readings + half the MEDIUM ones) / readings
+// Elevated = a CONFIRMED (alert_dispatched) HIGH/CRITICAL alert assessed
+// from the node's OWN sensors. Review 2026-10-09: the backend's
+// /api/analytics/heatmap counts every row's severity - pending (unconfirmed)
+// rows and FORECAST-only heavy_rain / high_wind alerts too, which the
+// backend raises at EVERY node in the forecast area, so one regional rain
+// forecast made every node a hotspot (and disagreed with the district
+// summary's top_hotspots, analytics.py HOTSPOT_BASIS). So the counts are
+// read here from the shared readings table (as latestNodeValues does),
+// with the same exclusions as analytics.py: forecast-only rows
+// (severity_source 'weather_forecast' or confirmation 'forecast') are never
+// "elevated", and suppressed (sensor fault, raw values) / untimed (time
+// unknown) / rejected rows are not counted as readings. Only when that
+// query cannot run (a database from before those columns) does it fall
+// back to the backend's endpoint, and the note says what that counts.
+// The 0.1 / 0.3 class edges are a project choice for the demo (no official
+// standard exists for this) - tune them with real deployment data.
+//
+// THE HOTSPOT DEFINITION (kept stable on purpose - 2026-10-09): the
+// backend's district summary (analytics.py, summary.top_hotspots) is being
+// aligned to THIS map definition, so changing any of it needs the same
+// change there and in the frontend text (components/RiskLayers.tsx):
+//   per node over the last `days` UTC calendar days (7 or 30)
+//   readings  = every stored reading except suppressed / untimed /
+//               rejected / duplicate / error rows (simulated ones included)
+//   elevated  = status 'alert_dispatched' (confirmed), severity HIGH or
+//               CRITICAL, and NOT forecast-only (severity_source
+//               'weather_forecast' / confirmation 'forecast')
+//   medium    = the same, at severity MEDIUM
+//   intensity = min(1, (elevated + 0.5 * medium) / readings)
+//   level     = high >= 0.3, moderate >= 0.1, else low (HOTSPOT_LEVEL_EDGES)
+//   order     = intensity, then elevated count, then node id
+// The answer carries it in words as `definition` (+ `basis`).
+const HOTSPOT_LEVEL_EDGES = { moderate: 0.1, high: 0.3 };
+const HOTSPOT_DEFINITION =
+  "A hotspot is a node where hazards keep coming back. Intensity = (confirmed HIGH or CRITICAL alert readings " +
+  "+ half the confirmed MEDIUM ones) / all readings the node sent in the window; High from 30 %, Moderate from 10 % " +
+  "(project thresholds, not an official standard).";
+const HOTSPOT_BASIS =
+  "Elevated = a confirmed HIGH or CRITICAL alert from the node's own sensors; MEDIUM counts half. " +
+  "Area-wide weather-forecast alerts (heavy rain, high wind) and unconfirmed alerts are not counted.";
+const HOTSPOT_DATA_NOTE =
+  "Counts every stored reading in the window, simulated (demo) readings included. Nodes report more often " +
+  "while a hazard is elevated, so the share of elevated readings overstates the share of time spent " +
+  "elevated. Use it to compare places, not as a probability.";
+const HOTSPOT_FALLBACK_BASIS =
+  "Elevated = any HIGH or CRITICAL reading (MEDIUM counts half), unconfirmed alerts included, and area-wide " +
+  "weather-forecast alerts too - they are raised at every node in the forecast area and inflate every node.";
+const HOTSPOT_FALLBACK_NOTE =
+  "Counted by the AI backend from every stored reading, simulated (demo) readings included: this database " +
+  "has no forecast / confirmation columns yet (restart backend_server.py to add them). " + HOTSPOT_FALLBACK_BASIS;
+const FORECAST_ROW_SQL =
+  "(COALESCE(severity_source, '') = 'weather_forecast' OR COALESCE(confirmation, '') = 'forecast')";
+const NOT_A_READING_SQL = "COALESCE(status, '') IN ('suppressed', 'untimed', 'rejected', 'duplicate', 'error')";
+let selectHotspotDays = null;
+
+/** Per-node, per-day hotspot counts from the shared readings table; throws if the table / columns are missing. */
+function hotspotDayRows(fromDay) {
+  selectHotspotDays ??= db.prepare(`
+    SELECT node_id, substr(timestamp, 1, 10) AS day, COUNT(*) AS reading_count,
+      SUM(CASE WHEN status = 'alert_dispatched' AND NOT ${FORECAST_ROW_SQL}
+               AND severity IN ('HIGH', 'CRITICAL') THEN 1 ELSE 0 END) AS high_count,
+      SUM(CASE WHEN status = 'alert_dispatched' AND NOT ${FORECAST_ROW_SQL}
+               AND severity = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_count,
+      SUM(CASE WHEN ${FORECAST_ROW_SQL} AND status IN ('alert_dispatched', 'pending_confirmation')
+               THEN 1 ELSE 0 END) AS forecast_alert_count,
+      SUM(CASE WHEN COALESCE(simulated, 0) = 1 THEN 1 ELSE 0 END) AS simulated_count,
+      MAX(CASE WHEN NOT ${FORECAST_ROW_SQL} THEN risk_score END) AS max_risk_score
+    FROM readings
+    WHERE timestamp >= ? AND NOT ${NOT_A_READING_SQL}
+    GROUP BY node_id, day`);
+  // "timestamp >= 'YYYY-MM-DD'" can use the backend's timestamp index; the
+  // exact day cut is aggregateHotspots' (the same substr day as the backend)
+  return selectHotspotDays.all(fromDay).map((r) => {
+    const info = nodeInfo(r.node_id);
+    return { ...r, location: info?.location ?? r.node_id, latitude: info?.latitude ?? null, longitude: info?.longitude ?? null };
+  });
+}
+
+function hotspotWindowStart(days, now = new Date()) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (days - 1)))
+    .toISOString().slice(0, 10);
+}
+
+function aggregateHotspots(rows, days, now = new Date()) {
+  const from = hotspotWindowStart(days, now);
+  const kept = rows.filter((r) => r && typeof r.day === "string" && r.day >= from && typeof r.node_id === "string");
+  const byNode = new Map();
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  for (const r of kept) {
+    let h = byNode.get(r.node_id);
+    if (!h) {
+      h = { node_id: r.node_id, location: r.location ?? r.node_id, latitude: null, longitude: null,
+            reading_count: 0, high_count: 0, medium_count: 0, max_risk_score: null, days_reported: 0, days_with_high: 0 };
+      byNode.set(r.node_id, h);
+    }
+    // the registry position the backend attached (latest row wins - same node)
+    if (typeof r.latitude === "number" && typeof r.longitude === "number") {
+      h.latitude = r.latitude;
+      h.longitude = r.longitude;
+    }
+    h.reading_count += num(r.reading_count);
+    h.high_count += num(r.high_count);
+    h.medium_count += num(r.medium_count);
+    h.days_reported += 1;
+    if (num(r.high_count) > 0) h.days_with_high += 1;
+    if (typeof r.max_risk_score === "number" && Number.isFinite(r.max_risk_score)) {
+      h.max_risk_score = h.max_risk_score == null ? r.max_risk_score : Math.max(h.max_risk_score, r.max_risk_score);
+    }
+  }
+  const hotspots = [...byNode.values()].map((h) => {
+    const intensity = h.reading_count > 0 ? Math.min(1, (h.high_count + 0.5 * h.medium_count) / h.reading_count) : 0;
+    const level = intensity >= HOTSPOT_LEVEL_EDGES.high ? "high" : intensity >= HOTSPOT_LEVEL_EDGES.moderate ? "moderate" : "low";
+    return { ...h, intensity: Math.round(intensity * 1000) / 1000, level };
+  });
+  hotspots.sort((a, b) => b.intensity - a.intensity || b.high_count - a.high_count || a.node_id.localeCompare(b.node_id));
+  return { from_day: from, rows: kept, hotspots };
+}
+
+app.get("/api/officer/heatmap", requireOfficerAuth, async (req, res) => {
+  const range = queryChoice(req.query.range, new Set(Object.keys(HOTSPOT_RANGE_DAYS)), "30d");
+  if (!range) return res.status(400).json({ error: "range must be 7d or 30d" });
+  try {
+    let rows;
+    let source = "readings";
+    try {
+      rows = hotspotDayRows(hotspotWindowStart(HOTSPOT_RANGE_DAYS[range]));
+    } catch (e) {
+      // no readings table yet, or one without the forecast / confirmation
+      // columns: the backend's own (unfiltered) counts, labelled as such
+      console.warn(`[hotspots] shared readings table not usable (${e.message}) - using the AI backend's heatmap`);
+      source = "backend";
+      const upstream = await backendGet("/api/analytics/heatmap");
+      rows = upstream.data && upstream.data.heatmap_data;
+    }
+    if (!Array.isArray(rows)) {
+      return res.status(502).json({ error: "The AI backend sent something that is not heatmap data.", code: "backend_error" });
+    }
+    const { from_day, rows: kept, hotspots } = aggregateHotspots(rows, HOTSPOT_RANGE_DAYS[range]);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      range,
+      days: HOTSPOT_RANGE_DAYS[range],
+      from_day, // UTC calendar day the window starts on
+      generated_at: new Date().toISOString(),
+      source, // "readings": measured + confirmed only | "backend": fallback, every row counted
+      definition: HOTSPOT_DEFINITION, // the stable definition above, in words
+      basis: source === "readings" ? HOTSPOT_BASIS : HOTSPOT_FALLBACK_BASIS,
+      data_note: source === "readings" ? HOTSPOT_DATA_NOTE : HOTSPOT_FALLBACK_NOTE,
+      level_edges: HOTSPOT_LEVEL_EDGES,
+      hotspots,
+      heatmap_data: kept, // the per-node, per-day rows inside the window
+    });
+  } catch (error) {
+    sendProxyError(res, error, "the hotspot map");
+  }
+});
+
+app.get("/api/officer/trends", requireOfficerAuth, async (req, res) => {
+  const nodeId = req.query.node_id;
+  if (typeof nodeId !== "string" || !ADMIN_NODE_ID.test(nodeId)) {
+    return res.status(400).json({ error: "node_id is required (1-12 letters, digits, - or _)" });
+  }
+  const range = queryChoice(req.query.range, TREND_RANGES, "24h");
+  if (!range) return res.status(400).json({ error: "range must be 24h, 7d or 30d" });
+  try {
+    const upstream = await backendGet("/api/analytics/trends", { params: { node_id: nodeId, range } });
+    res.set("Cache-Control", "no-store");
+    res.json(upstream.data);
+  } catch (error) {
+    sendProxyError(res, error, "trends");
+  }
+});
+
+app.get("/api/officer/summary", requireOfficerAuth, async (req, res) => {
+  const range = queryChoice(req.query.range, SUMMARY_RANGES, "7d");
+  if (!range) return res.status(400).json({ error: "range must be 7d or 30d" });
+  try {
+    const upstream = await backendGet("/api/analytics/summary", { params: { range } });
+    res.set("Cache-Control", "no-store");
+    res.json(upstream.data);
+  } catch (error) {
+    sendProxyError(res, error, "the analytics summary");
+  }
+});
+
+app.get("/api/officer/alerts/:id/cap", requireOfficerAuth, async (req, res) => {
+  if (!ALERT_ID_PATTERN.test(req.params.id)) return res.status(400).json({ error: "alert id must be a positive whole number" });
+  try {
+    const upstream = await backendGet(`/api/alerts/${req.params.id}/cap`, { responseType: "text" });
+    res.set("Cache-Control", "no-store");
+    res.type("application/xml").send(upstream.data);
+  } catch (error) {
+    sendProxyError(res, error, "the CAP export");
+  }
+});
+
+app.get("/api/officer/alerts/:id/report.pdf", requireOfficerAuth, async (req, res) => {
+  if (!ALERT_ID_PATTERN.test(req.params.id)) return res.status(400).json({ error: "alert id must be a positive whole number" });
+  try {
+    const upstream = await backendGet(`/api/reports/${req.params.id}/pdf`, { responseType: "arraybuffer" });
+    res.set({
+      "Cache-Control": "no-store",
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="sanjeevni_situation_report_${req.params.id}.pdf"`,
+    });
+    res.send(Buffer.from(upstream.data));
+  } catch (error) {
+    sendProxyError(res, error, "the situation report");
+  }
+});
+
+app.get("/api/officer/timeline/:node_id", requireOfficerAuth, async (req, res) => {
+  const nodeId = req.params.node_id;
+  if (!ADMIN_NODE_ID.test(nodeId)) return res.status(400).json({ error: "invalid node id" });
+  const params = {};
+  if (req.query.around_id !== undefined) {
+    if (typeof req.query.around_id !== "string" || !ALERT_ID_PATTERN.test(req.query.around_id)) {
+      return res.status(400).json({ error: "around_id must be a positive whole number" });
+    }
+    params.around_id = req.query.around_id;
+  }
+  if (req.query.window !== undefined) {
+    const w = Number(req.query.window);
+    if (!Number.isInteger(w) || w < 1 || w > 500) return res.status(400).json({ error: "window must be 1-500" });
+    params.window = w;
+  }
+  try {
+    const upstream = await backendGet(`/api/events/${encodeURIComponent(nodeId)}/timeline`, { params });
+    res.set("Cache-Control", "no-store");
+    res.json(upstream.data);
+  } catch (error) {
+    sendProxyError(res, error, "the event timeline");
+  }
+});
+
+// Latest value of every sensor a node has, for the officer map's node popup
+// and side panel. Read straight from the readings table the AI backend
+// writes (the same shared sanjeevni.db nodeInfo() reads), so it works while
+// the backend is down. Only these fields leave the server - never the
+// whole row. Per field:
+//   ok            - in the newest reading
+//   fault         - dropped as physically impossible (sensor_faults)
+//   not_in_latest - missing now, but reported recently (last_value/last_at)
+//   no_sensor     - not in any recent reading: no such sensor fitted
+// "Newest" is by reading time, not row id: a store-and-forward backlog
+// arrives after live readings. "untimed" backlog rows (time unknown) and
+// rejected/duplicate ones are skipped.
+const NODE_VALUE_FIELDS = [
+  "river_level_m", "river_level_rate_m_per_hr", "temp_c", "humidity_pct", "gas_ppm", "flame_reading",
+  "pm25_ugm3", "pm10_ugm3", "tilt_angle_deg", "vibration_magnitude", "soil_moisture_pct",
+  "water_ph", "turbidity_ntu", "rainfall_24h_mm", "battery_pct", "signal_strength_dbm",
+];
+const RECENT_READINGS_FOR_VALUES = 20;
+const SKIPPED_VALUE_STATUSES = new Set(["untimed", "rejected", "duplicate", "error"]);
+let selectRecentReadings = null;
+
+function latestNodeValues(nodeId) {
+  let rows = [];
+  try {
+    // Newest by READING time in SQL (review 2026-10-09): picking the 20
+    // newest ids first and sorting them afterwards showed an old reading as
+    // "latest" when a backlog of 20+ old readings arrived after the live
+    // one. julianday() compares instants (any UTC offset, fractional
+    // seconds); an unparsable time sorts last.
+    selectRecentReadings ??= db.prepare(
+      "SELECT * FROM readings WHERE node_id = ? " +
+      `AND COALESCE(status, '') NOT IN (${[...SKIPPED_VALUE_STATUSES].map((s) => `'${s}'`).join(", ")}) ` +
+      "ORDER BY julianday(timestamp) DESC, id DESC LIMIT ?",
+    );
+    rows = selectRecentReadings.all(nodeId, RECENT_READINGS_FOR_VALUES);
+  } catch {
+    rows = []; // backend not started yet -> no readings table yet
+  }
+  const timeOf = (r) => {
+    const t = Date.parse(r.timestamp);
+    return Number.isFinite(t) ? t : -Infinity;
+  };
+  const usable = rows.filter((r) => !SKIPPED_VALUE_STATUSES.has(r.status)).sort((a, b) => timeOf(b) - timeOf(a) || b.id - a.id);
+  const latest = usable[0];
+  if (!latest) return null;
+  const finite = (v) => typeof v === "number" && Number.isFinite(v);
+  const faults = new Set(String(latest.sensor_faults || "").split(",").map((s) => s.trim()).filter(Boolean));
+  const values = {};
+  for (const field of NODE_VALUE_FIELDS) {
+    if (finite(latest[field])) {
+      values[field] = { value: latest[field], state: "ok" };
+      continue;
+    }
+    const earlier = usable.find((r) => finite(r[field]));
+    const last = earlier ? { last_value: earlier[field], last_at: earlier.timestamp } : {};
+    values[field] = faults.has(field) ? { value: null, state: "fault", ...last }
+      : earlier ? { value: null, state: "not_in_latest", ...last }
+      : { value: null, state: "no_sensor" };
+  }
+  return {
+    reading_id: latest.id,
+    reading_at: latest.timestamp || null,
+    simulated: latest.simulated === 1,
+    link: latest.link || null,
+    hazard_type: latest.hazard_type || null,
+    severity: latest.severity || null,
+    status: latest.status || null,
+    sensor_faults: [...faults],
+    edge_anomaly: String(latest.edge_anomaly || "").split(",").map((s) => s.trim()).filter(Boolean),
+    values,
+  };
+}
+
+app.get("/api/officer/nodes/:node_id/latest", requireOfficerAuth, (req, res) => {
+  const nodeId = req.params.node_id;
+  if (!ADMIN_NODE_ID.test(nodeId)) return res.status(400).json({ error: "invalid node id" });
+  let siren = null;
+  try {
+    siren = sirens.status(nodeId);
+  } catch (e) {
+    console.error(`[siren] status for ${nodeId} failed: ${e.message}`);
+  }
+  const info = nodeInfo(nodeId);
+  res.set("Cache-Control", "no-store");
+  res.json({ node_id: nodeId, location: info ? info.location : null, latest: latestNodeValues(nodeId), siren });
+});
+
+// --- Public CAP (confirmed alerts only) -------------------------------------
+// Anyone may fetch these, like a SACHET-style feed reader. Confirmed means
+// the backend dispatched it (status "alert_dispatched"); this server checks
+// that itself in the shared database before asking the backend, so a
+// pending or logged reading id is a 404 even if the backend changes. A
+// simulated alert comes out with CAP <status>Exercise</status> (cap_alert.py).
+let selectAlertStatus = null;
+function isConfirmedAlert(id) {
+  try {
+    selectAlertStatus ??= db.prepare("SELECT status FROM readings WHERE id = ?");
+    const row = selectAlertStatus.get(Number(id));
+    return !!row && row.status === "alert_dispatched";
+  } catch {
+    return false;
+  }
+}
+
+// --- Confirmed alerts by id (step W2) ----------------------------------------
+// The dashboard table (sensor_data) has no link to the backend's readings
+// row, but CAP XML, the PDF situation report and the timeline are all keyed
+// by readings.id. Both are written for the same AI result, so the newest
+// CONFIRMED readings row for that node + hazard type is the alert behind a
+// confirmed hazard card / zone. Read from the shared database (like
+// latestNodeValues), so it costs no backend call; null when the backend
+// has not created its table yet or the row is gone.
+let selectLatestConfirmedAlert = null;
+function confirmedAlertId(nodeId, hazardType) {
+  if (!nodeId || !hazardType) return null;
+  try {
+    selectLatestConfirmedAlert ??= db.prepare(
+      "SELECT id FROM readings WHERE node_id = ? AND hazard_type = ? AND status = 'alert_dispatched' " +
+      "ORDER BY id DESC LIMIT 1",
+    );
+    const row = selectLatestConfirmedAlert.get(nodeId, hazardType);
+    return row ? row.id : null;
+  } catch {
+    return null;
+  }
+}
+
+// GET /api/officer/alerts?node_id=&range=24h|7d|30d&limit=1..200
+// Confirmed (dispatched) alerts, newest first, for the trends page's alert
+// list and its CAP / PDF / timeline buttons. Only these fields leave the
+// server. The time filter runs here on the parsed timestamp (the backend's
+// timestamp text format is not guaranteed to sort as a string).
+const ALERT_LIST_RANGE_MS = { "24h": 86_400_000, "7d": 7 * 86_400_000, "30d": 30 * 86_400_000 };
+const ALERT_LIST_SCAN = 2000; // newest confirmed rows looked at per request
+let selectConfirmedAlerts = null;
+let selectConfirmedAlertsForNode = null;
+
+app.get("/api/officer/alerts", requireOfficerAuth, (req, res) => {
+  const nodeId = req.query.node_id;
+  if (nodeId !== undefined && (typeof nodeId !== "string" || !ADMIN_NODE_ID.test(nodeId))) {
+    return res.status(400).json({ error: "invalid node id" });
+  }
+  const range = queryChoice(req.query.range, TREND_RANGES, "7d");
+  if (!range) return res.status(400).json({ error: "range must be 24h, 7d or 30d" });
+  let limit = 50;
+  if (req.query.limit !== undefined) {
+    limit = Number(req.query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return res.status(400).json({ error: "limit must be 1-200" });
+  }
+  let rows = [];
+  try {
+    const cols = "id, node_id, timestamp, hazard_type, severity, risk_score, simulated";
+    if (nodeId) {
+      selectConfirmedAlertsForNode ??= db.prepare(
+        `SELECT ${cols} FROM readings WHERE status = 'alert_dispatched' AND node_id = ? ORDER BY id DESC LIMIT ?`);
+      rows = selectConfirmedAlertsForNode.all(nodeId, ALERT_LIST_SCAN);
+    } else {
+      selectConfirmedAlerts ??= db.prepare(
+        `SELECT ${cols} FROM readings WHERE status = 'alert_dispatched' ORDER BY id DESC LIMIT ?`);
+      rows = selectConfirmedAlerts.all(ALERT_LIST_SCAN);
+    }
+  } catch {
+    rows = []; // backend not started yet -> no readings table
+  }
+  const since = Date.now() - ALERT_LIST_RANGE_MS[range];
+  const alerts = rows
+    .map((r) => ({ ...r, t: Date.parse(r.timestamp) }))
+    .filter((r) => Number.isFinite(r.t) && r.t >= since)
+    .sort((a, b) => b.t - a.t || b.id - a.id)
+    .slice(0, limit)
+    .map((r) => {
+      const info = nodeInfo(r.node_id);
+      return {
+        id: r.id,
+        node_id: r.node_id,
+        location: (info && info.location) || r.node_id,
+        timestamp: r.timestamp,
+        hazard_type: r.hazard_type,
+        severity: r.severity,
+        risk_score: typeof r.risk_score === "number" ? r.risk_score : null,
+        simulated: r.simulated === 1,
+      };
+    });
+  res.set("Cache-Control", "no-store");
+  res.json({ range, node_id: nodeId ?? null, generated_at: new Date().toISOString(), count: alerts.length, alerts });
+});
+
+//
+// These routes are public and unauthenticated, and the AI backend is the
+// ingest bottleneck (tools/loadtest: a few readings/s on one core), so
+// anonymous polling must not compete with alert ingestion for its CPU
+// (review 2026-10-09):
+//  - each answer is kept in memory for CAP_CACHE_MS (30 s default,
+//    SANJEEVNI_CAP_CACHE_MS; 0 = off). A feed reader polling every minute
+//    and a crowd opening the same alert cost ONE backend call per 30 s;
+//    concurrent misses for the same URL share one backend request;
+//  - a request that would reach the backend (a cache miss) is limited to
+//    CAP_MISSES_PER_MIN per network (req.ip). Cache hits are never limited,
+//    so many phones behind one mobile-carrier NAT still get the feed.
+// Errors are never cached. Demo defaults, not from a standard.
+const CAP_CACHE_MS = (() => {
+  const v = Number(process.env.SANJEEVNI_CAP_CACHE_MS ?? 30_000);
+  return Number.isFinite(v) && v >= 0 ? Math.min(v, 10 * 60_000) : 30_000;
+})();
+const CAP_MISSES_PER_MIN = 30;
+const CAP_CACHE_MAX_ENTRIES = 500;
+const capMissesPerNetwork = makeRateLimiter(60_000, CAP_MISSES_PER_MIN);
+const capCache = new Map(); // backend path -> { at, body } | { pending: Promise }
+
+async function cachedCapGet(req, res, backendPath, contentType, what) {
+  const now = Date.now();
+  const hit = capCache.get(backendPath);
+  let body;
+  if (hit && hit.body !== undefined && now - hit.at < CAP_CACHE_MS) {
+    body = hit.body;
+  } else {
+    try {
+      if (hit && hit.pending) {
+        body = await hit.pending;
+      } else {
+        if (capMissesPerNetwork(req.ip)) {
+          res.set("Retry-After", "60");
+          return res.status(429).json({ error: "Too many CAP requests from this network - try again in a minute.",
+            code: "rate_limited" });
+        }
+        const pending = backendGet(backendPath, { responseType: "text" }).then((r) => r.data);
+        capCache.set(backendPath, { pending });
+        try {
+          body = await pending;
+        } catch (error) {
+          capCache.delete(backendPath); // never cache an error
+          throw error;
+        }
+        if (CAP_CACHE_MS > 0) {
+          if (capCache.size > CAP_CACHE_MAX_ENTRIES) {
+            for (const [k, e] of capCache) if (e.body !== undefined && now - e.at >= CAP_CACHE_MS) capCache.delete(k);
+            if (capCache.size > CAP_CACHE_MAX_ENTRIES) capCache.clear();
+          }
+          capCache.set(backendPath, { at: Date.now(), body });
+        } else {
+          capCache.delete(backendPath);
+        }
+      }
+    } catch (error) {
+      return sendProxyError(res, error, what);
+    }
+  }
+  res.set("Cache-Control", "public, max-age=60");
+  res.type(contentType).send(body);
+}
+
+app.get(/^\/cap\/alerts\/([1-9][0-9]{0,11})\.xml$/, (req, res) => {
+  const id = req.params[0];
+  if (!isConfirmedAlert(id)) return res.status(404).json({ error: "No confirmed alert with that id" });
+  return cachedCapGet(req, res, `/api/alerts/${id}/cap`, "application/xml", "the CAP alert");
+});
+
+app.get("/cap/feed.atom", (req, res) =>
+  cachedCapGet(req, res, "/api/cap/feed.atom", "application/atom+xml", "the CAP feed"));
+
 // 9. Active hazards, numbered, for the dashboard list - location, AI risk
 // score, and a plain-language prediction of when it may reach critical level,
 // based on the eta_minutes/predicted_time the AI backend already computed.
@@ -1244,10 +2387,17 @@ app.get("/api/hazards", (req, res) => {
       longitude: r.longitude,
       eta_minutes: r.eta_minutes,
       predicted_time: r.predicted_time,
+      // severity from the weather forecast (area-wide), not this node's sensors
+      forecast_based: r.forecast_based === 1,
+      // readings.id of this confirmed alert: public CAP XML at /cap/alerts/<id>.xml
+      alert_id: confirmedAlertId(r.node_id, r.hazard_type),
       ...age,
       prediction_text: age.stale
         ? "No recent reading from this node - last known state only"
         : etaText(r.hazard_type, r.severity, r.eta_minutes, r.predicted_time),
+      // Shown next to the severity, never used to re-order the list: the
+      // most severe hazard stays on top even when it is the least certain.
+      ...confidenceFromRow(r),
     };
   });
 
@@ -1623,6 +2773,39 @@ function loadHazardAdvice() {
 }
 const { advice: HAZARD_ADVICE, fallback: HAZARD_ADVICE_FALLBACK } = loadHazardAdvice();
 
+// WhatsApp alerts to officers' own phones (users.phone, set with
+// create_user.js --phone / set-phone) - see officer_alerts.js. Same dry-run
+// and simulated-reading rules as the citizen alerts above.
+const officerAlerts = setupOfficerAlerts(db, {
+  send: sendWhatsAppTemplate,
+  dryRun: WHATSAPP_DRY_RUN,
+  allowSimulated: WHATSAPP_ALERTS_FOR_SIMULATED,
+  template: process.env.OFFICER_WHATSAPP_TEMPLATE || "sanjeevni_officer_alert",
+  templateLang: process.env.OFFICER_WHATSAPP_TEMPLATE_LANG || "en",
+  minSeverity: process.env.OFFICER_ALERT_MIN_SEVERITY,
+  publicBaseUrl: process.env.SANJEEVNI_PUBLIC_BASE_URL || "",
+  nodeLocation: (nodeId) => nodeInfo(nodeId)?.location || null,
+  confidenceSummary,
+});
+
+// The citizen advice table for the classic SOS page (public/sos.html; the
+// React page bundles it at build time). Public, read-only, the same file
+// the WhatsApp {{4}} lines above come from.
+app.get("/hazard-advice.json", (req, res) => {
+  res.set("Cache-Control", "public, max-age=300");
+  res.sendFile(paths.HAZARD_ADVICE_FILE, (err) => {
+    if (err && !res.headersSent) res.status(404).json({ error: "advice table not available" });
+  });
+});
+
+// Admin audit: who was (or, in dry run, would have been) messaged, newest
+// first. Phone numbers are masked.
+app.get("/api/admin/officer-alerts", auth.requireAdmin, (req, res) => {
+  const n = Number(req.query.limit ?? 50);
+  if (!Number.isInteger(n) || n < 1 || n > 500) return res.status(400).json({ error: "limit must be 1-500" });
+  res.json({ dry_run: WHATSAPP_DRY_RUN, min_severity: officerAlerts.minSeverity, alerts: officerAlerts.recent(n) });
+});
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS whatsapp_subscribers (
     phone TEXT PRIMARY KEY,
@@ -1723,9 +2906,15 @@ async function notifySubscribersOfAlert(alert) {
   if (alert.latitude == null || alert.longitude == null) return 0;
 
   const reachKm = ((HAZARD_RADIUS_M[alert.severity] || 500) + WHATSAPP_ALERT_BUFFER_M) / 1000;
+  // The confidence label rides in the severity variable ({{2}}): the
+  // approved template has exactly 4 variables, and adding a 5th would need
+  // a new Meta template approval. With the example template it reads
+  // "flood risk is CRITICAL, confidence High (82%) near ...".
+  const confidence = confidenceSummary(alert);
   const params = [
-    alert.hazard_type,
-    alert.severity,
+    // "flash_flood" -> "flash flood" (the other types already use spaces)
+    String(alert.hazard_type).replace(/_/g, " "),
+    confidence ? `${alert.severity}, confidence ${confidence}` : alert.severity,
     alert.location || alert.node_id,
     HAZARD_ADVICE[alert.hazard_type] || HAZARD_ADVICE_FALLBACK,
   ].map((p) => String(p).replace(/[\n\t]+/g, " ").replace(/ {4,}/g, " "));

@@ -11,6 +11,7 @@ import {
   ALERT_TITLE_PREFIX,
   alarmingItems,
   alarmSoundPref,
+  nodeListText,
   readAcks,
   refreshAcks,
   writeAcks,
@@ -18,6 +19,8 @@ import {
   type AlarmItem,
 } from "../lib/alarm";
 import { hazardIcon, percent } from "../lib/hazards";
+import { PublicAdviceSection } from "./PublicAdvice";
+import { Confidence } from "./Confidence";
 import { siren } from "../lib/siren";
 import styles from "./EmergencyAlarm.module.css";
 
@@ -42,7 +45,9 @@ const UNLOCK_EVENTS = ["pointerdown", "pointerup", "keydown", "touchend", "click
 /** Marks a control that unlocks audio itself, so the page-wide gesture listener leaves it alone. */
 const OWN_UNLOCK_ATTR = "data-own-audio-unlock"; // keep in sync with AlarmSoundToggle
 
-const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+// details > summary: the "What the public is told" toggle is a tab stop too - without it the
+// wrap from Acknowledge skipped the first item's toggle (W2 browser check)
+const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), details > summary:first-of-type, [tabindex]:not([tabindex="-1"])';
 
 function useSoundOn(): boolean {
   return useSyncExternalStore(alarmSoundPref.subscribe, alarmSoundPref.get, alarmSoundPref.get);
@@ -52,8 +57,14 @@ function useAudioUnlocked(): boolean {
   return useSyncExternalStore(siren.subscribe, siren.isUnlocked, siren.isUnlocked);
 }
 
+/** Where the hazard is, for the Location line. An area-wide forecast item names its nodes. */
 const placeText = (item: AlarmItem) =>
-  item.location && item.location !== item.nodeId ? `${item.location} (${item.nodeId})` : item.nodeId;
+  item.forecastNodeIds
+    ? `Forecast area: ${nodeListText(item.forecastNodeIds)}`
+    : item.location && item.location !== item.nodeId ? `${item.location} (${item.nodeId})` : item.nodeId;
+/** "at Sector 4 (NODE-04)" / "across the forecast area (NODE-01, NODE-02)" - for sentences. */
+const whereText = (item: AlarmItem) =>
+  item.forecastNodeIds ? `across the forecast area (${nodeListText(item.forecastNodeIds)})` : `at ${placeText(item)}`;
 
 /**
  * returnFocusTo: id of an element to focus when the dialog closes and there is
@@ -304,7 +315,7 @@ export function EmergencyAlarm({
     const f = fresh[0]; // alarming is sorted most severe first
     const n = alarming.length;
     setAnnouncement(
-      `New ${f.severity} hazard: ${f.title} at ${placeText(f)}.` +
+      `New ${f.severity} hazard: ${f.title} ${whereText(f)}.` +
         (fresh.length > 1 ? ` ${fresh.length - 1} more new.` : "") +
         ` ${n} ${n === 1 ? "hazard needs" : "hazards need"} attention.`,
     );
@@ -317,8 +328,8 @@ export function EmergencyAlarm({
   const count = alarming.length;
   const summary =
     count === 1
-      ? `${top.title}: ${top.severity} risk at ${placeText(top)}. Acknowledge to silence the alarm.`
-      : `${count} hazards need immediate attention. Most severe: ${top.title}, ${top.severity} at ${placeText(top)}.`;
+      ? `${top.title}: ${top.severity} risk ${whereText(top)}. Acknowledge to silence the alarm.`
+      : `${count} hazards need immediate attention. Most severe: ${top.title}, ${top.severity} ${whereText(top)}.`;
   const needsSoundButton = supported && soundOn && !unlocked;
 
   return createPortal(
@@ -347,7 +358,7 @@ export function EmergencyAlarm({
             {alarming.map((item) => (
               <li key={item.key} className={`${styles.item} ${item.severity === "CRITICAL" ? styles.itemCritical : ""}`}>
                 <div className={styles.itemHead}>
-                  <span className={styles.itemIcon} aria-hidden="true">{hazardIcon(item.title.toLowerCase())}</span>
+                  <span className={styles.itemIcon} aria-hidden="true">{hazardIcon(item.hazardType)}</span>
                   <h3 className={styles.itemTitle}>{item.title}</h3>
                   <span className={`${styles.badge} ${item.severity === "CRITICAL" ? styles.badgeCritical : ""}`}>
                     {item.severity}
@@ -363,12 +374,15 @@ export function EmergencyAlarm({
                     <dd>{percent(item.riskScore)}</dd>
                   </div>
                 </dl>
+                <Confidence value={item.confidence} maxReasons={3} />
                 {item.detail && <p className={styles.detail}>{item.detail}</p>}
+                <PublicAdviceSection hazardType={item.hazardType} severity={item.severity}
+                                     label={`${item.title} ${whereText(item)}`} />
                 {onShow && (
                   <button
                     type="button"
                     className={styles.showBtn}
-                    aria-label={`Show ${item.title} at ${placeText(item)}`}
+                    aria-label={`Show ${item.title} ${whereText(item)}`}
                     data-own-audio-unlock=""
                     onClick={() => show(item)}
                   >

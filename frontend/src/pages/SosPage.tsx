@@ -5,7 +5,9 @@ import type { DeviceSosStatus, HazardZonesResponse, LocationSource, NearestHospi
 import { hazardActions, hazardName } from "../lib/advice";
 import { hazardIcon, isSevere } from "../lib/hazards";
 import { STRING_KEYS, t, type Lang, type StringKey } from "../lib/i18n";
-import { evaluateArea, newDeviceId, sosGate, type Coords, type SosHint } from "../lib/sos";
+import {
+  accuracyOrNull, evaluateArea, formatAccuracy, isApproximateFix, newDeviceId, sosGate, type Coords, type SosHint,
+} from "../lib/sos";
 import { readStored, writeStored } from "../lib/storage";
 import styles from "./Sos.module.css";
 
@@ -48,14 +50,25 @@ class LocationError extends Error {
   }
 }
 
-function getPosition(options: PositionOptions = GEO_OPTIONS): Promise<Coords> {
+/**
+ * A position from the device, with how far off it may be (coords.accuracy,
+ * metres; null if the browser gave none). A device without GPS still answers,
+ * from Wi-Fi / cell / IP positioning - sometimes kilometres off.
+ */
+type DeviceFix = Coords & { accuracy_m: number | null };
+
+function getPosition(options: PositionOptions = GEO_OPTIONS): Promise<DeviceFix> {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) {
       reject(new LocationError("Location is not supported on this device or browser", null));
       return;
     }
     navigator.geolocation.getCurrentPosition(
-      (p) => resolve({ latitude: p.coords.latitude, longitude: p.coords.longitude }),
+      (p) => resolve({
+        latitude: p.coords.latitude,
+        longitude: p.coords.longitude,
+        accuracy_m: accuracyOrNull(p.coords.accuracy),
+      }),
       (err) => reject(new LocationError(err.message, err.code)),
       options,
     );
@@ -65,7 +78,7 @@ function getPosition(options: PositionOptions = GEO_OPTIONS): Promise<Coords> {
 const isPermissionDenied = (err: unknown) => err instanceof LocationError && err.code === PERMISSION_DENIED;
 
 /** Precise fix first; if that fails for any reason but "denied", a quick coarse one. */
-async function getSosPosition(): Promise<Coords> {
+async function getSosPosition(): Promise<DeviceFix> {
   try {
     return await getPosition();
   } catch (err) {
@@ -95,6 +108,8 @@ type LocateMsg = { key: StringKey; params?: Record<string, string>; suffix?: Str
 const locateMessage = (lang: Lang, m: LocateMsg) =>
   [t(lang, m.key, m.params), ...(m.suffix ?? []).map((k) => t(lang, k))].join(" ");
 const coordParams = (c: Coords) => ({ lat: c.latitude.toFixed(4), lon: c.longitude.toFixed(4) });
+/** Just the position (a DeviceFix carries accuracy_m too) */
+const plainCoords = (c: Coords): Coords => ({ latitude: c.latitude, longitude: c.longitude });
 /** The SOS went out without a fresh device fix: with the earlier fix (B54) or the point set on the map */
 type SentWith = { kind: "earlier" | "manual"; coords: Coords } | null;
 
@@ -181,6 +196,8 @@ export function SosPage() {
   const [lang, setLang] = useState<Lang>(() => (readStored("sanjeevni_lang") === "hi" ? "hi" : "en"));
   const deviceId = useDeviceId();
   const [coords, setCoords] = useState<Coords | null>(null);
+  /** accuracy of coords in metres while it is a device fix (null: unknown, or a point set by hand) */
+  const [accuracyM, setAccuracyM] = useState<number | null>(null);
   /** "manual" = coords is a point the person set on the map (no device fix) */
   const [locationSource, setLocationSource] = useState<"gps" | "manual">("gps");
   // read by locate(): the page-open locate can finish after the person set a point
@@ -262,9 +279,20 @@ export function SosPage() {
     wasActive.current = deviceActive;
   }, [deviceSos.data, deviceActive]);
 
-  /** A device fix always replaces a point set by hand on the map. */
-  function applyDeviceFix(c: Coords, replacedManual: boolean, sentInstead = false) {
-    setCoords(c);
+  /**
+   * A device fix replaces a point set by hand on the map - unless the fix is
+   * only approximate: the person may have set the point exactly BECAUSE the
+   * device's own position was kilometres off, so a coarse fix must not move
+   * it back. Returns false when the hand-set point was kept.
+   */
+  function applyDeviceFix(c: DeviceFix, replacedManual: boolean, sentInstead = false): boolean {
+    if (replacedManual && c.accuracy_m !== null && isApproximateFix(c.accuracy_m)) {
+      // HUMAN REVIEW: safety-critical citizen text (locApproxManualKept in lib/i18n.ts, Hindi unreviewed)
+      setLocateMsg({ key: "locApproxManualKept", params: { acc: formatAccuracy(c.accuracy_m) } });
+      return false;
+    }
+    setCoords(plainCoords(c));
+    setAccuracyM(c.accuracy_m);
     setLocationSource("gps");
     setManualOpen(false);
     setManualError(null);
@@ -274,6 +302,7 @@ export function SosPage() {
       params: coordParams(c),
       suffix: sentInstead ? ["locSentInstead"] : replacedManual ? ["locReplacesManual"] : [],
     });
+    return true;
   }
 
   async function locate(silent: boolean) {
@@ -316,6 +345,7 @@ export function SosPage() {
     // then matches the fields (Leaflet's wrap() leaves float noise like 79.45420000000001)
     const c = { latitude: Number(picked.latitude.toFixed(5)), longitude: Number(picked.longitude.toFixed(5)) };
     setCoords(c);
+    setAccuracyM(null);
     setLocationSource("manual");
     setManualError(null);
     setLatText(c.latitude.toFixed(5));
@@ -350,6 +380,10 @@ export function SosPage() {
   // The device location comes first: the map is offered only once it has
   // failed or is slow, and never replaces a working fix.
   const offerManual = !manualOpen && coords === null && (locationFailed || slowLocate);
+  // A device fix that may be far off (no GPS: Wi-Fi / cell / IP position).
+  // Only a notice with a way to the map - the SOS button is NEVER held back
+  // by it (team rule: with a location, SOS always works).
+  const approxAccuracy = coords !== null && locationSource === "gps" && isApproximateFix(accuracyM) ? accuracyM : null;
 
   async function sendSos() {
     if (!gate.enabled) return;
@@ -364,13 +398,9 @@ export function SosPage() {
       // not at all: it is where the person was a moment ago (B54).
       // A point set by hand gets one short device try (MANUAL_RECHECK_OPTIONS).
       setModal(manual ? "Checking for your device location..." : "Confirming your current location...");
-      let fresh: Coords;
-      let source: LocationSource = "gps";
-      let fallback: "earlier" | "manual" | null = null;
+      let fix: DeviceFix | null = null;
       try {
-        fresh = manual ? await getPosition(MANUAL_RECHECK_OPTIONS) : await getSosPosition();
-        if (manual) applyDeviceFix(fresh, true, true);
-        else setCoords(fresh);
+        fix = manual ? await getPosition(MANUAL_RECHECK_OPTIONS) : await getSosPosition();
       } catch (err) {
         if (!coords) {
           // (the SOS button needs a location, so this is a safety net only)
@@ -383,19 +413,42 @@ export function SosPage() {
           });
           return;
         }
-        // Also after a refusal: the person pressed SOS, and this position
-        // was shared with their permission when the page opened - or they
-        // set it on the map themselves.
-        fresh = coords;
+      }
+      let fresh: Coords;
+      let accuracy: number | null;
+      let source: LocationSource = "gps";
+      let fallback: "earlier" | "manual" | null = null;
+      if (fix && (!manual || applyDeviceFix(fix, true, true))) {
+        if (!manual) {
+          setCoords(plainCoords(fix));
+          setAccuracyM(fix.accuracy_m);
+        }
+        fresh = plainCoords(fix);
+        accuracy = fix.accuracy_m;
+      } else {
+        // No fresh fix (also after a refusal: the person pressed SOS, and
+        // this position was shared with their permission when the page
+        // opened - or they set it on the map themselves), or only an
+        // approximate one that must not replace their hand-set point.
+        fresh = coords!;
         source = locationSource;
+        accuracy = manual ? null : accuracyM;
         fallback = manual ? "manual" : "earlier";
       }
       setModal("Sending SOS...");
       let data: SosCreateResponse;
       let already = false;
       try {
-        // location_source lets officers see a hand-placed (approximate) point
-        data = await apiPost<SosCreateResponse>("/api/sos", { ...fresh, note, device_id: deviceId, location_source: source });
+        // location_source lets officers see a hand-placed (approximate) point;
+        // location_accuracy_m how far off a device fix may be (null = unknown / by hand)
+        data = await apiPost<SosCreateResponse>("/api/sos", {
+          latitude: fresh.latitude,
+          longitude: fresh.longitude,
+          note,
+          device_id: deviceId,
+          location_source: source,
+          location_accuracy_m: source === "gps" ? accuracy : null,
+        });
       } catch (err) {
         const body = err instanceof ApiError ? (err.data as Partial<SosCreateResponse> | null) : null;
         if (err instanceof ApiError && err.status === 409 && body?.status === "already_active") {
@@ -445,6 +498,15 @@ export function SosPage() {
             </button>
           </div>
           <div className={styles.locateStatus} role="status">{locateMessage(lang, locateMsg)}</div>
+          {approxAccuracy !== null && !manualOpen && (
+            // HUMAN REVIEW: safety-critical citizen text (approxNotice / approxSetOnMap in lib/i18n.ts, Hindi unreviewed)
+            <div className={styles.approxNotice} role="note">
+              <p>{t(lang, "approxNotice", { acc: formatAccuracy(approxAccuracy) })}</p>
+              <button type="button" className={styles.btnSecondary} onClick={() => setManualOpen(true)}>
+                {t(lang, "approxSetOnMap")}
+              </button>
+            </div>
+          )}
           {offerManual && (
             <button type="button" className={styles.btnSecondary} onClick={() => setManualOpen(true)}>
               {t(lang, "manualOffer")}
@@ -470,13 +532,13 @@ export function SosPage() {
               <form className={styles.manualFields} onSubmit={applyTypedCoords} aria-labelledby="manual-title" noValidate>
                 <label>
                   <span>{t(lang, "manualLat")}</span>
-                  <input value={latText} onChange={(e) => setLatText(e.target.value)} inputMode="decimal"
+                  <input name="manual-latitude" value={latText} onChange={(e) => setLatText(e.target.value)} inputMode="decimal"
                          autoComplete="off" aria-invalid={manualError ? true : undefined}
                          aria-describedby={manualError ? "manual-error" : undefined} />
                 </label>
                 <label>
                   <span>{t(lang, "manualLon")}</span>
-                  <input value={lonText} onChange={(e) => setLonText(e.target.value)} inputMode="decimal"
+                  <input name="manual-longitude" value={lonText} onChange={(e) => setLonText(e.target.value)} inputMode="decimal"
                          autoComplete="off" aria-invalid={manualError ? true : undefined}
                          aria-describedby={manualError ? "manual-error" : undefined} />
                 </label>

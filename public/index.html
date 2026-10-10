@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,"><!-- no favicon request: /favicon.ico is a 404 in classic mode -->
+    <link rel="alternate" type="application/atom+xml" title="SANJEEVNI confirmed alerts (CAP 1.2)" href="/cap/feed.atom">
     <title>SANJEEVNI</title>
     <style>
         :root {
@@ -88,6 +90,11 @@
         .hazard-card-link { text-decoration: none; color: inherit; display: block; }
         .hazard-card-link .hazard-card { cursor: pointer; transition: box-shadow 0.15s, transform 0.15s; }
         .hazard-card-link:hover .hazard-card { box-shadow: 0 4px 14px rgba(27,94,32,0.2); transform: translateY(-2px); }
+        /* confidence line (server.js / confidence.js): same wording as the React dashboard */
+        .confidence { margin-top: 8px; font-size: 13px; }
+        .confidence .conf-label { font-weight: 600; border: 1px solid #7d8f80; border-radius: 999px; padding: 2px 8px; display: inline-block; }
+        .confidence.conf-Low .conf-label { border-style: dashed; color: #8a5300; background: #fff4e0; }
+        .confidence .conf-reasons { display: block; color: var(--text-muted); font-size: 12.5px; margin-top: 2px; }
         .hazard-card .click-hint { margin-top: 8px; font-size: 12px; color: var(--green-dark); font-weight: bold; }
 
         @media(max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
@@ -147,6 +154,9 @@
     </table>
     </div>
     </main>
+    <footer style="max-width:1200px;margin:0 auto;padding:12px 20px 32px;color:#5f6b60;font-size:14px;">
+      <a href="/cap/feed.atom">Public CAP 1.2 alert feed (Atom)</a> - confirmed alerts for emergency-management dashboards and feed readers.
+    </footer>
 
 
     <script src="/auth-ui.js"></script>
@@ -159,12 +169,37 @@
         // with no icon at all, no visual distinction between a flood
         // and a landslide.
         const HAZARD_ICONS = {
-            "flood": "🌊", "gas leak": "☣️", "fire": "🔥",
+            "flood": "🌊", "flash_flood": "⏫", "gas leak": "☣️", "fire": "🔥", "smoke": "💨",
             "extreme heat": "🌡️", "landslide": "⛰️",
             "air pollution": "😷", "water quality degradation": "💧",
+            // extreme weather (forecast-based ones are never above HIGH)
+            "heavy_rain": "🌧️", "high_wind": "🌬️",
         };
         function hazardIconFor(hazardType) {
-            return HAZARD_ICONS[hazardType] || "⚠️";
+            return (Object.prototype.hasOwnProperty.call(HAZARD_ICONS, hazardType) && HAZARD_ICONS[hazardType]) || "⚠️";
+        }
+        // "flash_flood" -> "FLASH FLOOD"
+        function hazardTitleFor(hazardType) {
+            return String(hazardType || "").replace(/_/g, " ").toUpperCase();
+        }
+        // Everything from the server that goes into innerHTML below is
+        // escaped (hazard types and confidence reasons come from the AI
+        // backend, locations from the node registry) - defence in depth.
+        function esc(value) {
+            return String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+        }
+        // "Confidence: High (82%)" + up to 3 reasons, or "" for an alert
+        // without a score (stored before the score existed) - never made up.
+        function confidenceHtml(h) {
+            const label = ["High", "Medium", "Low"].includes(h.confidence_label) ? h.confidence_label : null;
+            const pct = typeof h.confidence === "number" && h.confidence >= 0 && h.confidence <= 1
+                ? Math.round(h.confidence * 100) + "%" : null;
+            if (!label && !pct) return "";
+            const text = label && pct ? `${label} (${pct})` : (label || pct);
+            const reasons = Array.isArray(h.confidence_reasons)
+                ? h.confidence_reasons.filter((r) => typeof r === "string" && r.trim()).slice(0, 3) : [];
+            return `<div class="confidence conf-${esc(label || "none")}"><span class="conf-label">Confidence: ${esc(text)}</span>` +
+                (reasons.length ? `<span class="conf-reasons">${esc(reasons.join("; "))}</span>` : "") + "</div>";
         }
 
         async function loadHazards() {
@@ -188,9 +223,10 @@
                     <a href="officer.html?focus=${encodeURIComponent(top.node_id)}" target="sanjeevni-officer-map">
                         <div class="critical-hazard-box">
                             <div class="ch-left">
-                                <h4>${hazardIconFor(top.hazard_type)} ${top.label}: ${top.hazard_type.toUpperCase()}</h4>
-                                <div class="loc">📍 ${top.location} (${top.node_id})</div>
-                                <div class="eta">⏱ ${top.prediction_text}</div>
+                                <h4>${hazardIconFor(top.hazard_type)} ${esc(top.label)}: ${esc(hazardTitleFor(top.hazard_type))}</h4>
+                                <div class="loc">📍 ${esc(top.location)} (${esc(top.node_id)})</div>
+                                <div class="eta">⏱ ${esc(top.prediction_text)}</div>
+                                ${confidenceHtml(top)}
                             </div>
                             <div class="ch-score">${(top.risk_score * 100).toFixed(0)}%
                                 <span class="lbl">Risk Score</span>
@@ -201,14 +237,15 @@
 
                 container.innerHTML = result.hazards.map(h => `
                     <a href="officer.html?focus=${encodeURIComponent(h.node_id)}" target="sanjeevni-officer-map" class="hazard-card-link">
-                        <div class="hazard-card ${h.severity}">
-                            <h4>${hazardIconFor(h.hazard_type)} ${h.label}: ${h.hazard_type.toUpperCase()}</h4>
-                            <div class="loc">📍 ${h.location} (${h.node_id})</div>
+                        <div class="hazard-card ${esc(h.severity)}">
+                            <h4>${hazardIconFor(h.hazard_type)} ${esc(h.label)}: ${esc(hazardTitleFor(h.hazard_type))}</h4>
+                            <div class="loc">📍 ${esc(h.location)} (${esc(h.node_id)})</div>
                             <div class="score-row">
                                 <span>Risk Score</span>
                                 <span class="score">${(h.risk_score * 100).toFixed(0)}%</span>
                             </div>
-                            <div class="eta">⏱ ${h.prediction_text}</div>
+                            <div class="eta">⏱ ${esc(h.prediction_text)}</div>
+                            ${confidenceHtml(h)}
                             <div class="click-hint">📌 Click to view on map</div>
                         </div>
                     </a>
@@ -249,7 +286,7 @@
 
                 const latest = result.data[0];
                 document.getElementById("device").innerText = latest.device_id;
-                document.getElementById("hazard").innerText = (latest.hazard || "--").toUpperCase();
+                document.getElementById("hazard").innerText = (latest.hazard || "--").replace(/_/g, " ").toUpperCase();
                 document.getElementById("water").innerText = latest.water_level ?? "--";
                 document.getElementById("risk").innerText = latest.risk;
                 document.getElementById("score").innerText = latest.risk_score;

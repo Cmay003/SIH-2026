@@ -283,7 +283,8 @@ inline bool readTiltAndVibration(float& tiltDeg, float& vibrationG) {
 }
 
 // ---------------------------------------------------------------------
-// PMS5003 - streams a 32-byte frame about once a second (active mode).
+// PMS5003 - streams a 32-byte frame every 0.2 - 2.3 s (active mode; datasheet
+// PTQ3004-2015: 2.3 s when stable, 200-800 ms when the value changes fast).
 // Frame: 0x42 0x4D, length(2), 13 data words, checksum(2) = sum of the
 // first 30 bytes. Uses the "atmospheric environment" PM values.
 // ---------------------------------------------------------------------
@@ -303,6 +304,13 @@ inline void pollPms5003() {
       continue;
     }
     frame[pos++] = b;
+    // Frame length 2x13+2 = 28 (datasheet). Anything else - e.g. the 8-byte
+    // answer to a sleep / wake command (duty cycle) - is not a data frame:
+    // drop it here instead of eating the start of the next real frame.
+    if (pos == 4 && (frame[2] != 0 || frame[3] != 28)) {
+      pos = 0;
+      continue;
+    }
     if (pos < 32) continue;
     pos = 0;
     uint16_t sum = 0;

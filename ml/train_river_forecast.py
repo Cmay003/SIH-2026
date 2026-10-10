@@ -15,6 +15,12 @@ Writes models/river_forecast_lstm.npz and models/river_forecast_metrics.json
 
 import json
 import os
+# Windows 11 Smart App Control blocks wrapt's unsigned compiled helper
+# (_wrappers.*.pyd, pulled in by TensorFlow / ChromaDB) with "Part of this
+# app has been blocked". wrapt's pure-Python fallback behaves the same.
+# Must run before those imports. To keep the compiled helper, set
+# WRAPT_DISABLE_EXTENSIONS to an EMPTY value (wrapt treats "0" as set).
+os.environ.setdefault("WRAPT_DISABLE_EXTENSIONS", "1")
 
 import numpy as np
 import os as _os

@@ -1,65 +1,107 @@
 """
 Runs the ACTUAL quantized int8 TFLite model (via the TFLite interpreter,
 not the original Keras model) against the held-out test set, to prove
-quantization didn't destroy real-world accuracy - this is the test that
-actually matters, not just "the conversion succeeded without erroring".
+quantization didn't destroy the model - this is the test that actually
+matters, not just "the conversion succeeded without erroring".
+
+  .\\venv\\Scripts\\python.exe ml\\verify_quantized_model.py [--model lite]
+
+The input tensor is built exactly as the firmware builds it
+(sj_edge_input.h: float32, roundf, clamp - quantize_edge_model.quantize_inputs),
+and the firmware's class is the first maximum of the int8 output.
+Also reports: float (Keras) vs int8 agreement, URGENT recall per rule
+(lite: which sensor made it URGENT), and whether the header installed in
+firmware/sanjeevni_lora_node is this build. Fails (exit 1) if a single
+URGENT test reading comes out NORMAL.
 """
-import numpy as np
-import tensorflow as tf
 import json
-from sklearn.model_selection import train_test_split
+import os
+# Windows 11 Smart App Control blocks wrapt's unsigned compiled helper
+# (_wrappers.*.pyd, pulled in by TensorFlow / ChromaDB) with "Part of this
+# app has been blocked". wrapt's pure-Python fallback behaves the same.
+# Must run before those imports. To keep the compiled helper, set
+# WRAPT_DISABLE_EXTENSIONS to an EMPTY value (wrapt treats "0" as set).
+os.environ.setdefault("WRAPT_DISABLE_EXTENSIONS", "1")
+import sys
+
+import numpy as np
 from sklearn.metrics import classification_report
-import os as _os
-import sys as _sys
+from sklearn.model_selection import train_test_split
 
-# backend/ holds the shared modules + paths.py (file locations)
-_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "backend"))
-import paths  # noqa: E402
+import make_edge_dataset as med
+import paths  # noqa: E402 - make_edge_dataset put backend/ on sys.path
+import quantize_edge_model as qem
 
-_os.makedirs(paths.EDGE_BUILD_DIR, exist_ok=True)
-_os.chdir(paths.EDGE_BUILD_DIR)
 
-X, y = np.load("edge_X.npy"), np.load("edge_y.npy")
-with open("scaler_params.json") as f:
-    scaler = json.load(f)
-mean, scale = np.array(scaler["mean"]), np.array(scaler["scale"])
-X_scaled = ((X - mean) / scale).astype(np.float32)
+def main():
+    args = med.model_arg("Verify an int8 edge model on its held-out test set.").parse_args()
+    s = med.spec(args.model)
+    os.makedirs(paths.EDGE_BUILD_DIR, exist_ok=True)
+    os.chdir(paths.EDGE_BUILD_DIR)
 
-_, X_test, _, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+    X, y = np.load(s["X"]), np.load(s["y"])
+    with open(s["scaler"]) as f:
+        scaler = json.load(f)
+    mean = np.array(scaler["mean"], dtype=np.float32)
+    scale = np.array(scaler["scale"], dtype=np.float32)
 
-interpreter = tf.lite.Interpreter(model_path="edge_model_int8.tflite")
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()[0]
-output_details = interpreter.get_output_details()[0]
+    idx_train, idx_test = train_test_split(np.arange(len(y)), test_size=0.2, random_state=42, stratify=y)
+    X_test, y_test = X[idx_test], y[idx_test]
 
-input_scale, input_zero_point = input_details["quantization"]
-output_scale, output_zero_point = output_details["quantization"]
+    model = qem.Int8Model(s["tflite"])
+    predictions = np.array([model.classify_q(qem.quantize_inputs(x, mean, scale, model.in_scale, model.in_zp))
+                            for x in X_test])
 
-predictions = []
-for i in range(len(X_test)):
-    x = X_test[i:i+1]
-    # Exactly what the firmware does (round, then clamp to int8). A plain
-    # astype(int8) truncates and WRAPS out-of-range values, so this check
-    # used to test something different from what runs on the ESP32 (B19).
-    x_int8 = np.clip(np.round(x / input_scale) + input_zero_point, -128, 127).astype(np.int8)
-    interpreter.set_tensor(input_details["index"], x_int8)
-    interpreter.invoke()
-    output = interpreter.get_tensor(output_details["index"])
-    predictions.append(np.argmax(output[0]))
+    print(f"=== [{args.model}] QUANTIZED (int8) model on the held-out test set ({len(y_test)} readings) ===")
+    print(classification_report(y_test, predictions, target_names=["NORMAL", "WATCH", "URGENT"], digits=4))
+    accuracy = (predictions == y_test).mean()
+    print(f"Quantized model agreement with the label rule: {accuracy:.4f}")
 
-predictions = np.array(predictions)
-print("=== QUANTIZED (int8) model performance on the SAME held-out test set ===")
-print(classification_report(y_test, predictions, target_names=["NORMAL", "WATCH", "URGENT"]))
+    try:
+        import tensorflow as tf
+        keras = tf.keras.models.load_model(s["keras"])
+        float_pred = np.argmax(keras.predict(((X_test - mean) / scale).astype(np.float32), verbose=0), axis=1)
+        print(f"Float (Keras) agreement with the rule: {(float_pred == y_test).mean():.4f}; float vs int8 agree on "
+              f"{(float_pred == predictions).mean():.4f} ({int((float_pred != predictions).sum())} of {len(y_test)} "
+              "differ)")
+    except Exception as exc:  # the Keras file is optional for this check
+        print(f"(float model not compared: {exc})")
 
-accuracy = (predictions == y_test).mean()
-print(f"Quantized model accuracy: {accuracy:.4f}")
+    urgent = y_test == 2
+    normal_as_urgent = int(((y_test == 0) & (predictions == 2)).sum())
+    urgent_as_normal = int((urgent & (predictions == 0)).sum())
+    urgent_missed = int((urgent & (predictions != 2)).sum())
+    print(f"\nNORMAL misclassified as URGENT: {normal_as_urgent}")
+    print(f"URGENT misclassified as NORMAL (the dangerous direction): {urgent_as_normal}")
+    print(f"URGENT not called URGENT: {urgent_missed} of {int(urgent.sum())} ({urgent_missed / max(1, urgent.sum()):.4f})")
 
-# Critical safety check: does quantization introduce any NORMAL<->URGENT
-# confusion that wasn't there before? That would be a genuinely dangerous
-# regression for a safety system, worth catching explicitly.
-normal_as_urgent = ((y_test == 0) & (predictions == 2)).sum()
-urgent_as_normal = ((y_test == 2) & (predictions == 0)).sum()
-print(f"\nNORMAL misclassified as URGENT: {normal_as_urgent}")
-print(f"URGENT misclassified as NORMAL (the dangerous direction): {urgent_as_normal}")
-assert urgent_as_normal == 0, "CRITICAL: quantization caused a real hazard to be missed entirely"
-print("\nPASS: quantized model never mistakes a real URGENT event for NORMAL")
+    if args.model == "lite":
+        _, _, present = med.generate_lite(return_present=True)
+        reasons = np.array([med.lite_reason(**med.lite_row_values(X[i], present[i])) for i in idx_test])
+        print("\nURGENT recall per rule (lite):")
+        for reason in ("water", "gas", "flame", "heat", "tilt"):
+            m = urgent & (reasons == reason)
+            if m.any():
+                print(f"  {reason:<6} {int((predictions[m] == 2).sum())}/{int(m.sum())}")
+        print("Agreement by number of sensor groups fitted:")
+        groups = [[med.LITE_FEATURES.index(n) for n in g] for g in med.LITE_GROUPS.values()]
+        fitted = np.array([sum(bool(present[i, g[0]]) for g in groups) for i in idx_test])
+        for k in range(1, len(groups) + 1):
+            m = fitted == k
+            if m.any():
+                print(f"  {k} group(s): {(predictions[m] == y_test[m]).mean():.4f} on {int(m.sum())}")
+
+    installed = os.path.join(qem.FIRMWARE_NODE, s["header"])
+    if os.path.exists(installed):
+        with open(installed, encoding="utf-8") as a, open(s["header"], encoding="utf-8") as b:
+            same = a.read() == b.read()
+        print(f"\nfirmware/sanjeevni_lora_node/{s['header']} is this build: {same}")
+
+    if urgent_as_normal:
+        print("\nCRITICAL: the int8 model calls a real URGENT reading NORMAL")
+        sys.exit(1)
+    print("\nPASS: the quantized model never mistakes an URGENT test reading for NORMAL")
+
+
+if __name__ == "__main__":
+    main()

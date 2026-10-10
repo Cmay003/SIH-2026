@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setUnauthorizedHandler } from "../api/client";
 import type { NodeConfig } from "../api/types";
-import { curveNumberHint, emptyNodeForm, validateNodeForm } from "../lib/nodes";
+import { autoIntervalText, curveNumberHint, emptyNodeForm, formatInterval, validateNodeForm } from "../lib/nodes";
 import { PickPosition } from "../components/PickPosition";
 import { AdminPage } from "../pages/AdminPage";
 import { Providers } from "../Providers";
@@ -24,7 +24,7 @@ const HEALTH = {
   generated_at: "", summary: { online: 1, offline: 1, never_seen: 0 }, nodes_with_issues: 1,
   nodes: [
     { node_id: "NODE-04", location: "", latitude: 29.39, longitude: 79.45, status: "online", level: "ok", last_seen: null,
-      seconds_since_seen: 3, expected_interval_seconds: 5, battery_pct: null, signal_strength_dbm: null, link: null, issues: [] },
+      seconds_since_seen: 3, expected_interval_seconds: 300, battery_pct: null, signal_strength_dbm: null, link: null, issues: [] },
     { node_id: "NODE-07", location: "", latitude: 29.4, longitude: 79.46, status: "offline", level: "critical", last_seen: null,
       seconds_since_seen: 900, expected_interval_seconds: 60, battery_pct: null, signal_strength_dbm: null, link: null, issues: [] },
   ],
@@ -62,6 +62,16 @@ afterEach(() => {
 });
 
 const renderPage = () => render(<Providers><AdminPage /></Providers>);
+
+describe("automatic report interval text", () => {
+  it("shows the backend's interval, or both nominal ones while the node is unknown", () => {
+    expect(formatInterval(300)).toBe("5 min");
+    expect(formatInterval(60)).toBe("1 min");
+    expect(formatInterval(90)).toBe("90 s");
+    expect(autoIntervalText(60)).toBe("auto (1 min)");
+    expect(autoIntervalText(undefined)).toBe("auto (5 min; 1 min with a siren)");
+  });
+});
 
 describe("validateNodeForm", () => {
   const filled = { ...emptyNodeForm(), node_id: "NODE-05", location: "Bridge", latitude: "29.38", longitude: "79.46" };
@@ -117,10 +127,13 @@ describe("AdminPage", { timeout: 30_000 }, () => {
     renderPage();
     const row04 = (await screen.findByRole("rowheader", { name: "NODE-04" }, PAGE_LOAD)).closest("tr")!;
     expect(within(row04).getByText("Sector 4, Riverside")).toBeInTheDocument();
-    expect(within(row04).getByText("5 s (default)")).toBeInTheDocument();
+    // no pinned interval: the backend's automatic one (5 min without a siren -
+    // user decision 2026-10-09), never the old "5 s (default)"
+    expect(within(row04).getByText("auto (5 min)")).toBeInTheDocument();
     expect(within(row04).getByText("Online")).toBeInTheDocument();
     const row07 = screen.getByRole("rowheader", { name: "NODE-07" }).closest("tr")!;
     expect(within(row07).getByText("Offline")).toBeInTheDocument();
+    expect(within(row07).getByText("60 s")).toBeInTheDocument(); // pinned by the admin
     expect(screen.getByRole("heading", { name: "Sensor nodes (2)" })).toBeInTheDocument();
   });
 
@@ -179,6 +192,16 @@ describe("AdminPage", { timeout: 30_000 }, () => {
     await user.click(screen.getByRole("button", { name: "Save changes" }));
     expect(await screen.findByText("Couldn't save: Upstream node 'X' does not exist", {}, PAGE_LOAD)).toBeInTheDocument();
     expect(calls.find((c) => c.method === "PUT")!.body).toMatchObject({ location: "Hill Road (moved)", report_interval_seconds: 60 });
+  });
+
+  it("keeps the picker map dots out of the Tab order (W2 browser check)", async () => {
+    const user = userEvent.setup({ delay: null });
+    api(baseRoutes);
+    const { container } = renderPage();
+    await user.click(await screen.findByRole("button", { name: "Edit NODE-07" }, PAGE_LOAD));
+    // NODE-04 (other node, grey) + NODE-07 (the one being edited)
+    await waitFor(() => expect(container.querySelectorAll("path.leaflet-interactive").length).toBe(2));
+    for (const p of container.querySelectorAll("path.leaflet-interactive")) expect(p).toHaveAttribute("tabindex", "-1");
   });
 
   it("deletes only after confirmation and explains a refusal", async () => {

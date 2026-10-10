@@ -30,3 +30,37 @@ inline uint32_t sjPopAfterUpload(uint32_t sent, uint32_t droppedAtBuild, uint32_
   uint32_t overwritten = droppedNow - droppedAtBuild;  // dropped only grows between clears
   return overwritten >= sent ? 0 : sent - overwritten;
 }
+
+// ---- the order of one forwarding pass, and what a refusal stops ----------
+// forwardQueue() sends, oldest first within each: SOS readings (a node's
+// button), SOS requests from the offline Wi-Fi, urgent readings, then the
+// backlog. An SOS that the server answers with "not now" (401 / 403 / 429
+// / 5xx ...) is PARKED for the rest of the pass - it stays first in its
+// outbox and goes first again on the next pass - but the readings behind
+// it still go. It used to end the pass: one tap on the open SANJEEVNI-SOS
+// Wi-Fi of a gateway whose GATEWAY_ID is not in its device key (403)
+// stopped every reading upload - flood alerts and the siren commands that
+// ride on their answers included - until an admin fixed the key (review).
+// Only "no answer at all" (negative code: no network, DNS, timeout) ends
+// the pass: then the readings would fail the same way.
+enum SjFwdStep : uint8_t {
+  SJ_FWD_SOS = 0,   // forwardSos()
+  SJ_FWD_SOS_MSG,   // forwardSosMsg()
+  SJ_FWD_URGENT,    // forwardUrgent()
+  SJ_FWD_BACKLOG,   // one batch of the queue
+  SJ_FWD_IDLE,      // nothing (else) to send in this pass
+};
+
+// What to send next. A parked outbox counts as empty for the rest of the pass.
+inline SjFwdStep sjForwardStep(bool sosWaiting, bool sosParked, bool sosMsgWaiting, bool sosMsgParked,
+                               bool urgentWaiting, bool queued) {
+  if (sosWaiting && !sosParked) return SJ_FWD_SOS;
+  if (sosMsgWaiting && !sosMsgParked) return SJ_FWD_SOS_MSG;
+  if (urgentWaiting) return SJ_FWD_URGENT;
+  if (queued) return SJ_FWD_BACKLOG;
+  return SJ_FWD_IDLE;
+}
+
+// An SOS request the server did not take yet (sjUploadAction() RETRY):
+// true = park it and carry on with the readings; false = end the pass.
+inline bool sjSosRetryParks(int httpCode) { return httpCode > 0; }

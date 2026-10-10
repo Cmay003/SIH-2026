@@ -1,0 +1,54 @@
+/* CAP XML / PDF report / Timeline for one confirmed alert (step W2).
+   Used on the dashboard cards, the officer panel's hazard list, the map
+   popups and the trends page. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 34px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--link);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  line-height: 1.2;
+  text-decoration: none;
+  white-space: nowrap;
+}
+/* Inside a map popup Leaflet's ".leaflet-container a" (#0078A8) outranks
+   .btn, so the CAP XML / Timeline links came out blue beside a green PDF
+   button. a.btn is one element more specific. */
+.actions a.btn {
+  color: var(--link);
+}
+.btn:hover:not(:disabled),
+.actions a.btn:hover {
+  border-color: var(--green);
+  background: var(--green-lighter);
+  color: var(--link-hover);
+}
+.btn:disabled {
+  opacity: 0.65;
+  cursor: progress;
+}
+.compact .btn {
+  min-height: 30px;
+  padding: 3px 8px;
+  font-size: var(--text-xs);
+}
+.error {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+  color: var(--danger);
+  font-size: var(--text-sm);
+}

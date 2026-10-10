@@ -9,8 +9,16 @@ import { Fragment, useEffect, useRef, useState, type RefObject } from "react";
 import { Circle, CircleMarker, Marker, Popup, useMap } from "react-leaflet";
 import { apiGet, apiPost } from "../api/client";
 import type { ForecastResponse, HazardZone, NodeHealth, SatelliteCheck, SosRequest } from "../api/types";
-import { hazardIcon, hospitalZoneNote, manualLocationNote, staleText } from "../lib/hazards";
+import {
+  approximateLocationNote, hazardIcon, hazardTypeText, hospitalZoneNote, hotspotNote, isApproximateSos,
+  manualLocationNote, nodeButtonNote, peopleNeedsText, sosAccuracyText, staleText,
+} from "../lib/hazards";
 import { severityMapColor } from "../lib/severity";
+import { useMe } from "../hooks/useAuth";
+import { AlertActions } from "./AlertActions";
+import { Confidence } from "./Confidence";
+import { NodeSensorValues } from "./RiskLayers";
+import { PublicAdviceSection } from "./PublicAdvice";
 import styles from "./Officer.module.css";
 
 // ---- marker icons (built from fixed values only - never server text) ----
@@ -35,8 +43,10 @@ const hazardMarkerIcon = (severity: string, hazardType: string) =>
     L.divIcon({
       className: styles.divIconReset,
       // Colour via a class, not an inline style="" - the page's
-      // Content-Security-Policy blocks inline style attributes.
-      html: `<div class="${styles.hazardIcon} ${severityIconClass(severity)}">${hazardIcon(hazardType)}</div>`,
+      // Content-Security-Policy blocks inline style attributes. The emoji is
+      // aria-hidden: Leaflet makes the marker a focusable role="button", and
+      // its name came from the emoji ("🌊") instead of the marker's title.
+      html: `<div aria-hidden="true" class="${styles.hazardIcon} ${severityIconClass(severity)}">${hazardIcon(hazardType)}</div>`,
       iconSize: [30, 30],
       iconAnchor: [15, 15],
       popupAnchor: [0, -12],
@@ -44,16 +54,30 @@ const hazardMarkerIcon = (severity: string, hazardType: string) =>
   );
 
 /**
- * manual: the person placed the point by hand on a map (no device fix), so
- * the pin carries a "?" badge - it can be off by a street or more and must
- * not look as exact as a GPS pin.
+ * "uncertain": the person placed the point by hand on a map (no device fix),
+ * or the device fix may be far off (no GPS - Wi-Fi / cell / IP position), so
+ * the pin carries a "?" badge - it must not look as exact as a GPS pin.
+ * "node": the SOS button on a sensor node - an "N" badge (pin = the node).
+ * "hotspot": the offline SOS Wi-Fi at a node/gateway - a "W" badge (pin = the
+ * node, person within Wi-Fi range; or coordinates the person typed).
  */
-const sosMarkerIcon = (manual: boolean) =>
-  cachedIcon(manual ? "sos-manual" : "sos", () =>
+type SosPinKind = "exact" | "uncertain" | "node" | "hotspot";
+const sosPinKind = (s: SosRequest): SosPinKind =>
+  s.location_source === "node" ? "node"
+    : s.location_source === "hotspot" ? "hotspot"
+    : s.location_source === "manual" || isApproximateSos(s) ? "uncertain" : "exact";
+const SOS_PIN_BADGE: Record<SosPinKind, string> = {
+  exact: "",
+  uncertain: `<div class="${styles.sosManualBadge}">?</div>`,
+  node: `<div class="${styles.sosManualBadge} ${styles.sosNodeBadge}">N</div>`,
+  hotspot: `<div class="${styles.sosManualBadge} ${styles.sosNodeBadge}">W</div>`,
+};
+const sosMarkerIcon = (kind: SosPinKind) =>
+  cachedIcon(`sos-${kind}`, () =>
     L.divIcon({
       className: styles.divIconReset,
-      html: `<div class="${styles.sosPinWrap}"><div class="${styles.sosPulse}"></div><div class="${styles.sosPin}">📍</div>` +
-        (manual ? `<div class="${styles.sosManualBadge}">?</div>` : "") + "</div>",
+      html: `<div aria-hidden="true" class="${styles.sosPinWrap}"><div class="${styles.sosPulse}"></div><div class="${styles.sosPin}">📍</div>` +
+        SOS_PIN_BADGE[kind] + "</div>",
       iconSize: [44, 54],
       iconAnchor: [22, 54],
       popupAnchor: [0, -48],
@@ -96,7 +120,7 @@ export function HazardZones({ zones, markerRefs }: {
               <Popup><HazardPopup zone={z} /></Popup>
             </Circle>
             <Marker position={[z.latitude, z.longitude]} icon={hazardMarkerIcon(z.severity, z.hazard_type)}
-                    title={`${z.hazard_type} ${z.severity} at ${z.node_id}${z.confirmed ? "" : " (awaiting confirmation)"}`}
+                    title={`${hazardTypeText(z.hazard_type)} ${z.severity} at ${z.node_id}${z.confirmed ? "" : " (awaiting confirmation)"}`}
                     ref={(m) => {
                       if (!m) return;
                       markerRefs.current?.set(z.node_id, m); // ?focus=NODE-xx deep link
@@ -118,17 +142,30 @@ function HazardPopup({ zone, withInsights = false }: { zone: HazardZone; withIns
         <strong>{zone.node_id}</strong>
         <span className={`${styles.popupSev} ${severityIconClass(zone.severity)}`}>{zone.severity}</span>
       </div>
-      <div><span aria-hidden="true">{hazardIcon(zone.hazard_type)}</span> {zone.hazard_type}</div>
+      <div><span aria-hidden="true">{hazardIcon(zone.hazard_type)}</span> {hazardTypeText(zone.hazard_type)}</div>
       <div>Risk score: {zone.risk_score.toFixed(2)}</div>
+      <Confidence value={zone} />
       {!zone.confirmed && <div className={styles.pendingNote}><em>Awaiting confirmation - not yet public</em></div>}
       {zone.stale === true && (
         <div className={styles.pendingNote} title={zone.last_reading_at ? `Last reading: ${zone.last_reading_at}` : undefined}>
           <strong>{staleText(zone.last_reading_at)}</strong>
         </div>
       )}
-      {withInsights && zone.hazard_type === "flood" && <FloodInsights nodeId={zone.node_id} />}
+      {zone.confirmed && typeof zone.alert_id === "number" && <PopupAlertActions zone={zone} alertId={zone.alert_id} />}
+      <PublicAdviceSection hazardType={zone.hazard_type} severity={zone.severity}
+                           label={`${hazardTypeText(zone.hazard_type)} at ${zone.node_id}`} />
+      {/* river forecast + satellite check help with a flash flood too (same river gauge) */}
+      {withInsights && (zone.hazard_type === "flood" || zone.hazard_type === "flash_flood") &&
+        <FloodInsights nodeId={zone.node_id} />}
     </div>
   );
+}
+
+/** CAP XML / PDF report / Timeline for the confirmed alert behind a zone (step W2). */
+function PopupAlertActions({ zone, alertId }: { zone: HazardZone; alertId: number }) {
+  const role = useMe().data?.user.role;
+  return <AlertActions alertId={alertId} nodeId={zone.node_id} role={role} compact
+                       label={`${hazardTypeText(zone.hazard_type)} at ${zone.node_id}`} />;
 }
 
 /** Rendered only while the popup is open, so these requests run on demand. */
@@ -275,16 +312,31 @@ export function SosMarkers({ requests, markerRefs }: {
   return (
     <>
       {requests.map((s) => (
-        <Marker key={s.id} position={[s.latitude, s.longitude]} icon={sosMarkerIcon(s.location_source === "manual")}
-                zIndexOffset={sosZIndexOffset(s)}
-                title={`SOS #${s.id}${s.escalated ? ", escalated" : ""}${
-                  s.location_source === "manual" ? ", location set by hand (approximate)" : ""}, open ${s.minutes_open} min`}
-                ref={(m) => { if (m) markerRefs.current?.set(`sos:${s.id}`, m); }}>
-          <Popup minWidth={230}><SosPopup sos={s} /></Popup>
-        </Marker>
+        <Fragment key={s.id}>
+          {/* How far off an approximate device fix may be: the person is
+              somewhere in this circle, not necessarily at the pin */}
+          {isApproximateSos(s) && (
+            <Circle center={[s.latitude, s.longitude]} radius={s.location_accuracy_m!} interactive={false}
+                    pathOptions={{ color: "#7a4a00", weight: 1.5, dashArray: "6 6", fillOpacity: 0.06 }} />
+          )}
+          <Marker position={[s.latitude, s.longitude]} icon={sosMarkerIcon(sosPinKind(s))}
+                  zIndexOffset={sosZIndexOffset(s)}
+                  title={`SOS #${s.id}${s.escalated ? ", escalated" : ""}${sosPinTitle(s)}, open ${s.minutes_open} min`}
+                  ref={(m) => { if (m) markerRefs.current?.set(`sos:${s.id}`, m); }}>
+            <Popup minWidth={230}><SosPopup sos={s} /></Popup>
+          </Marker>
+        </Fragment>
       ))}
     </>
   );
+}
+
+function sosPinTitle(s: SosRequest): string {
+  if (s.location_source === "node") return `, SOS button on node ${s.node_id ?? ""}`;
+  if (s.location_source === "hotspot") return `, ${hotspotNote(s)}`;
+  if (s.location_source === "manual") return ", location set by hand (approximate)";
+  if (isApproximateSos(s)) return `, approximate location (${sosAccuracyText(s)})`;
+  return "";
 }
 
 function SosPopup({ sos }: { sos: SosRequest }) {
@@ -293,7 +345,12 @@ function SosPopup({ sos }: { sos: SosRequest }) {
     <div className={styles.popup}>
       {sos.escalated && <div className={styles.escalated}>⚠ ESCALATED - open {sos.minutes_open} min</div>}
       <strong>SOS #{sos.id}</strong> - {new Date(sos.timestamp).toLocaleTimeString()}
+      {sosAccuracyText(sos) && !isApproximateSos(sos) && <> · location {sosAccuracyText(sos)}</>}
       {manualLocationNote(sos) && <div className={styles.manualLocation}>{manualLocationNote(sos)}</div>}
+      {approximateLocationNote(sos) && <div className={styles.manualLocation}>{approximateLocationNote(sos)}</div>}
+      {nodeButtonNote(sos) && <div className={styles.nodeButtonNote}>{nodeButtonNote(sos)}</div>}
+      {hotspotNote(sos) && <div className={styles.nodeButtonNote}>{hotspotNote(sos)}</div>}
+      {peopleNeedsText(sos) && <div className={styles.escalated}>{peopleNeedsText(sos)}</div>}
       {sos.note && <div className={styles.note}>{sos.note}</div>}
       <div>Nearest hospital: <strong>{sos.nearest_hospital}</strong> ({sos.hospital_distance_km} km straight-line)</div>
       {hospitalZoneNote(sos) && <div className={styles.note}>{hospitalZoneNote(sos)}</div>}
@@ -337,18 +394,17 @@ export function NodeMarkers({ nodes }: { nodes: NodeHealth[] }) {
         <CircleMarker key={n.node_id} center={[n.latitude!, n.longitude!]} radius={7}
                       pathOptions={{ color: "#333", weight: 1, fillOpacity: 0.9,
                                      fillColor: n.status !== "online" ? "#9aa1ab" : NODE_LEVEL_COLOR[n.level] }}>
-          <Popup>
+          <Popup minWidth={250}>
             <div className={styles.popup}>
               <strong>{n.node_id}</strong> ({n.status})
               <div>{n.location}</div>
               <div>Last seen: {n.seconds_since_seen == null ? "never" : `${n.seconds_since_seen}s ago`}</div>
-              <div>
-                Battery: {n.battery_pct == null ? "-" : `${n.battery_pct.toFixed(0)}%`} · Signal:{" "}
-                {n.signal_strength_dbm == null ? "-" : `${n.signal_strength_dbm} dBm`}{n.link ? ` (${n.link})` : ""}
-              </div>
               {n.issues.map((i) => (
                 <div key={i.type + i.message} className={styles[`issue_${i.level}`]}>{i.message}</div>
               ))}
+              {/* every fitted sensor (battery, signal and siren included);
+                  rendered - and fetched - only while the popup is open */}
+              <NodeSensorValues nodeId={n.node_id} />
             </div>
           </Popup>
         </CircleMarker>

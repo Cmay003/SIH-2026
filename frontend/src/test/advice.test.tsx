@@ -13,6 +13,11 @@ import { Providers } from "../Providers";
 
 /** Every hazard_type the backend produces (hazard_classification.py / rag_alert_pipeline.py). */
 const HAZARD_TYPES = ["flood", "gas leak", "fire", "extreme heat", "landslide", "air pollution", "water quality degradation"];
+/** Added 2026-10-09: river rising fast (node-computed) and smoke (PM2.5 + gas rising together) - no older WhatsApp line. */
+const NEW_HAZARD_TYPES = ["flash_flood", "smoke",
+  // extreme weather from the Open-Meteo forecast / measured rain (backend lane, 2026-10-09)
+  "heavy_rain", "high_wind"];
+const ALL_HAZARD_TYPES = [...HAZARD_TYPES, ...NEW_HAZARD_TYPES];
 
 /** server.js HAZARD_ADVICE before it moved into the shared table - WhatsApp {{4}} must not change. */
 const OLD_WHATSAPP_ADVICE: Record<string, string> = {
@@ -29,8 +34,8 @@ const DEVANAGARI = /[ऀ-ॿ]/;
 
 describe("shared hazard advice table", () => {
   it("covers every hazard type, in English and Hindi, with 2-3 actions per level", () => {
-    expect(Object.keys(ADVICE.hazards).sort()).toEqual([...HAZARD_TYPES].sort());
-    for (const entry of [...HAZARD_TYPES.map((h) => ADVICE.hazards[h]), ADVICE.default]) {
+    expect(Object.keys(ADVICE.hazards).sort()).toEqual([...ALL_HAZARD_TYPES].sort());
+    for (const entry of [...ALL_HAZARD_TYPES.map((h) => ADVICE.hazards[h]), ADVICE.default]) {
       expect(entry.name.en).toBeTruthy();
       expect(entry.name.hi).toMatch(DEVANAGARI);
       for (const level of ["MEDIUM", "HIGH"] as const) {
@@ -45,9 +50,10 @@ describe("shared hazard advice table", () => {
   });
 
   it("keeps the WhatsApp lines one line long and the English ones unchanged", () => {
-    for (const h of HAZARD_TYPES) {
+    for (const h of ALL_HAZARD_TYPES) {
       const { en, hi } = ADVICE.hazards[h].whatsapp;
-      expect(en).toBe(OLD_WHATSAPP_ADVICE[h]);
+      if (h in OLD_WHATSAPP_ADVICE) expect(en).toBe(OLD_WHATSAPP_ADVICE[h]);
+      else expect(en.trim()).not.toBe("");
       // Meta rejects template parameters with newlines or tabs
       for (const line of [en, hi]) expect(line).not.toMatch(/[\n\t]| {4,}/);
       expect(hi).toMatch(DEVANAGARI);
@@ -119,7 +125,7 @@ const renderSos = () => render(<Providers><SosPage /></Providers>);
 const liveRegion = () => document.querySelector('[aria-live="polite"][aria-atomic="true"]') as HTMLElement;
 
 describe("SOS page advice", () => {
-  it.each(HAZARD_TYPES)("shows the %s name, severity and actions in English and Hindi", async (hazardType) => {
+  it.each(ALL_HAZARD_TYPES)("shows the %s name, severity and actions in English and Hindi", async (hazardType) => {
     mockApi([zone({ hazard_type: hazardType })]);
     renderSos();
     expect(await screen.findByText("HIGH RISK")).toBeInTheDocument();

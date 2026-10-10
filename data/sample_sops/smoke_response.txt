@@ -1,0 +1,21 @@
+SMOKE RESPONSE SOP (sample - generic guidance written for this project,
+not taken from a district SOP; needs review by a fire-safety / disaster
+management expert before field use)
+
+A smoke alert means fine particles (PM2.5) and combustion gas are rising
+together at the sensor, which usually means something is burning nearby.
+It does not say where the fire is or how large it is.
+
+LOW severity: Continue monitoring PM2.5, gas, temperature and humidity.
+No action required.
+
+MEDIUM severity: Alert the local fire service and ask a nearby officer to
+check the area around the sensor for a fire. Advise people nearby to stay
+indoors with doors and windows closed. Children, elderly people and people
+with asthma, lung or heart disease should avoid going outside.
+
+HIGH severity: Dispatch the fire service to the area around the sensor.
+Advise anyone who sees fire, or whose building is filling with smoke, to
+leave by the safest route away from the smoke and call 112. While moving
+through smoke, stay low, where the air is clearer. Keep everyone else
+indoors with doors and windows closed until the area is declared safe.

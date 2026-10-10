@@ -1,11 +1,12 @@
 r"""
-SANJEEVNI - honest evaluation report ("model card") for the four models.
+SANJEEVNI - honest evaluation report ("model card") for the five models.
 
 Writes var/models/model_card.json (paths.MODEL_CARD_PATH). The backend
 serves it to admins at GET /api/model-card.
 
-Covers the flood-risk model, the Isolation Forest anomaly filter, the
-on-device edge network and the LSTM river forecaster. For each one it
+Covers the flood-risk model, the Isolation Forest anomaly filter, the two
+on-device edge networks (main, and lite for reduced / deep-sleep sensor
+kits) and the LSTM river forecaster. For each one it
 records what it is for, what it was trained on, held-out metrics, the
 baseline it has to beat, the false-alarm rate, calibration and known
 limitations.
@@ -26,6 +27,8 @@ Held-out data, per model (none of it was seen in training):
             in-sample score next to the held-out one.
   edge    - a fresh draw from make_edge_dataset.generate() (own seed), run
             through the actual int8 .tflite the firmware embeds.
+  edge_lite - the same with make_edge_dataset.generate_lite() (random sensor
+            kits; own seed).
   lstm    - fresh synthetic catchments (own seed): different rivers from
             the 30 it was trained on.
 Every figure is from SYNTHETIC data unless the card says REAL. They show
@@ -34,8 +37,8 @@ the pipeline works; they are not evidence of real-world accuracy (B13).
 Run (from the project folder):
   venv\Scripts\python.exe ml\evaluate_models.py [--seed 2026] [--out file]
 The same seed and the same model files give a byte-identical JSON (no
-wall-clock time is written). The edge section needs tensorflow
-(requirements-training.txt); without it that entry is "not_available".
+wall-clock time is written). The edge sections need tensorflow
+(requirements-training.txt); without it those entries are "not_available".
 """
 
 import argparse
@@ -43,6 +46,12 @@ import hashlib
 import json
 import math
 import os
+# Windows 11 Smart App Control blocks wrapt's unsigned compiled helper
+# (_wrappers.*.pyd, pulled in by TensorFlow / ChromaDB) with "Part of this
+# app has been blocked". wrapt's pure-Python fallback behaves the same.
+# Must run before those imports. To keep the compiled helper, set
+# WRAPT_DISABLE_EXTENSIONS to an EMPTY value (wrapt treats "0" as set).
+os.environ.setdefault("WRAPT_DISABLE_EXTENSIONS", "1")
 import re
 import sys
 import warnings
@@ -88,6 +97,7 @@ ALERT_BAND = "MEDIUM"
 FLOOD_TEST_ROWS = 6000  # same size as the synthetic training draw
 ANOMALY_TRAIN_SEED = 7  # anomaly_detection.RNG - rebuilds the fitted stream
 EDGE_TEST_ROWS = med.N_SAMPLES
+LITE_TEST_ROWS = med.LITE_N_SAMPLES
 LSTM_TEST_CATCHMENTS = trf.TEST_CATCHMENTS
 LSTM_DAYS = trf.DAYS_PER_CATCHMENT
 EDGE_CLASSES = ["NORMAL", "WATCH", "URGENT"]
@@ -653,7 +663,7 @@ def evaluate_anomaly(models_dir, test_rng, n_normal=2000, n_anomalies=100):
     return entry
 
 
-# --- on-device edge network ---------------------------------------------------
+# --- on-device edge networks (main + lite) ------------------------------------
 
 def _load_interpreter(tflite_path):
     """TFLite interpreter with the REFERENCE kernels (closer to TFLite
@@ -676,19 +686,21 @@ def _load_interpreter(tflite_path):
     return interp, None
 
 
-def _header_bytes(header_path):
+def _header_bytes(header_path, c_name="edge_model_data"):
     with open(header_path, encoding="utf-8", errors="replace") as f:
         text = f.read()
-    body = text.split("edge_model_data[]", 1)[-1]
+    body = text.split(f"{c_name}[]", 1)[-1]
     return bytes(int(h, 16) for h in re.findall(r"0x([0-9a-fA-F]{2})", body))
 
 
-def _firmware_scaler(edge_ai_path):
-    with open(edge_ai_path, encoding="utf-8", errors="replace") as f:
+def _firmware_scaler(header_path, prefix="EDGE", n=5):
+    """The input scaling compiled into the firmware: the generated model
+    header's <prefix>_FEATURE_MEAN / _SCALE (ml/quantize_edge_model.py)."""
+    with open(header_path, encoding="utf-8", errors="replace") as f:
         text = f.read()
     out = {}
     for key in ("MEAN", "SCALE"):
-        m = re.search(rf"EDGE_FEATURE_{key}\[5\]\s*=\s*\{{([^}}]*)\}}", text)
+        m = re.search(rf"{prefix}_FEATURE_{key}\[{n}\]\s*=\s*\{{([^}}]*)\}}", text)
         if not m:
             return None
         out[key] = np.array([float(v.strip().rstrip("fF")) for v in m.group(1).split(",")])
@@ -708,44 +720,53 @@ def _near_threshold(X):
     return near
 
 
-def evaluate_edge(test_seed, n=EDGE_TEST_ROWS, build_dir=None, firmware_dir=None):
-    build_dir = build_dir or paths.EDGE_BUILD_DIR
-    firmware_dir = firmware_dir or os.path.join(paths.FIRMWARE_DIR, "sanjeevni_lora_node")
-    tflite_path = os.path.join(build_dir, "edge_model_int8.tflite")
-    entry = new_entry(
-        "edge",
-        "On-device edge network (int8 TFLite Micro)",
-        "A 5-16-8-3 neural network on the ESP32 node that labels each reading NORMAL / WATCH / "
-        "URGENT without the backend, so a node can raise its local alarm and report sooner "
-        "when the LoRa link or the server is down.",
-        "ESP32 node firmware (firmware/sanjeevni_lora_node/edge_ai.h)",
-        tflite_path,
-    )
-    scaler_path = os.path.join(build_dir, "scaler_params.json")
-    if not (os.path.exists(tflite_path) and os.path.exists(scaler_path)):
-        return _unavailable(entry, "edge_model_int8.tflite / scaler_params.json missing in var/edge_ai_build - "
-                            "see the rebuild steps in ml/make_edge_dataset.py")
-    interp, reason = _load_interpreter(tflite_path)
-    if interp is None:
-        return _unavailable(entry, reason)
-    with open(scaler_path) as f:
-        sp = json.load(f)
-    mean, scale = np.array(sp["mean"]), np.array(sp["scale"])
+def _lite_labels(X, present):
+    return np.array([med.label_lite(**med.lite_row_values(X[i], present[i])) for i in range(len(X))])
 
-    X, y = med.generate(n=n, seed=test_seed)
-    Xs = ((X - mean) / scale).astype(np.float32)
+
+def _near_threshold_lite(X, present):
+    """As _near_threshold for the lite model: river level, rise, temperature,
+    gas, tilt or vibration moved by 5% (only where the sensor is present)."""
+    base = _lite_labels(X, present)
+    near = np.zeros(len(X), dtype=bool)
+    for col in (0, 1, 2, 3, 5, 6):
+        for factor in (0.95, 1.05):
+            Xp = X.copy()
+            Xp[:, col] = np.where(present[:, col], Xp[:, col] * factor, Xp[:, col])
+            near |= _lite_labels(Xp, present) != base
+    return near
+
+
+def _int8_run(interp, X, mean, scale):
+    """De-quantised outputs of the int8 model; the input tensor is built
+    exactly as the firmware builds it (make_edge_dataset.quantize_inputs:
+    float32, roundf, clamp)."""
     inp, out = interp.get_input_details()[0], interp.get_output_details()[0]
     in_scale, in_zp = inp["quantization"]
     out_scale, out_zp = out["quantization"]
+    q_all = med.quantize_inputs(X, mean, scale, in_scale, in_zp)
     probs = np.zeros((len(X), 3))
     for i in range(len(X)):
-        # Exactly what the firmware does: round, then clamp to int8.
-        q = np.clip(np.round(Xs[i:i + 1] / in_scale) + in_zp, -128, 127).astype(np.int8)
-        interp.set_tensor(inp["index"], q)
+        interp.set_tensor(inp["index"], q_all[i:i + 1])
         interp.invoke()
         probs[i] = (interp.get_tensor(out["index"])[0].astype(np.float64) - out_zp) * out_scale
-    pred = probs.argmax(axis=1)
+    return probs
 
+
+def _per_reason_recall(y, pred, reasons, cls=2):
+    """Recall of class `cls` per rule that produced it (water / gas / ...)."""
+    out = {}
+    for reason in ("water", "gas", "flame", "heat", "tilt", "rise"):
+        m = (y == cls) & (reasons == reason)
+        if m.any():
+            out[reason] = {"count": int(m.sum()), "recall": _num(_div(int((pred[m] == cls).sum()), int(m.sum())))}
+    return out
+
+
+def _edge_metrics(entry, X, y, probs, near, n_train, generator, description):
+    """Fills the parts the main and the lite edge entry share. Returns
+    (pred, numbers used in the limitations)."""
+    pred = probs.argmax(axis=1)  # the firmware's first maximum of the int8 output (same scale for all)
     cm = np.zeros((3, 3), dtype=int)
     for t, p in zip(y, pred):
         cm[t, p] += 1
@@ -760,7 +781,6 @@ def evaluate_edge(test_seed, n=EDGE_TEST_ROWS, build_dir=None, firmware_dir=None
     false_alarm = _div(int((normal & (pred != 0)).sum()), int(normal.sum()))
     urgent_as_normal = int((urgent & (pred == 0)).sum())
     urgent_missed = _div(int((urgent & (pred != 2)).sum()), int(urgent.sum()))
-    near = _near_threshold(X)
     near_agree = _div(int((pred[near] == y[near]).sum()), int(near.sum()))
 
     onehot = np.eye(3)[y]
@@ -768,33 +788,16 @@ def evaluate_edge(test_seed, n=EDGE_TEST_ROWS, build_dir=None, firmware_dir=None
     conf = probs.max(axis=1)
     bins, ece = reliability((pred == y).astype(float), conf)
 
-    header = os.path.join(firmware_dir, "edge_model_data.h")
-    with open(tflite_path, "rb") as f:
-        tflite_bytes = f.read()
-    header_matches = _header_bytes(header) == tflite_bytes if os.path.exists(header) else None
-    fw = _firmware_scaler(os.path.join(firmware_dir, "edge_ai.h")) if os.path.exists(
-        os.path.join(firmware_dir, "edge_ai.h")) else None
-    scaler_matches = (
-        bool(np.allclose(fw["MEAN"], mean, atol=1e-5) and np.allclose(fw["SCALE"], scale, atol=1e-5))
-        if fw else None
-    )
-
-    n_train = int(round(med.N_SAMPLES * 0.8))
     entry["training_data"] = {
         "provenance": "SYNTHETIC",
-        "generator": f"ml/make_edge_dataset.py: generate (seed {med.SEED})",
+        "generator": generator,
         "size": n_train,
-        "description": (
-            f"{med.N_SAMPLES} synthetic readings labelled by make_edge_dataset.label() - the same "
-            "fixed thresholds the backend uses (gas 600/800 ppm, flame, river 2.75/3.5 m, "
-            f"temperature 40/45 C). 80% = {n_train} rows trained the network (15% of those for "
-            "Keras validation); weights quantised to int8."
-        ),
+        "description": description,
     }
     entry["evaluation"].update({
         "provenance": "SYNTHETIC",
-        "split": f"an independent draw of {n} readings from the same generator with its own seed, "
-        "run through the int8 .tflite (not the float Keras model)",
+        "split": f"an independent draw of {len(y)} readings from the same generator with its own seed, "
+        "run through the int8 .tflite (not the float Keras model), inputs quantised exactly as the firmware does",
         "split_kind": "independent_draw",
         "test_size": int(len(y)),
         "test_positives": int((y != 0).sum()),
@@ -841,25 +844,165 @@ def evaluate_edge(test_seed, n=EDGE_TEST_ROWS, build_dir=None, firmware_dir=None
         "per_class_recall": {
             name: _num(_div(int(cm[i, i]), int(cm[i].sum()))) for i, name in enumerate(EDGE_CLASSES)
         },
+    }
+    return pred, {"agreement": agreement, "near_agree": near_agree, "urgent_missed": urgent_missed,
+                  "urgent_as_normal": urgent_as_normal}
+
+
+def _firmware_match(entry, firmware_dir, header_name, c_name, prefix, n_inputs, tflite_bytes, mean, scale):
+    header = os.path.join(firmware_dir, header_name)
+    header_matches = _header_bytes(header, c_name) == tflite_bytes if os.path.exists(header) else None
+    fw = _firmware_scaler(header, prefix, n_inputs) if os.path.exists(header) else None
+    scaler_matches = (
+        bool(np.allclose(fw["MEAN"], mean, atol=1e-5) and np.allclose(fw["SCALE"], scale, atol=1e-5))
+        if fw else None
+    )
+    entry["details"].update({
         "model_bytes": len(tflite_bytes),
         "firmware_header_matches_tflite": header_matches,
         "firmware_scaler_matches": scaler_matches,
-    }
+    })
+    if header_matches is False or scaler_matches is False:
+        entry["limitations"].insert(0, "The firmware's embedded model or scaler constants DIFFER from "
+                                    "the evaluated build - these numbers do not describe the device.")
+
+
+SIREN_NOTE = ("Its verdict makes a reading 'send now' (WATCH and up) and feeds the backend's alert "
+              "confidence; it is NOT a siren trigger - the node's offline siren decides from the water "
+              "level and gas alone (decision 2026-10-09).")
+
+
+def evaluate_edge(test_seed, n=EDGE_TEST_ROWS, build_dir=None, firmware_dir=None):
+    build_dir = build_dir or paths.EDGE_BUILD_DIR
+    firmware_dir = firmware_dir or os.path.join(paths.FIRMWARE_DIR, "sanjeevni_lora_node")
+    s = med.spec("main")
+    tflite_path = os.path.join(build_dir, s["tflite"])
+    entry = new_entry(
+        "edge",
+        "On-device edge network, main (int8 TFLite Micro)",
+        "A 5-16-8-3 neural network on ESP32 nodes with water level, temperature/humidity, gas and "
+        "flame sensors that labels each reading NORMAL / WATCH / URGENT without the backend, so a "
+        "node can raise its local alarm and report sooner when the LoRa link or the server is down. "
+        + SIREN_NOTE,
+        "ESP32 node firmware (firmware/sanjeevni_lora_node/edge_ai.h, EDGE_MODEL_MAIN)",
+        tflite_path,
+    )
+    scaler_path = os.path.join(build_dir, s["scaler"])
+    if not (os.path.exists(tflite_path) and os.path.exists(scaler_path)):
+        return _unavailable(entry, f"{s['tflite']} / {s['scaler']} missing in var/edge_ai_build - "
+                            "see the rebuild steps in ml/make_edge_dataset.py")
+    interp, reason = _load_interpreter(tflite_path)
+    if interp is None:
+        return _unavailable(entry, reason)
+    with open(scaler_path) as f:
+        sp = json.load(f)
+    mean, scale = np.array(sp["mean"], dtype=np.float32), np.array(sp["scale"], dtype=np.float32)
+
+    X, y = med.generate(n=n, seed=test_seed)
+    probs = _int8_run(interp, X, mean, scale)
+    near = _near_threshold(X)
+    n_train = int(round(med.N_SAMPLES * 0.8))
+    pred, nums = _edge_metrics(
+        entry, X, y, probs, near, n_train, f"ml/make_edge_dataset.py: generate (seed {med.SEED})",
+        f"{med.N_SAMPLES} synthetic readings labelled by make_edge_dataset.label() - fixed thresholds "
+        "from the backend: gas 600/800 ppm, flame, river 2.75/3.5 m, temperature 45/47 C (IMD heat wave / "
+        f"severe heat wave, plains). 80% = {n_train} rows trained the network (15% of those for Keras "
+        "validation); weights quantised to int8.")
+    reasons = np.array([med.lite_reason(level_m=float(r[0]), temp_c=float(r[1]), gas_ppm=float(r[3]),
+                                        flame=float(r[4])) for r in X])
+    entry["details"]["urgent_recall_by_rule"] = _per_reason_recall(y, pred, reasons)
+    with open(tflite_path, "rb") as f:
+        tflite_bytes = f.read()
     entry["limitations"] = [
         "This is NOT hazard-detection accuracy: the labels come from fixed thresholds, so "
         "'agreement' only says how well the network copies that rule (the old '98.28% accuracy' "
         "figure meant the same thing).",
         "SYNTHETIC inputs: independent random readings, not real sensor time series - no "
         "drift, saturation or correlated faults.",
-        f"Mistakes concentrate near the thresholds: {_pct(near_agree)} agreement within 5% of a "
-        f"limit vs {_pct(agreement)} overall. {_pct(urgent_missed)} of URGENT readings were called "
-        f"a lower class ({urgent_as_normal} of them NORMAL).",
+        f"Mistakes concentrate near the thresholds: {_pct(nums['near_agree'])} agreement within 5% of a "
+        f"limit vs {_pct(nums['agreement'])} overall. {_pct(nums['urgent_missed'])} of URGENT readings were "
+        f"called a lower class ({nums['urgent_as_normal']} of them NORMAL).",
+        "Heat follows IMD's PLAINS criteria on one instantaneous reading (45 C heat wave = WATCH, 47 C "
+        "severe = URGENT); it is not IMD's daily maximum, and hilly / coastal regions are graded only by "
+        "the backend. Labels before 2026-10-09 called 40 C WATCH and 45 C URGENT.",
         "Humidity is an input but not part of the rule, so the network can react to it where the "
         "rule never would.",
     ]
-    if header_matches is False or scaler_matches is False:
-        entry["limitations"].insert(0, "The firmware's embedded model or scaler constants DIFFER from "
-                                    "the evaluated build - these numbers do not describe the device.")
+    _firmware_match(entry, firmware_dir, s["header"], s["c_name"], "EDGE", len(s["features"]), tflite_bytes,
+                    mean, scale)
+    entry["status"] = "evaluated"
+    return entry
+
+
+def evaluate_edge_lite(test_seed, n=LITE_TEST_ROWS, build_dir=None, firmware_dir=None):
+    build_dir = build_dir or paths.EDGE_BUILD_DIR
+    firmware_dir = firmware_dir or os.path.join(paths.FIRMWARE_DIR, "sanjeevni_lora_node")
+    s = med.spec("lite")
+    tflite_path = os.path.join(build_dir, s["tflite"])
+    entry = new_entry(
+        "edge_lite",
+        "On-device edge network, lite (int8 TFLite Micro)",
+        "A 7-16-8-3 neural network for the nodes the main model cannot serve - deep-sleep battery "
+        "nodes, gas-free, tilt-only and other modular kits, an MQ135 on the duty cycle. Inputs: river "
+        "level, rise rate, temperature, gas, flame, tilt, vibration; any sensor may be missing. Same "
+        "NORMAL / WATCH / URGENT output, also on every deep-sleep wake. " + SIREN_NOTE,
+        "ESP32 node firmware (firmware/sanjeevni_lora_node/edge_ai.h, EDGE_MODEL_LITE)",
+        tflite_path,
+    )
+    scaler_path = os.path.join(build_dir, s["scaler"])
+    if not (os.path.exists(tflite_path) and os.path.exists(scaler_path)):
+        return _unavailable(entry, f"{s['tflite']} / {s['scaler']} missing in var/edge_ai_build - "
+                            "see the rebuild steps in ml/make_edge_dataset.py (--model lite)")
+    interp, reason = _load_interpreter(tflite_path)
+    if interp is None:
+        return _unavailable(entry, reason)
+    with open(scaler_path) as f:
+        sp = json.load(f)
+    mean, scale = np.array(sp["mean"], dtype=np.float32), np.array(sp["scale"], dtype=np.float32)
+
+    X, y, present = med.generate_lite(n=n, seed=test_seed, return_present=True)
+    probs = _int8_run(interp, X, mean, scale)
+    near = _near_threshold_lite(X, present)
+    n_train = int(round(med.LITE_N_SAMPLES * 0.8))
+    groups = [[med.LITE_FEATURES.index(f) for f in g] for g in med.LITE_GROUPS.values()]
+    pred, nums = _edge_metrics(
+        entry, X, y, probs, near, n_train, f"ml/make_edge_dataset.py: generate_lite (seed {med.LITE_SEED})",
+        f"{med.LITE_N_SAMPLES} synthetic readings labelled by make_edge_dataset.label_lite(): river "
+        "2.75/3.5 m, gas 600/800 ppm, flame, temperature 45/47 C (IMD, plains), rise rate >= 2x the "
+        "node's fast-rise limit = WATCH (backend flash-flood HIGH; never URGENT on its own), the "
+        "backend's landslide tilt score > 0.4 WATCH / > 0.7 URGENT. Each of the five sensor groups is "
+        f"missing in {med.LITE_ABSENT_P:.0%} of rows (filled with a calm stand-in, as the firmware does). "
+        f"80% = {n_train} rows trained the network; weights quantised to int8.")
+    reasons = np.array([med.lite_reason(**med.lite_row_values(X[i], present[i])) for i in range(len(X))])
+    fitted = np.array([sum(bool(present[i, g[0]]) for g in groups) for i in range(len(X))])
+    entry["details"]["urgent_recall_by_rule"] = _per_reason_recall(y, pred, reasons)
+    entry["details"]["agreement_by_groups_fitted"] = {
+        str(k): {"count": int((fitted == k).sum()),
+                 "agreement": _num(_div(int((pred[fitted == k] == y[fitted == k]).sum()), int((fitted == k).sum())))}
+        for k in range(1, len(groups) + 1) if (fitted == k).any()
+    }
+    entry["details"]["parameters"] = (7 * 16 + 16) + (16 * 8 + 8) + (8 * 3 + 3)
+    with open(tflite_path, "rb") as f:
+        tflite_bytes = f.read()
+    entry["limitations"] = [
+        "This is NOT hazard-detection accuracy: the labels come from fixed rules on the backend's "
+        "thresholds, so 'agreement' only says how well the network copies that rule.",
+        "SYNTHETIC inputs: independent random readings with random sensor kits - no real river, "
+        "hillside or sensor faults, no time series.",
+        f"Mistakes concentrate near the thresholds: {_pct(nums['near_agree'])} agreement within 5% of a "
+        f"limit vs {_pct(nums['agreement'])} overall. {_pct(nums['urgent_missed'])} of URGENT readings were "
+        f"called a lower class ({nums['urgent_as_normal']} of them NORMAL).",
+        "A missing sensor is fed as a calm reading, so the network cannot say 'unknown' - a node without "
+        "a water sensor is simply never flood-WATCH. The backend still sees which sensors reported.",
+        "No rain input: the node only holds the rain since its last report (1-5 min, or a 30-s wake), "
+        "too short for an intensity; rain is graded by the backend from its rain log. So a fast rise is "
+        "WATCH at most here (the backend's CRITICAL needs rain / upstream corroboration).",
+        "Landslide: the tilt score is the backend's formula, but URGENT is its HIGH band (> 0.7) - the "
+        "node has no CRITICAL. Rain-triggered landslide WATCH (Caine I-D threshold) is backend-only.",
+        "Heat follows IMD's PLAINS criteria on one instantaneous reading (45 C WATCH, 47 C URGENT).",
+    ]
+    _firmware_match(entry, firmware_dir, s["header"], s["c_name"], "EDGE_LITE", len(s["features"]), tflite_bytes,
+                    mean, scale)
     entry["status"] = "evaluated"
     return entry
 
@@ -1025,16 +1168,21 @@ def evaluate_lstm(models_dir, test_rng, catchments=LSTM_TEST_CATCHMENTS, days=LS
 def build_card(seed=DEFAULT_SEED, models_dir=None, sizes=None, edge_build_dir=None, firmware_dir=None):
     """The whole card as a dict. sizes (tests only) shrinks the held-out
     sets: {"flood": n, "anomaly": (normal, faults), "edge": n,
-    "lstm": (catchments, days)}."""
+    "edge_lite": n, "lstm": (catchments, days)}."""
     check_operating_points()
     models_dir = models_dir or paths.MODELS_DIR
     sizes = sizes or {}
     # One child stream per held-out set: changing one size never shifts
     # another model's test data, and none equals a training seed's stream.
-    flood_test, flood_fit, anomaly_test, edge_test, lstm_test = np.random.SeedSequence(seed).spawn(5)
+    # spawn(6): the first five children are the ones spawn(5) gave before the
+    # lite model was added, so the other entries' test data did not move.
+    flood_test, flood_fit, anomaly_test, edge_test, lstm_test, lite_test = np.random.SeedSequence(seed).spawn(6)
     edge_seed = int(edge_test.generate_state(1)[0])
     if edge_seed == med.SEED:
         edge_seed += 1
+    lite_seed = int(lite_test.generate_state(1)[0])
+    if lite_seed == med.LITE_SEED:
+        lite_seed += 1
 
     entries = [
         evaluate_flood(models_dir, np.random.default_rng(flood_test), np.random.default_rng(flood_fit),
@@ -1043,6 +1191,8 @@ def build_card(seed=DEFAULT_SEED, models_dir=None, sizes=None, edge_build_dir=No
                          *sizes.get("anomaly", (2000, 100))),
         evaluate_edge(edge_seed, n=sizes.get("edge", EDGE_TEST_ROWS),
                       build_dir=edge_build_dir, firmware_dir=firmware_dir),
+        evaluate_edge_lite(lite_seed, n=sizes.get("edge_lite", LITE_TEST_ROWS),
+                           build_dir=edge_build_dir, firmware_dir=firmware_dir),
         evaluate_lstm(models_dir, np.random.default_rng(lstm_test),
                       *sizes.get("lstm", (LSTM_TEST_CATCHMENTS, LSTM_DAYS))),
     ]
@@ -1083,6 +1233,7 @@ _ENTRY_KEYS = {
     "confusion_matrices": list, "details": dict, "limitations": list,
 }
 _NUM = (int, float, type(None))
+MODEL_IDS = ["flood", "anomaly_filter", "edge", "edge_lite", "lstm"]
 
 
 def validate_card(card: dict):
@@ -1094,7 +1245,9 @@ def validate_card(card: dict):
     need(card.get("provenance") in ("SYNTHETIC", "REAL", "MIXED", "NONE"), "provenance")
     need(isinstance(card.get("banner"), str) and card["banner"], "banner")
     need(isinstance(card.get("models"), list), "models list")
-    need([e.get("id") for e in card["models"]] == ["flood", "anomaly_filter", "edge", "lstm"], "model ids/order")
+    # MODEL_IDS; a card written before the lite edge model (no "edge_lite") is still valid
+    ids = [e.get("id") for e in card["models"]]
+    need(ids in (MODEL_IDS, [i for i in MODEL_IDS if i != "edge_lite"]), "model ids/order")
     for e in card["models"]:
         for key, typ in _ENTRY_KEYS.items():
             need(isinstance(e.get(key), typ) and key in e, f"{e.get('id')}.{key}")

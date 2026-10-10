@@ -1,26 +1,39 @@
 import "leaflet/dist/leaflet.css";
 import { useQuery } from "@tanstack/react-query";
 import type L from "leaflet";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { MapContainer, TileLayer } from "react-leaflet";
 import { apiGet } from "../api/client";
-import type { HazardZone, HazardZonesResponse, NodeHealth, NodeHealthResponse, SosListResponse, SosRequest } from "../api/types";
+import type {
+  HazardZone, HazardZonesResponse, HeatmapResponse, Hotspot, NodeHealth, NodeHealthResponse, Role, SosListResponse,
+  SosRequest, UnlocatedNodeSos,
+} from "../api/types";
+import { AlertActions } from "../components/AlertActions";
 import { UserChip } from "../components/AppHeader";
 import { useMe } from "../hooks/useAuth";
 import { AlarmSoundToggle, EmergencyAlarm } from "../components/EmergencyAlarm";
 import { Logo } from "../components/Logo";
+import { HotspotLayer, HotspotSection, NodeValuesList } from "../components/RiskLayers";
+import { VillageSirens } from "../components/VillageSirens";
 import styles from "../components/Officer.module.css";
 import {
   FocusOnNode, HazardZones, MapAutoResize, NodeMarkers, SosMarkers, prefersReducedMotion, useResolveAllSos,
   useResolveSos, type FocusRequest,
 } from "../components/officerMap";
-import { alarmItemsFromZones, alarmKey, hazardTitle, receivesAlarm, type AlarmItem } from "../lib/alarm";
-import { hazardIcon, hospitalZoneNote, manualLocationNote, percent } from "../lib/hazards";
+import { alarmItemsFromZones, alarmKey, hazardTitle, receivesAlarm, showKeyOf, type AlarmItem } from "../lib/alarm";
+import {
+  CARD_REASONS, approximateLocationNote, confidenceReasons, confidenceText, hazardIcon, hazardTypeText, hospitalZoneNote,
+  hotspotNote, isApproximateSos, joinReasons, manualLocationNote, nodeButtonNote, peopleNeedsText, percent, sosAccuracyText,
+} from "../lib/hazards";
+import { isHotspotRange, type HotspotRange } from "../lib/sensors";
 import { SEVERITY_RANK } from "../lib/severity";
+import { CAP_FEED_URL } from "../lib/alertLinks";
+import { readStored, writeStored } from "../lib/storage";
 import { useBackgroundRefetch } from "../lib/useBackgroundRefetch";
 
 const CENTER: [number, number] = [29.3919, 79.4542];
 const ZONES_MS = 5000;
+const HOTSPOT_RANGE_KEY = "sanjeevni_officer_hotspots";
 
 export function OfficerPage() {
   // Same refresh rates as the classic page
@@ -41,6 +54,22 @@ export function OfficerPage() {
     queryKey: ["node-health"],
     queryFn: () => apiGet<NodeHealthResponse>("/api/node-health"),
     refetchInterval: 10_000,
+  });
+  // Hotspot layer (off by default; the officer's choice is remembered on this device)
+  const [hotspotRange, setHotspotRangeState] = useState<HotspotRange>(() => {
+    const stored = readStored(HOTSPOT_RANGE_KEY);
+    return isHotspotRange(stored) ? stored : "off";
+  });
+  const setHotspotRange = useCallback((r: HotspotRange) => {
+    setHotspotRangeState(r);
+    writeStored(HOTSPOT_RANGE_KEY, r);
+  }, []);
+  const hotspots = useQuery({
+    queryKey: ["hotspots", hotspotRange],
+    queryFn: () => apiGet<HeatmapResponse>(`/api/officer/heatmap?range=${hotspotRange}`),
+    enabled: hotspotRange !== "off",
+    refetchInterval: 60_000,
+    staleTime: 30_000,
   });
   const markerRefs = useRef(new Map<string, L.Marker>());
   const mapRef = useRef<L.Map | null>(null);
@@ -68,6 +97,12 @@ export function OfficerPage() {
     else mapRef.current?.flyTo([s.latitude, s.longitude], 16, { duration: 1 });
     setTimeout(() => markerRefs.current.get(`sos:${s.id}`)?.openPopup(), reduce ? 50 : 1100);
   };
+  const showHotspot = (h: Hotspot) => {
+    if (h.latitude == null || h.longitude == null) return;
+    if (prefersReducedMotion()) mapRef.current?.setView([h.latitude, h.longitude], 14, { animate: false });
+    else mapRef.current?.flyTo([h.latitude, h.longitude], 14, { duration: 1 });
+    setMapStatus(`Showing hotspot at ${h.node_id} (${h.location}) on the map`);
+  };
   const showZoneFromList = (nodeId: string, hazardType: string) => {
     showZone(nodeId, hazardType);
     setMapStatus(`Showing ${hazardTitle(hazardType)} at ${nodeId} on the map`);
@@ -75,7 +110,8 @@ export function OfficerPage() {
   const zoneList = useMemo(() => zones.data?.zones ?? [], [zones.data]);
   const alarmItems = useMemo(() => alarmItemsFromZones(zoneList), [zoneList]);
   // Only officers get the pop-up + siren (admins can open this map too)
-  const alarmOn = receivesAlarm(useMe().data?.user.role);
+  const role = useMe().data?.user.role;
+  const alarmOn = receivesAlarm(role);
 
   // "Show" in the alarm: fly to the zone, open the panel, announce it and
   // move keyboard focus to that zone's button (the dialog has just closed).
@@ -84,7 +120,9 @@ export function OfficerPage() {
   const focusTimer = useRef<number | undefined>(undefined);
   const showAlarmItem = useCallback(
     (item: AlarmItem) => {
-      const z = zoneListRef.current.find((zone) => alarmKey(zone.node_id, zone.hazard_type) === item.key);
+      // an area-wide forecast item goes to its most severe node's zone
+      const key = showKeyOf(item);
+      const z = zoneListRef.current.find((zone) => alarmKey(zone.node_id, zone.hazard_type) === key);
       if (z) showZone(z.node_id, z.hazard_type);
       else showZone(item.nodeId);
       setCollapsed(false);
@@ -93,7 +131,7 @@ export function OfficerPage() {
       // runs after the dialog's own focus restore (0 ms timer)
       focusTimer.current = window.setTimeout(() => {
         const btn = Array.from(document.querySelectorAll<HTMLElement>("[data-zone-key]")).find(
-          (el) => el.dataset.zoneKey === item.key,
+          (el) => el.dataset.zoneKey === key,
         );
         const target = btn ?? document.getElementById("officer-panel-title");
         const reduce = prefersReducedMotion();
@@ -120,6 +158,8 @@ export function OfficerPage() {
         <MapContainer center={CENTER} zoom={12} className={styles.map} ref={mapRef}>
           <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                      attribution="&copy; OpenStreetMap contributors" />
+          <HotspotLayer hotspots={hotspotRange !== "off" ? hotspots.data?.hotspots ?? [] : []}
+                        days={hotspots.data?.days ?? null} />
           <HazardZones zones={zoneList} markerRefs={markerRefs} />
           <SosMarkers requests={sos.data?.data ?? []} markerRefs={markerRefs} />
           <NodeMarkers nodes={health.data?.nodes ?? []} />
@@ -131,13 +171,19 @@ export function OfficerPage() {
       <OfficerPanel sos={sos.data} health={health.data} zones={zones.data ? zoneList : undefined}
                     loadError={zones.isError || sos.isError} onShowSos={showSosOnMap} onShowZone={showZoneFromList}
                     collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} mapStatus={mapStatus}
-                    alarmOn={alarmOn} />
+                    alarmOn={alarmOn} role={role}
+                    hotspots={
+                      <HotspotSection range={hotspotRange} onRangeChange={setHotspotRange} data={hotspots.data}
+                                      isPending={hotspots.isPending} error={hotspots.error} onShow={showHotspot} />
+                    } />
       {alarmOn && <EmergencyAlarm items={alarmItems} onShow={showAlarmItem} returnFocusTo="officer-panel-title" />}
     </div>
   );
 }
 
-function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, collapsed, onToggle, mapStatus, alarmOn }: {
+function OfficerPanel({
+  sos, health, zones, loadError, onShowSos, onShowZone, collapsed, onToggle, mapStatus, alarmOn, role, hotspots,
+}: {
   sos: SosListResponse | undefined;
   health: NodeHealthResponse | undefined;
   zones: HazardZone[] | undefined;
@@ -148,8 +194,12 @@ function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, co
   onToggle: () => void;
   mapStatus: string;
   alarmOn: boolean;
+  role: Role | undefined;
+  /** the hotspot layer's controls + list (its state lives in OfficerPage, next to the map) */
+  hotspots: ReactNode;
 }) {
   const resolveAll = useResolveAllSos();
+  const unlocatedCount = sos?.unlocated_node_sos?.length ?? 0;
 
   // Snapshot the ids on screen BEFORE the confirm dialog: it blocks the
   // page (and polling), and a request that arrives meanwhile has not been
@@ -171,8 +221,13 @@ function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, co
           <Logo size={30} />
           <span className={styles.titleText}>Officer view</span>
         </h1>
-        {sos && sos.count > 0 && collapsed && (
-          <span className={styles.headerCount}>{sos.count} SOS</span>
+        {/* Counts the unlocated node SOS too: they have no pin, and their
+            banner is inside the hidden body - without this a collapsed panel
+            would show nothing at all for them. */}
+        {sos && collapsed && sos.count + unlocatedCount > 0 && (
+          <span className={styles.headerCount}>
+            {sos.count + unlocatedCount} SOS{unlocatedCount > 0 && ` (${unlocatedCount} no position)`}
+          </span>
         )}
         <button type="button" className={styles.collapse} aria-expanded={!collapsed} aria-controls="officer-panel-body"
                 onClick={onToggle}>
@@ -193,6 +248,7 @@ function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, co
         <section className={styles.section} aria-labelledby="sos-section-title">
           <h2 id="sos-section-title" className={styles.sectionTitle}>SOS requests</h2>
           {!sos && <p className={styles.muted}>Loading SOS requests...</p>}
+          {sos && (sos.unlocated_node_sos?.length ?? 0) > 0 && <UnlocatedNodeSosList requests={sos.unlocated_node_sos!} />}
           {sos && sos.count > 0 && (
             <>
               <div className={styles.sosSummary}>
@@ -208,12 +264,19 @@ function OfficerPanel({ sos, health, zones, loadError, onShowSos, onShowZone, co
               <SosQueue requests={sos.data} onShow={onShowSos} />
             </>
           )}
-          {sos && sos.count === 0 && <div className={styles.allClear}>✅ All SOS requests resolved</div>}
+          {sos && sos.count === 0 && !sos.unlocated_node_sos?.length && (
+            <div className={styles.allClear}>✅ All SOS requests resolved</div>
+          )}
         </section>
 
-        <HazardList zones={zones} onShow={onShowZone} />
+        <VillageSirens role={role} />
+        <HazardList zones={zones} onShow={onShowZone} role={role} />
+        {hotspots}
         <NodeHealthSection health={health} />
         <Legend />
+        <p className={styles.feedNote}>
+          <a href={CAP_FEED_URL}>Public CAP 1.2 alert feed (Atom)</a> - confirmed alerts for other dashboards
+        </p>
       </div>
     </aside>
   );
@@ -243,11 +306,19 @@ function SosQueue({ requests, onShow }: { requests: SosRequest[]; onShow: (s: So
                 <strong id={titleId} className={styles.sosId}>SOS #{s.id}</strong>
                 {s.escalated && <span className={styles.escalatedBadge}>Escalated</span>}
                 {s.location_source === "manual" && <span className={styles.manualBadge}>Set by hand</span>}
+                {s.location_source === "node" && <span className={styles.nodeBadge}>Node button</span>}
+                {s.location_source === "hotspot" && <span className={styles.nodeBadge}>SOS Wi-Fi</span>}
+                {isApproximateSos(s) && <span className={styles.manualBadge}>Approximate</span>}
+                {sosAccuracyText(s) && <span className={styles.accuracyChip}>{sosAccuracyText(s)}</span>}
                 <span className={styles.wait}>
                   <span className={styles.waitValue}>{formatWait(s.minutes_open)}</span> waiting
                 </span>
               </div>
               {manualLocationNote(s) && <div className={styles.queueManual}>{manualLocationNote(s)}</div>}
+              {approximateLocationNote(s) && <div className={styles.queueManual}>{approximateLocationNote(s)}</div>}
+              {nodeButtonNote(s) && <div className={styles.queueNode}>{nodeButtonNote(s)}</div>}
+              {hotspotNote(s) && <div className={styles.queueNode}>{hotspotNote(s)}</div>}
+              {peopleNeedsText(s) && <div className={styles.queuePeople}>{peopleNeedsText(s)}</div>}
               {s.note && <div className={styles.queueNote}>{s.note}</div>}
               <div className={styles.queueMeta}>
                 Nearest hospital: {s.nearest_hospital} ({s.hospital_distance_km} km straight-line)
@@ -277,10 +348,46 @@ function SosQueue({ requests, onShow }: { requests: SosRequest[]; onShow: (s: So
   );
 }
 
+/**
+ * SOS-button presses (or offline SOS Wi-Fi requests) at a node/gateway that
+ * has no registered position: there is nowhere to put a pin, but someone
+ * asked for help - so they are listed loudly at the top of the SOS section
+ * until resolved (server.js createNodeButtonSos / createHotspotSos).
+ */
+function UnlocatedNodeSosList({ requests }: { requests: UnlocatedNodeSos[] }) {
+  const resolve = useResolveSos();
+  const anyHotspot = requests.some((u) => u.location_source === "hotspot");
+  return (
+    <div className={styles.unlocated} role="alert">
+      <p className={styles.unlocatedTitle}>
+        {anyHotspot
+          ? "SOS from a node or offline SOS Wi-Fi with no registered position - find where it is installed"
+          : "SOS button pressed on a node with no registered position - find where the node is installed"}
+      </p>
+      <ul className={styles.unlocatedList}>
+        {requests.map((u) => (
+          <li key={u.id}>
+            <strong>SOS #{u.id} · {u.node_id}</strong> - {formatWait(u.minutes_open)} waiting
+            {hotspotNote(u) && <div>{hotspotNote(u)}</div>}
+            {peopleNeedsText(u) && <div className={styles.queuePeople}>{peopleNeedsText(u)}</div>}
+            {u.note && <div className={styles.queueNote}>{u.note}</div>}
+            <button type="button" className={styles.actionBtn} onClick={() => resolve.mutate(u.id)}
+                    disabled={resolve.isPending} aria-label={`Resolve SOS #${u.id}`}>
+              {resolve.isPending && resolve.variables === u.id ? "Resolving..." : "Resolve"}
+            </button>
+          </li>
+        ))}
+      </ul>
+      <p className={styles.unlocatedHint}>Register the node's position on the admin page so the next press shows on the map.</p>
+    </div>
+  );
+}
+
 /** Keyboard / screen-reader path to every hazard zone; most severe first. */
-function HazardList({ zones, onShow }: {
+function HazardList({ zones, onShow, role }: {
   zones: HazardZone[] | undefined;
   onShow: (nodeId: string, hazardType: string) => void;
+  role: Role | undefined;
 }) {
   const ordered = useMemo(
     () => [...(zones ?? [])].sort((a, b) =>
@@ -304,14 +411,20 @@ function HazardList({ zones, onShow }: {
                       onClick={() => onShow(z.node_id, z.hazard_type)}>
                 <span className={styles.zoneIcon} aria-hidden="true">{hazardIcon(z.hazard_type)}</span>
                 <span className={styles.zoneText}>
-                  <span className={styles.zoneName}>{z.node_id} · {z.hazard_type}</span>
+                  <span className={styles.zoneName}>{z.node_id} · {hazardTypeText(z.hazard_type)}</span>
                   <span className={styles.zoneMeta}>
                     Risk {percent(z.risk_score)}{z.confirmed ? "" : " · awaiting confirmation"}
                     {z.stale === true ? " · stale (node may be offline)" : ""}
                   </span>
+                  <ZoneConfidence zone={z} />
                 </span>
                 <span className={`${styles.sevChip} ${styles[`sev_${z.severity}`] ?? ""}`}>{z.severity}</span>
               </button>
+              {/* confirmed alerts only: CAP XML / PDF report / timeline (outside the zone button) */}
+              {z.confirmed && typeof z.alert_id === "number" && (
+                <AlertActions alertId={z.alert_id} nodeId={z.node_id} role={role} compact
+                              label={`${hazardTitle(z.hazard_type)} at ${z.node_id}`} />
+              )}
             </li>
           ))}
         </ul>
@@ -361,13 +474,32 @@ function NodeHealthSection({ health }: { health: NodeHealthResponse | undefined 
           ))}
         </ul>
       )}
+      {health && <NodeValuesList nodes={health.nodes} />}
     </section>
   );
 }
 
+/**
+ * Confidence line inside a zone button. Plain spans (a button may only hold
+ * phrasing content), so not the shared <Confidence> block; same wording.
+ * Nothing for a zone without a score.
+ */
+function ZoneConfidence({ zone }: { zone: HazardZone }) {
+  const text = confidenceText(zone);
+  if (!text) return null;
+  const reasons = confidenceReasons(zone, CARD_REASONS);
+  return (
+    <span className={`${styles.zoneMeta} ${styles.zoneConfidence}`}
+          data-confidence={zone.confidence_label ?? "unlabelled"}>
+      {text}{reasons.length > 0 ? ` - ${joinReasons(reasons)}` : ""}
+    </span>
+  );
+}
+
 const HAZARD_TYPES: [type: string, label: string][] = [
-  ["flood", "Flood"], ["fire", "Fire"], ["gas leak", "Gas leak"], ["extreme heat", "Heat"],
-  ["landslide", "Landslide"], ["air pollution", "Air pollution"], ["water quality degradation", "Water quality"],
+  ["flood", "Flood"], ["flash_flood", "Flash flood (river rising fast)"], ["fire", "Fire"], ["smoke", "Smoke"],
+  ["gas leak", "Gas leak"], ["extreme heat", "Heat"], ["landslide", "Landslide"], ["air pollution", "Air pollution"],
+  ["water quality degradation", "Water quality"], ["heavy_rain", "Heavy rain"], ["high_wind", "High wind (forecast)"],
 ];
 
 function Legend() {
@@ -383,6 +515,7 @@ function Legend() {
       <p className={styles.legendSub}>Markers</p>
       <ul className={styles.legendList}>
         <li><span className={styles.legendIcon} aria-hidden="true">📍</span>Person needing help (SOS)</li>
+        <li>N / W badge on a pin: node SOS button / offline SOS Wi-Fi (pin = the node)</li>
         <li><span className={`${styles.swatch} ${styles.nodeOk}`} aria-hidden="true" />Sensor node - normal</li>
         <li><span className={`${styles.swatch} ${styles.nodeWarning}`} aria-hidden="true" />Sensor node - warning</li>
         <li><span className={`${styles.swatch} ${styles.nodeCritical}`} aria-hidden="true" />Sensor node - critical</li>

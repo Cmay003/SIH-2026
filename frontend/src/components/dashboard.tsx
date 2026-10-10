@@ -1,9 +1,12 @@
 // Dashboard building blocks. All server values are rendered as React text
 // (auto-escaped) - no innerHTML anywhere, which is what closes the stored
 // XSS hole the original pages had (B2).
-import type { Hazard, HospitalRoute, SensorRow, Severity } from "../api/types";
-import { alarmKey } from "../lib/alarm";
-import { hazardIcon, isSevere, orDash, percent, severityClass, staleText } from "../lib/hazards";
+import type { Hazard, HospitalRoute, Role, SensorRow, Severity } from "../api/types";
+import { alarmKey, hazardTitle } from "../lib/alarm";
+import { CARD_REASONS, hazardIcon, isSevere, orDash, percent, severityClass, staleText } from "../lib/hazards";
+import { AlertActions } from "./AlertActions";
+import { Confidence } from "./Confidence";
+import { PublicAdviceSection } from "./PublicAdvice";
 import styles from "./Dashboard.module.css";
 
 const officerLink = (nodeId: string) => `/officer.html?focus=${encodeURIComponent(nodeId)}`;
@@ -146,7 +149,7 @@ export function KpiTiles({
     { label: "Device", value: orDash(latest?.device_id), text: true },
     {
       label: "Hazard",
-      value: latest?.hazard ? latest.hazard.toUpperCase() : "--",
+      value: latest?.hazard ? hazardTitle(latest.hazard).toUpperCase() : "--",
       text: true,
       icon: latest?.hazard ? hazardIcon(latest.hazard) : undefined,
     },
@@ -221,7 +224,7 @@ export function HospitalCard({ route }: { route: HospitalRoute }) {
 function HazardTitle({ hazard }: { hazard: Hazard }) {
   return (
     <h3>
-      <span aria-hidden="true">{hazardIcon(hazard.hazard_type)}</span> {hazard.label}: {hazard.hazard_type.toUpperCase()}
+      <span aria-hidden="true">{hazardIcon(hazard.hazard_type)}</span> {hazard.label}: {hazardTitle(hazard.hazard_type).toUpperCase()}
     </h3>
   );
 }
@@ -267,6 +270,7 @@ export function CriticalHazard({
             </div>
           )}
           <StaleNote hazard={hazard} />
+          <Confidence value={hazard} maxReasons={CARD_REASONS} />
           <span className={styles.hint}>
             Open on officer map <span aria-hidden="true">→</span>
           </span>
@@ -290,7 +294,12 @@ function StaleNote({ hazard }: { hazard: Pick<Hazard, "stale" | "last_reading_at
   );
 }
 
-export function HazardList({ hazards, highlightKey = null }: { hazards: Hazard[]; highlightKey?: string | null }) {
+export function HazardList({ hazards, highlightKey = null, role }: {
+  hazards: Hazard[];
+  highlightKey?: string | null;
+  /** signed-in role: officers/admins also get the PDF report + timeline buttons */
+  role?: Role;
+}) {
   if (hazards.length === 0) {
     return <p className={styles.empty}>No active hazards - all nodes normal.</p>;
   }
@@ -325,11 +334,23 @@ export function HazardList({ hazards, highlightKey = null }: { hazards: Hazard[]
                   </div>
                 )}
                 <StaleNote hazard={h} />
+                <Confidence value={h} maxReasons={CARD_REASONS} />
                 <div className={styles.hint}>
                   <span aria-hidden="true">📌</span> Open on officer map
                 </div>
               </article>
             </a>
+            {/* outside the card link: a link may not contain other links/buttons */}
+            {typeof h.alert_id === "number" && (
+              <div className={styles.cardActions}>
+                <AlertActions alertId={h.alert_id} nodeId={h.node_id} role={role} compact
+                              label={`${hazardTitle(h.hazard_type)} at ${h.node_id}`} />
+              </div>
+            )}
+            <div className={styles.cardActions}>
+              <PublicAdviceSection hazardType={h.hazard_type} severity={h.severity}
+                                   label={`${hazardTitle(h.hazard_type)} at ${h.node_id}`} />
+            </div>
           </li>
         );
       })}
@@ -403,7 +424,7 @@ export function SensorTable({
             <tr key={r.id} className={isSevere(r.risk) ? styles.rowSevere : undefined}>
               <td className={`${styles.num} ${styles.muted}`}>{r.id}</td>
               <td className={styles.device}>{r.device_id}</td>
-              <td>{r.hazard}</td>
+              <td>{r.hazard.replace(/_/g, " ")}</td>
               <td className={styles.num}><Measure value={r.water_level} digits={2} unit="m" /></td>
               <td className={styles.num}><Measure value={r.temperature} digits={1} unit="°C" /></td>
               <td className={styles.num}><Measure value={r.humidity} digits={1} unit="%" /></td>

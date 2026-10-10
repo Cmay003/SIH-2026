@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:,"><!-- no favicon request: /favicon.ico is a 404 in classic mode -->
     <title>SANJEEVNI - User Portal</title>
     <style>
       :root {
@@ -141,6 +142,20 @@
         font-size: 14px;
         color: #374151;
       }
+      /* Device fix less exact than APPROX_LOCATION_M (no GPS) - a warning only,
+         the SOS button stays usable */
+      .approx-notice {
+        margin-top: 12px;
+        background: #fff4e0;
+        color: #7a4a00;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .approx-notice p {
+        margin: 0 0 8px;
+      }
 
       /* ---- Row of two cards ---- */
       .grid-row {
@@ -181,6 +196,12 @@
       .risk-label.CRITICAL {
         color: var(--red);
       }
+      /* the hazard in the person's zone + what to do (data/hazard_advice.json) */
+      .hazard-info { margin: 4px 0 0; }
+      .hazard-info .hazard-name { font-weight: 700; margin: 0 0 4px; }
+      .hazard-info .advice-head { font-weight: 600; margin: 6px 0 2px; }
+      .hazard-info ul { margin: 0; padding-left: 20px; }
+      .hazard-info li { margin: 2px 0; }
 
       .score-ring {
         flex: 0 0 auto;
@@ -368,6 +389,12 @@
         <div class="locate-status" id="locateStatus">
           Detecting your location automatically...
         </div>
+        <!-- This classic page has no map picker (the React SOS page does), so
+             the notice offers a retry and asks for a description instead. -->
+        <div class="approx-notice" id="approxNotice" role="note" style="display: none">
+          <p id="approxText"></p>
+          <button id="approxRetryBtn" type="button" class="btn-primary" data-i18n="approxRetry">Try again</button>
+        </div>
       </section>
 
       <section class="grid-row">
@@ -378,6 +405,8 @@
             <p class="muted" id="riskDesc">
               SANJEEVNI is monitoring environmental conditions in your area.
             </p>
+            <!-- HUMAN REVIEW: safety-critical advice from data/hazard_advice.json (Hindi unreviewed) -->
+            <div class="hazard-info" id="hazardInfo" aria-live="polite" hidden></div>
           </div>
           <div class="score-ring">
             <div class="score-value" id="scoreValue">0</div>
@@ -479,6 +508,12 @@
           sosHintAvailable: "Tap SOS if you need emergency help - responders will receive your location.",
           sosHintUnlocked: "High risk detected nearby. Tap SOS to alert responders.",
           sosHintActive: "Your SOS is already active. Responders have been notified - waiting for it to be resolved.",
+          // HUMAN REVIEW: safety-critical citizen text - check wording before release.
+          approxNotice: "Your location is approximate (about {acc}). If you can, try again near a window or outdoors, and describe where you are (village, landmark) in the note below.",
+          approxRetry: "Try again",
+          // same strings as the React SOS page (frontend/src/lib/i18n.ts)
+          hazardInArea: "Active hazard in your area:",
+          whatToDo: "What to do now:",
         },
         hi: {
           portalLabel: "नागरिक पोर्टल",
@@ -492,6 +527,12 @@
           sosHintAvailable: "आपातकालीन सहायता चाहिए तो एसओएस दबाएं - आपकी लोकेशन सहायता दल को भेजी जाएगी।",
           sosHintUnlocked: "आस-पास उच्च जोखिम पाया गया। मदद के लिए एसओएस दबाएं।",
           sosHintActive: "आपका एसओएस पहले से सक्रिय है। सहायता दल को सूचित कर दिया गया है - समाधान की प्रतीक्षा है।",
+          // HUMAN REVIEW: new approximate-location text - Hindi needs native-speaker review
+          approxNotice: "आपकी लोकेशन अनुमानित है (लगभग {acc})। हो सके तो खिड़की के पास या खुले में फिर से कोशिश करें, और नीचे संदेश में बताएं कि आप कहाँ हैं (गाँव, कोई पहचान का स्थान)।",
+          approxRetry: "फिर से कोशिश करें",
+          // same strings as the React SOS page (frontend/src/lib/i18n.ts) - not new
+          hazardInArea: "आपके क्षेत्र में सक्रिय खतरा:",
+          whatToDo: "अभी क्या करें:",
         },
       };
       let currentLang = localStorage.getItem("sanjeevni_lang") || "en";
@@ -511,6 +552,8 @@
         localStorage.setItem("sanjeevni_lang", currentLang);
         applyTranslations();
         updateSosGate(); // refresh the currently-shown SOS hint in the new language
+        updateApproxNotice();
+        renderHazardInfo();
       });
 
       applyTranslations();
@@ -583,6 +626,26 @@
       const sosModalTextEl = document.getElementById("sosModalText");
 
       let userCoords = null; // { latitude, longitude } once detected
+      // How far off userCoords may be (the browser's coords.accuracy, metres),
+      // or null if unknown. A device without GPS still answers from Wi-Fi /
+      // cell / IP positioning - sometimes kilometres off.
+      let userAccuracyM = null;
+      // Same value as APPROX_LOCATION_M in server.js and frontend/src/lib/sos.ts
+      const APPROX_LOCATION_M = 500;
+      const accuracyOrNull = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
+      const formatAccuracy = (m) =>
+        m < 1000 ? `\u00b1${Math.round(m)} m` : `\u00b1${m < 10000 ? (m / 1000).toFixed(1) : Math.round(m / 1000)} km`;
+      // Never touches the SOS button: with a location, SOS always works.
+      function updateApproxNotice() {
+        const notice = document.getElementById("approxNotice");
+        if (!userCoords || userAccuracyM === null || userAccuracyM <= APPROX_LOCATION_M) {
+          notice.style.display = "none";
+          return;
+        }
+        document.getElementById("approxText").textContent =
+          translations[currentLang].approxNotice.replace("{acc}", formatAccuracy(userAccuracyM));
+        notice.style.display = "block";
+      }
       let zones = []; // from /api/hazard-zones
       let areaSeverity = "LOW"; // LOW | MEDIUM | HIGH | CRITICAL
       let areaScore = 0;
@@ -692,6 +755,62 @@
         }
       }
 
+      // The hazard in the person's zone, with its icon and what to do - the
+      // same advice table as the React SOS page and the WhatsApp alerts
+      // (data/hazard_advice.json, served by server.js as /hazard-advice.json).
+      // Same icons as index.html / officer.html.
+      const HAZARD_ICONS = {
+        "flood": "🌊", "flash_flood": "⏫", "gas leak": "☣️", "fire": "🔥", "smoke": "💨",
+        "extreme heat": "🌡️", "landslide": "⛰️", "air pollution": "😷", "water quality degradation": "💧",
+        "heavy_rain": "🌧️", "high_wind": "🌬️",
+      };
+      let adviceTable = null; // null until loaded; the card then shows the severity only
+      let areaZone = null;
+      fetch("/hazard-advice.json")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((t) => {
+          adviceTable = t;
+          renderHazardInfo();
+        })
+        .catch((e) => console.log("hazard-advice error", e));
+
+      function renderHazardInfo() {
+        const box = document.getElementById("hazardInfo");
+        const z = areaZone;
+        if (!z || !adviceTable || !(z.severity in severityRank) || z.severity === "LOW") {
+          box.hidden = true;
+          box.textContent = "";
+          return;
+        }
+        const own = (o, k) => o && Object.prototype.hasOwnProperty.call(o, k);
+        const entry = own(adviceTable.hazards, z.hazard_type) ? adviceTable.hazards[z.hazard_type] : adviceTable.default;
+        const lang = currentLang === "hi" ? "hi" : "en";
+        const level = z.severity === "MEDIUM" ? "MEDIUM" : "HIGH";
+        const actions = (entry && entry.actions && entry.actions[level] && entry.actions[level][lang]) || [];
+        const dict = translations[currentLang];
+        // textContent only: the names and actions are data, never HTML
+        box.textContent = "";
+        const name = document.createElement("p");
+        name.className = "hazard-name";
+        const icon = own(HAZARD_ICONS, z.hazard_type) ? HAZARD_ICONS[z.hazard_type] : "⚠️";
+        name.textContent = `${icon} ${dict.hazardInArea} ${(entry && entry.name && entry.name[lang]) || z.hazard_type}`;
+        box.appendChild(name);
+        if (actions.length) {
+          const head = document.createElement("p");
+          head.className = "advice-head";
+          head.textContent = dict.whatToDo;
+          box.appendChild(head);
+          const ul = document.createElement("ul");
+          for (const a of actions) {
+            const li = document.createElement("li");
+            li.textContent = a;
+            ul.appendChild(li);
+          }
+          box.appendChild(ul);
+        }
+        box.hidden = false;
+      }
+
       function evaluateArea() {
         if (!userCoords) return;
 
@@ -720,6 +839,8 @@
         riskLabelEl.innerText = `${areaSeverity} RISK`;
         riskDescEl.innerText = descByLevel[areaSeverity] || descByLevel.LOW;
         scoreValueEl.innerText = areaScore;
+        areaZone = best;
+        renderHazardInfo();
 
         updateSosGate();
       }
@@ -777,6 +898,8 @@
               latitude: position.coords.latitude,
               longitude: position.coords.longitude,
             };
+            userAccuracyM = accuracyOrNull(position.coords.accuracy);
+            updateApproxNotice();
             locateStatusEl.innerText = `Location detected (${userCoords.latitude.toFixed(4)}, ${userCoords.longitude.toFixed(4)}).`;
             locateBtn.disabled = false;
             evaluateArea();
@@ -793,6 +916,7 @@
       }
 
       locateBtn.addEventListener("click", () => requestLocation());
+      document.getElementById("approxRetryBtn").addEventListener("click", () => requestLocation());
 
       // Checks whether THIS device already has an unresolved SOS -
       // called on page load (so a refresh restores the locked state
@@ -863,7 +987,10 @@
               latitude: position.coords.latitude,
               longitude: position.coords.longitude,
             };
+            const accuracyM = accuracyOrNull(position.coords.accuracy);
             userCoords = coords; // keep the rest of the UI in sync too
+            userAccuracyM = accuracyM;
+            updateApproxNotice();
             showSosModal("Sending SOS...");
 
             fetch("/api/sos", {
@@ -874,6 +1001,9 @@
                 longitude: coords.longitude,
                 note: noteEl.value,
                 device_id: deviceId,
+                // always a device fix on this page; officers see how far off it may be
+                location_source: "gps",
+                location_accuracy_m: accuracyM,
               }),
             })
               .then(async (res) => {

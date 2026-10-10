@@ -1,0 +1,23 @@
+FLASH FLOOD RESPONSE SOP (sample - generic guidance written for this
+project, not taken from a district SOP; needs review by a disaster
+management expert before field use)
+
+A flash flood alert means the river at the sensor is rising fast, even if
+the water level is still low. There may be only minutes before the water
+reaches the bank.
+
+LOW severity: Continue routine monitoring of the river level and its rate
+of rise. No public alert required.
+
+MEDIUM severity: Notify the local disaster management authority. Advise
+people near the riverbank, stream beds and low crossings to keep away from
+the water and be ready to move to higher ground quickly. Watch for further
+updates.
+
+HIGH severity: Issue an immediate advisory for riverside and low-lying
+zones. People near the river should move away from the bank and stream
+beds to higher ground now, without waiting for the water to arrive. Do not
+walk, swim or drive through flowing water, and do not cross causeways or
+bridges with water over them. Authorities should coordinate with SDRF/NDRF
+teams and keep people away from the river until it is declared safe.
+Emergency number: 112.

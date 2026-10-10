@@ -348,3 +348,42 @@ h3[tabindex="-1"]:focus {
     outline: 3px solid CanvasText;
   }
 }
+
+/* Paper is white: print with the LIGHT palette whatever the screen theme.
+   Printed from a dark-theme device, the district report's headings came out
+   #a5d6a7 on white (1.6:1) and its notes #9fb0a2 (2.3:1) - measured in Edge
+   (W2 browser check). Same values as the light :root above. */
+@media print {
+  :root {
+    --page-bg: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #f1f8f2;
+    --text: #1b1b1b;
+    --text-muted: #5f6b60;
+    --heading: #1b5e20;
+    --link: #2e7d32;
+    --link-hover: #1b5e20;
+    --border: #dbe7dc;
+    --border-strong: #7d8f80;
+    --input-bg: #ffffff;
+    --green-light: #e8f5e9;
+    --green-lighter: #f1f8f2;
+    --sev-medium: #b45309;
+    --sev-high: #d32f2f;
+    --sev-low: #2e7d32;
+    --sev-critical: #b71c1c;
+    --sev-medium-bg: #fff4e0;
+    --sev-high-bg: #fdecea;
+    --sev-critical-bg: #fef2f2;
+    --critical-bg: #fef2f2;
+    --critical-text: #b91c1c;
+    --danger: #c62828;
+    --danger-bg: #fdecea;
+    --warning-text: #8a5300;
+    --warning-bg: #fff4e0;
+    --success: #2e7d32;
+    --info: #1a4f8b;
+    --info-bg: #e8f1fd;
+    color-scheme: light;
+  }
+}

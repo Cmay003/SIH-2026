@@ -27,6 +27,8 @@ from typing import Optional
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
+from alert_confidence import HIGH_CONFIDENCE, MEDIUM_CONFIDENCE
+
 CAP_NAMESPACE = "urn:oasis:names:tc:emergency:cap:1.2"
 
 # Maps SANJEEVNI's own severity bands to CAP's controlled vocabulary.
@@ -49,19 +51,87 @@ CERTAINTY_BY_SOURCE = {
     # confident as the model, not "Unknown" as before.
     "threshold_classifier": "Likely",
     "hardware_test_threshold": "Possible",
+    # A weather-model forecast crossing an IMD rainfall / gale line at a
+    # point is a possibility, not a >50 % likelihood - see the cap below.
+    "weather_forecast": "Possible",
 }
+# CERTAINTY_BY_SOURCE is now only the fallback for alerts stored before the
+# confidence score existed. With a score, certainty_for() below decides.
+
+# CAP 1.2 <certainty> values (spec 3.2.2): "Observed" - determined to have
+# occurred or to be ongoing; "Likely" - p > ~50%; "Possible" - p <= ~50%;
+# "Unlikely" - not expected to occur. The confidence score is NOT a
+# probability (alert_confidence.py), so the cut-offs below are its own
+# label boundaries, not a claim that 0.5 means a 50 % chance.
+#
+# "Observed" needs all of: a High score, confirmation (a repeat or a
+# neighbour node), and a hazard that is itself a MEASURED condition - a
+# gas level, a fire, a fast river rise, a heat or air reading compared
+# with a limit. The flood ML model's output is a RISK estimate and a
+# landslide alert (rain over a threshold, or ground starting to tilt) is a
+# warning of something that may happen, so those top out at "Likely".
+CAP_OBSERVABLE_HAZARDS = (
+    "gas leak", "fire", "smoke", "flash_flood", "extreme heat",
+    "air pollution", "water quality degradation",
+    # heavy rain MEASURED by the node's gauge; a forecast-only one has
+    # severity_source "weather_forecast" and can never be "Observed".
+    "heavy_rain",
+)
+CAP_CERTAINTY_RANK = ("Unlikely", "Possible", "Likely", "Observed")
+CAP_POSSIBLE_MIN_CONFIDENCE = 0.25
+# A tabletop bench rig never stands for a real-world event.
+# A forecast-only alert (severity_source "weather_forecast": heavy_rain /
+# high_wind from the Open-Meteo forecast alone) is a forecast of something
+# that has not happened, made by a weather model, not by SANJEEVNI's
+# sensors or by IMD - at most "Possible", whatever its confidence score.
+CAP_CERTAINTY_CAP_BY_SOURCE = {"hardware_test_threshold": "Possible", "weather_forecast": "Possible"}
+
+
+def certainty_for(
+    confidence: Optional[float],
+    confirmation: Optional[str],
+    hazard_type: str,
+    severity_source: str,
+) -> str:
+    """CAP <certainty> for one alert - see the comment above."""
+    if confidence is None:
+        return CERTAINTY_BY_SOURCE.get(severity_source, "Unknown")
+    confirmed = confirmation == "persistent" or str(confirmation or "").startswith("neighbour:")
+    if (confidence >= HIGH_CONFIDENCE and confirmed and hazard_type in CAP_OBSERVABLE_HAZARDS
+            and severity_source == "threshold_classifier"):
+        certainty = "Observed"
+    elif confidence >= MEDIUM_CONFIDENCE:
+        certainty = "Likely"
+    elif confidence >= CAP_POSSIBLE_MIN_CONFIDENCE:
+        certainty = "Possible"
+    else:
+        certainty = "Unlikely"
+    cap = CAP_CERTAINTY_CAP_BY_SOURCE.get(severity_source)
+    if cap and CAP_CERTAINTY_RANK.index(certainty) > CAP_CERTAINTY_RANK.index(cap):
+        certainty = cap
+    return certainty
 
 # hazard_type -> (CAP <event> text, CAP <category>). <category> must be one
 # of CAP's fixed values: Geo, Met, Safety, Security, Rescue, Fire, Health,
-# Env, Transport, Infra, CBRNE, Other.
+# Env, Transport, Infra, CBRNE, Other. The spec (3.2.2, category) describes
+# "Geo" as "Geophysical (inc. landslide)" and "Met" as "Meteorological
+# (inc. flood)", so floods - including flash floods - are Met (flood was
+# "Geo" here before 2026-10-09). Smoke is filed under Fire: it is reported
+# as a sign that something is burning, not as an air-quality reading.
 HAZARD_TO_CAP = {
-    "flood": ("Flood Warning", "Geo"),
+    "flood": ("Flood Warning", "Met"),
+    "flash_flood": ("Flash Flood Warning", "Met"),
+    "smoke": ("Smoke Warning", "Fire"),
     "gas leak": ("Hazardous Materials Warning", "CBRNE"),
     "fire": ("Fire Warning", "Fire"),
     "extreme heat": ("Extreme Heat Warning", "Met"),
     "landslide": ("Landslide Warning", "Geo"),
     "air pollution": ("Air Quality Alert", "Env"),
     "water quality degradation": ("Water Quality Alert", "Health"),
+    # Extreme weather (2026-10-09). Both are meteorological: CAP 1.2
+    # (3.2.2, category) "Met - Meteorological (inc. flood)".
+    "heavy_rain": ("Heavy Rain Warning", "Met"),
+    "high_wind": ("High Wind Warning", "Met"),
 }
 
 # Optional public dashboard URL for <web>. CAP's <web> is optional, so it
@@ -116,6 +186,16 @@ def cap_identifier(node_id: str, reading_id: Optional[int]) -> str:
     return f"sanjeevni-{safe_node}-{int(reading_id)}"
 
 
+def cap_urgency(severity: str, severity_source: str) -> str:
+    """CAP 1.2 <urgency> (spec 3.2.2): "Immediate" - responsive action
+    SHOULD be taken immediately; "Expected" - soon (within next hour);
+    "Future" - in the near future. A forecast-only alert describes the
+    next 24 h, so it is "Future" whatever its severity."""
+    if severity_source == "weather_forecast":
+        return "Future"
+    return "Immediate" if severity in ("HIGH", "CRITICAL") else "Expected"
+
+
 def generate_cap_alert(
     hazard_type: str,
     severity: str,
@@ -131,6 +211,8 @@ def generate_cap_alert(
     reading_id: Optional[int] = None,
     sent_at: Optional[datetime] = None,
     status: str = "Actual",
+    confidence: Optional[float] = None,
+    confirmation: Optional[str] = None,
 ) -> str:
     """Returns a complete, spec-compliant CAP v1.2 XML string for one
     hazard alert. Never raises on bad input types it can coerce; raises
@@ -143,7 +225,10 @@ def generate_cap_alert(
     the SAME CAP message (same identifier, same <sent>); sent_at falls back
     to now only for a message that has no stored time.
     radius_m: defaults to the severity's zone (CAP_RADIUS_M).
-    status: "Exercise" for simulated alerts - see CAP_STATUSES."""
+    status: "Exercise" for simulated alerts - see CAP_STATUSES.
+    confidence / confirmation: the stored alert's confidence score (0..1)
+    and HazardConfirmer basis; they set <certainty> (certainty_for). Leave
+    confidence None for an alert stored before scores existed."""
     if severity not in SEVERITY_TO_CAP:
         raise ValueError(f"Unknown severity '{severity}' - cannot map to CAP vocabulary")
     if status not in CAP_STATUSES:
@@ -160,7 +245,9 @@ def generate_cap_alert(
         hazard_type, ("Other Hazard Warning", "Other")
     )
     cap_severity = SEVERITY_TO_CAP[severity]
-    cap_certainty = CERTAINTY_BY_SOURCE.get(severity_source, "Unknown")
+    if confidence is not None and not (isinstance(confidence, (int, float)) and 0.0 <= confidence <= 1.0):
+        confidence = None  # a damaged stored value: fall back, do not guess
+    cap_certainty = certainty_for(confidence, confirmation, hazard_type, severity_source)
 
     alert = Element("alert", xmlns=CAP_NAMESPACE)
     SubElement(alert, "identifier").text = identifier
@@ -184,7 +271,7 @@ def generate_cap_alert(
     info = SubElement(alert, "info")
     SubElement(info, "category").text = cap_category
     SubElement(info, "event").text = cap_event
-    SubElement(info, "urgency").text = "Immediate" if severity in ("HIGH", "CRITICAL") else "Expected"
+    SubElement(info, "urgency").text = cap_urgency(severity, severity_source)
     SubElement(info, "severity").text = cap_severity
     SubElement(info, "certainty").text = cap_certainty
     # <expires> sits between <certainty> and <senderName> in CAP's order.
@@ -204,6 +291,13 @@ def generate_cap_alert(
     param_risk = SubElement(info, "parameter")
     SubElement(param_risk, "valueName").text = "sanjeevni_risk_score"
     SubElement(param_risk, "value").text = f"{risk_score:.4f}"
+
+    if confidence is not None:
+        # The score behind <certainty>, for consumers that want the number
+        # (the reasons are in <description>, in the alert text).
+        param_conf = SubElement(info, "parameter")
+        SubElement(param_conf, "valueName").text = "sanjeevni_confidence"
+        SubElement(param_conf, "value").text = f"{confidence:.2f}"
 
     area = SubElement(info, "area")
     SubElement(area, "areaDesc").text = location

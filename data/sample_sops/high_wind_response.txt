@@ -1,0 +1,21 @@
+HIGH WIND RESPONSE SOP (sample - generic guidance written for this
+project, not taken from a district SOP; needs review by a disaster
+management expert before field use)
+
+A high wind alert is based on the weather forecast for the node's area;
+SANJEEVNI nodes do not measure wind. It means strong gusts, or
+gale-force wind as defined by the India Meteorological Department, are
+expected within the next 24 hours.
+
+LOW severity: Continue monitoring the forecast. No public alert required.
+
+MEDIUM severity: Notify the local disaster management authority. Advise
+people to secure loose objects such as tin sheets, signboards and roof
+items, and to avoid standing under trees, hoardings, electric poles and
+weak walls. Check official IMD warnings.
+
+HIGH severity: Issue an advisory. People should stay indoors in a strong
+building, away from windows, and keep away from trees, poles, hoardings
+and fallen power lines. Do not travel unless necessary. Authorities
+should prepare to clear fallen trees, restore power safely and keep
+relief teams ready. Emergency number: 112.

@@ -20,6 +20,7 @@ export default defineConfig({
         officer: `${root}officer.html`,
         admin: `${root}admin.html`, // node registry (admin role only - checked by server.js)
         sos: `${root}sos.html`, // citizen page: keep its bundle small (no map, no auth code)
+        trends: `${root}trends.html`, // risk trends + district report (officer/admin - checked by server.js)
       },
     },
   },

@@ -66,8 +66,10 @@ class Sim7020 {
   }
 
   // POSTs a JSON body. Returns the HTTP status code, or -1 on a module /
-  // network error (caller keeps the readings queued).
-  int httpPost(const char* base, const char* path, const String& json, const char* deviceKey) {
+  // network error (caller keeps the readings queued). `responseBody`
+  // (optional) gets the body of a 200 - see readBody() - or stays empty.
+  int httpPost(const char* base, const char* path, const String& json, const char* deviceKey,
+               String* responseBody = nullptr) {
     String resp;
     String create = String("AT+CHTTPCREATE=\"") + base + "\"";
     if (!command(create.c_str(), "+CHTTPCREATE:", 10000, &resp)) return -1;
@@ -85,6 +87,7 @@ class Sim7020 {
         // +CHTTPNMIH: <id>,<response_code>,<header_length>,<header>
         int afterId = urc.indexOf(',', urc.indexOf("+CHTTPNMIH:"));
         if (afterId > 0) code = urc.substring(afterId + 1).toInt();
+        if (code == 200 && responseBody) readBody(urc, *responseBody);
       }
       command(("AT+CHTTPDISCON=" + String(id)).c_str(), "OK", 5000);
     }
@@ -120,6 +123,58 @@ class Sim7020 {
   }
 
  private:
+  // The response body (it may carry siren commands for the nodes). EVEN
+  // LESS VERIFIED than the rest of this file: written for the content URC
+  //   +CHTTPNMIC: <id>,<flag>,<total_len>,<len>,<content>
+  // (flag 0 = last part) as we read the SIM7020 manual, with the content
+  // taken as hex if it is all hex digits and as text otherwise. Gives up
+  // after NBIOT_BODY_WAIT_MS - the upload's status code is not affected,
+  // only a siren command waits for a WiFi upload or the server's re-send.
+  // Check with the 'a' pass-through what your module really prints.
+  void readBody(const String& already, String& body) {
+    String buf = already;
+    body = "";
+    uint32_t start = millis();
+    int from = 0;
+    while (millis() - start < NBIOT_BODY_WAIT_MS) {
+      while (serial_.available()) buf += (char)serial_.read();
+      int at = buf.indexOf("+CHTTPNMIC:", from);
+      int eol = at >= 0 ? buf.indexOf('\n', at) : -1;
+      if (at < 0 || eol < 0) {  // nothing (complete) yet
+        delay(5);
+        continue;
+      }
+      String line = buf.substring(at + 11, eol);
+      line.trim();
+      from = eol + 1;
+      // <id>,<flag>,<total>,<len>,<content>
+      int c1 = line.indexOf(','), c2 = line.indexOf(',', c1 + 1), c3 = line.indexOf(',', c2 + 1),
+          c4 = line.indexOf(',', c3 + 1);
+      if (c1 < 0 || c2 < 0 || c3 < 0 || c4 < 0) return;
+      int flag = line.substring(c1 + 1, c2).toInt();
+      String part = line.substring(c4 + 1);
+      body += isHex(part) ? fromHex(part) : part;
+      if (flag == 0) return;
+    }
+  }
+
+  static bool isHex(const String& s) {
+    if (s.length() == 0 || s.length() % 2) return false;
+    for (size_t i = 0; i < s.length(); i++)
+      if (!isxdigit((unsigned char)s[i])) return false;
+    return true;
+  }
+
+  static String fromHex(const String& s) {
+    String out;
+    out.reserve(s.length() / 2);
+    for (size_t i = 0; i + 1 < s.length(); i += 2) {
+      char hex[3] = {s[i], s[i + 1], 0};
+      out += (char)strtol(hex, nullptr, 16);
+    }
+    return out;
+  }
+
   HardwareSerial serial_{1};
   bool attached_ = false;
   bool apnSet_ = false;

@@ -11,14 +11,22 @@
 #include "../../firmware/sanjeevni_lora_node/sj_session.h"
 #include "../../firmware/sanjeevni_lora_node/sj_selftest.h"
 #include "../../firmware/sanjeevni_lora_node/sj_warmup.h"
+#include "../../firmware/sanjeevni_lora_node/sj_sos.h"
+#include "../../firmware/sanjeevni_lora_node/sj_siren.h"
+#include "../../firmware/sanjeevni_lora_node/sj_anomaly.h"
+#include "../../firmware/sanjeevni_lora_node/sj_hotspot.h"
 #include "../../firmware/sanjeevni_lora_node/config.h"  // the shipped warm-up times + alert limits
 #include "../../firmware/sanjeevni_lora_gateway/sj_forward.h"
+// It includes the gateway's copy of sj_packet.h: skipped by that file's guard.
+#include "../../firmware/sanjeevni_lora_gateway/sj_siren_cmd.h"
 #include <cstddef>
 #include <set>
 
 static int failures = 0;
+static int checks = 0;  // reported, so a shrinking test suite is noticed
 #define CHECK(cond)                                                     \
   do {                                                                  \
+    checks++;                                                           \
     if (!(cond)) {                                                      \
       std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);       \
       failures++;                                                       \
@@ -44,6 +52,13 @@ struct Rec {
 };
 
 #include "queue_tests.h"  // segment-file queue: wrap, reboot, corruption, capacity change, power cuts
+#include "sos_tests.h"    // SOS button: hold/bounce/cooldown/stuck, flag + JSON, SOS ahead of the backlog
+#include "siren_tests.h"  // village siren: offline fallback, on-time/cooldown, commands in the ACK, millis() wrap
+#include "hotspot_tests.h"  // offline SOS Wi-Fi: SOS packet, UTF-8, JSON, form/HTTP, limits, outbox, pages
+#include "anomaly_tests.h"  // river rise rate + anomaly checks: true positives, no false alarms on noise, siren
+#include "report_tests.h"   // smart sending: summary, urgent first after an outage, airtime figures
+#include "duty_tests.h"     // gas / PM duty cycle: timing, millis() wrap, never a cold value, energy on-time
+#include "edge_tests.h"     // edge models: reading -> int8 inputs == the Python pipeline's, absent sensors, siren
 
 // The bytes a version-1 firmware put on air / into its queue: same as v2
 // up to the node id, then a 16-bit session and the rest unchanged.
@@ -96,7 +111,8 @@ static void sessionAndProtocolTests() {
   orig.edge_risk = 1;
   std::vector<uint8_t> v1 = v1Bytes(orig);
   CHECK(sjIsValidReadingV1(v1.data(), v1.size()));
-  CHECK(!sjIsValidReading(v1.data(), v1.size()));          // 54 bytes: not a v2 packet
+  CHECK(!sjIsValidReading(v1.data(), v1.size()));          // 54 bytes: not a current packet
+  CHECK(!sjIsValidReadingV2(v1.data(), v1.size()));
   CHECK(!sjIsValidReadingV1((uint8_t*)&orig, sizeof(orig)));
   SjReading up = sjReadingFromV1(v1.data());
   CHECK(up.version == SJ_VERSION && up.session == 517 && up.seq == 77 && up.age_s == 90);
@@ -110,35 +126,163 @@ static void sessionAndProtocolTests() {
   CHECK(sizeof(a1) == 21 && a1.version == SJ_VERSION_V1 && a1.session == 517 && a1.seq == 77);
   CHECK(std::memcmp(a1.node_id, orig.node_id, SJ_NODE_ID_LEN) == 0);
 
-  // ---- a record queued on flash by v1 firmware, read after the update ----
+  // ---- version 2 packets (no rise rate / anomaly bytes) ------------------
+  SjReading v3 = orig;
+  v3.xflags = SJ_X_RISE_RATE;  // a v2 node never sends these: they must come out zero
+  v3.rise_cm_min_x100 = 250;
+  v3.anomaly[SJ_AC_SPIKE] = 1;
+  std::vector<uint8_t> v2((uint8_t*)&v3, (uint8_t*)&v3 + SJ_V2_READING_SIZE);
+  v2[1] = SJ_VERSION_V2;
+  CHECK(sjIsValidReadingV2(v2.data(), v2.size()));
+  CHECK(!sjIsValidReading(v2.data(), v2.size()) && !sjIsValidReadingV1(v2.data(), v2.size()));
+  CHECK(!sjIsValidReadingV2((uint8_t*)&v3, sizeof(v3)));  // a v3 packet is not a v2 one
+  std::vector<uint8_t> v2wrongVersion = v2;
+  v2wrongVersion[1] = SJ_VERSION;  // 56 bytes claiming v3: refused
+  CHECK(!sjIsValidReadingV2(v2wrongVersion.data(), 56) && !sjIsValidReading(v2wrongVersion.data(), 56));
+  SjReading w2 = sjReadingFromV2(v2.data());
+  CHECK(std::memcmp(&w2, &orig, sizeof(orig)) == 0);  // same values, v3 bytes zero
+  // ACKed in ITS version: a v2 node checks the version byte (same 23-byte layout)
+  SjAck a2 = sjMakeAck(w2, SJ_VERSION_V2);
+  CHECK(a2.version == SJ_VERSION_V2 && a2.session == 517 && a2.seq == 77 && a2.type == SJ_TYPE_ACK);
+  CHECK(!sjAckMatches((uint8_t*)&a2, sizeof(a2), w2));  // ...and never satisfies a v3 node
+  SjAck a3 = sjMakeAck(w2);
+  CHECK(a3.version == SJ_VERSION && sjAckMatches((uint8_t*)&a3, sizeof(a3), w2));
+  SjDownlink on = {SJ_CMD_SIREN_ON, 120, 0};
+  uint8_t cmdKey[SJ_CMD_KEY_LEN] = {1, 2, 3};
+  SjAckCmd c2 = sjMakeAckCmd(w2, on, cmdKey, SJ_VERSION_V2);
+  CHECK(c2.version == SJ_VERSION_V2 && c2.type == SJ_TYPE_ACK_CMD && c2.cmd == SJ_CMD_SIREN_ON && c2.arg == 120);
+  SjReading w1 = sjReadingFromV1(v1.data());  // v1 widening also leaves the v3 bytes zero
+  CHECK(w1.xflags == 0 && w1.rise_cm_min_x100 == 0 && w1.anomaly[0] == 0 && w1.tx_state == 0);
+
+  // ---- records queued on flash by the v2 firmware, after the update -------
+  // (and v1 bytes that a v1 firmware put into that 56-byte frame before)
   {
-    struct RecV1 {  // the old QueuedReading: 54-byte packed reading, then takenAtS
-      uint8_t reading[SJ_V1_READING_SIZE];
+    struct RecV2 {  // the v2 node QueuedReading: 56-byte packed reading, then takenAtS
+      uint8_t reading[SJ_V2_READING_SIZE];
       uint32_t t;
     };
-    static_assert(sizeof(RecV1) == sizeof(Rec), "same record size -> the queue keeps v1 records");
-    static_assert(offsetof(RecV1, t) == offsetof(Rec, t), "takenAtS did not move");
+    static_assert(sizeof(RecV2) == 60, "v2 node record");
+    struct RecNow {  // the node QueuedReading now: reading, takenAtS, summary
+      SjReading reading;
+      uint32_t t;
+      SjSummary summary;
+    };
+    static_assert(sizeof(RecNow) == 100, "v3 node record with its summary");
     {
-      SjFileQueue<RecV1> q;
+      SjFileQueue<RecV2> q;
       CHECK(q.begin("/upg.bin", "/upg.hdr", 10));
       q.clear();
-      RecV1 r1;
-      std::memset(&r1, 0, sizeof(r1));
-      std::memcpy(r1.reading, v1.data(), v1.size());
-      r1.t = 1234;
-      CHECK(q.push(r1));
+      RecV2 r;
+      std::memset(&r, 0, sizeof(r));
+      std::memcpy(r.reading, v1.data(), v1.size());  // a v1 record
+      r.t = 1234;
+      CHECK(q.push(r));
+      std::memcpy(r.reading, v2.data(), v2.size());  // a v2 record
+      r.reading[SJ_V1_SESSION_OFFSET + 4] = 78;      // seq 78
+      r.t = 1240;
+      CHECK(q.push(r));
+      std::memset(r.reading, 0x5A, sizeof(r.reading));  // not a reading at all (left out)
+      CHECK(q.push(r));
+      std::memcpy(r.reading, v2.data(), v2.size());
+      r.reading[SJ_V1_SESSION_OFFSET + 4] = 79;
+      r.t = 1250;
+      CHECK(q.push(r));
+      r.reading[SJ_V1_SESSION_OFFSET + 4] = 80;  // damaged on flash below: its CRC must stop it
+      r.t = 1260;
+      CHECK(q.push(r));
     }
-    SjFileQueue<Rec> q;
-    CHECK(q.begin("/upg.bin", "/upg.hdr", 10));
-    Rec got;
-    CHECK(q.count() == 1 && q.peek(0, got));
-    CHECK(got.r.version == SJ_VERSION_V1);  // still v1 bytes until upgraded
-    sjUpgradeQueuedReading(got.r);
-    CHECK(std::memcmp(&got.r, &orig, sizeof(orig)) == 0 && got.t == 1234);
-    SjReading cur = makeReading("NODE-NEW", 3000000000u, 5);
-    SjReading copy = cur;
-    sjUpgradeQueuedReading(copy);  // current records are left alone
-    CHECK(std::memcmp(&copy, &cur, sizeof(cur)) == 0);
+    qt::flipByte(qt::seg("/upg.bin", 0, 0), 4 * (sizeof(RecV2) + 4) + 30);  // record 5, inside the reading
+    g_serialLog.clear();
+    SjFileQueue<RecNow> q;
+    CHECK(q.begin("/upg.bin", "/upg.hdr", 10, sjUpgradeRecord<RecNow>));
+    CHECK(std::strstr(g_serialLog.c_str(), "converting 5 queued reading(s)"));
+    CHECK(q.count() == 3 && q.dropped() == 2);  // the junk record and the damaged one
+    RecNow got;
+    CHECK(q.peek(0, got) && std::memcmp(&got.reading, &orig, sizeof(orig)) == 0 && got.t == 1234);
+    CHECK(q.peek(1, got) && got.reading.seq == 78 && got.reading.version == SJ_VERSION && got.t == 1240 && got.reading.xflags == 0);
+    CHECK(q.peek(2, got) && got.reading.seq == 79 && got.t == 1250);
+    SjSummary zero;
+    std::memset(&zero, 0, sizeof(zero));
+    CHECK(std::memcmp(&got.summary, &zero, sizeof(zero)) == 0);  // no summary invented
+    // converted once: the next boot finds the current layout
+    g_serialLog.clear();
+    SjFileQueue<RecNow> again;
+    CHECK(again.begin("/upg.bin", "/upg.hdr", 10, sjUpgradeRecord<RecNow>));
+    CHECK(again.count() == 3 && !std::strstr(g_serialLog.c_str(), "converting"));
+    // a record layout the upgrade does not know (other size): empty + message, as before
+    struct Odd {
+      uint8_t b[40];
+    };
+    SjFileQueue<Odd> odd;
+    CHECK(odd.begin("/upg.bin", "/upg.hdr", 10, nullptr) && odd.count() == 0);
+    Odd o;
+    std::memset(&o, 0x11, sizeof(o));
+    CHECK(odd.push(o) && odd.count() == 1);
+    g_serialLog.clear();
+    SjFileQueue<RecNow> afterOdd;  // 40-byte records are not the v2 layout: left out, never misread
+    CHECK(afterOdd.begin("/upg.bin", "/upg.hdr", 10, sjUpgradeRecord<RecNow>) && afterOdd.count() == 0);
+    CHECK(std::strstr(g_serialLog.c_str(), "converting 1 queued reading(s)"));
+
+    // ...and the 68-byte records of the v3 firmware before summaries
+    struct RecV3 {
+      SjReading reading;
+      uint32_t t;
+    };
+    static_assert(sizeof(RecV3) == 68, "v3 node record before summaries");
+    {
+      SjFileQueue<RecV3> q3;
+      CHECK(q3.begin("/upg3.bin", "/upg3.hdr", 10));
+      q3.clear();
+      RecV3 a3 = {orig, 4321};
+      a3.reading.xflags = SJ_X_RISE_RATE | SJ_X_SUMMARY;  // a stray summary bit must not survive
+      a3.reading.rise_cm_min_x100 = 150;
+      CHECK(q3.push(a3));
+      RecV3 junk3 = a3;
+      junk3.reading.version = 9;  // not a v3 reading: left out
+      CHECK(q3.push(junk3));
+    }
+    g_serialLog.clear();
+    SjFileQueue<RecNow> q3now;
+    CHECK(q3now.begin("/upg3.bin", "/upg3.hdr", 10, sjUpgradeRecord<RecNow>));
+    CHECK(std::strstr(g_serialLog.c_str(), "converting 2 queued reading(s)") && q3now.count() == 1);
+    RecNow got3;
+    CHECK(q3now.peek(0, got3) && got3.t == 4321 && got3.reading.rise_cm_min_x100 == 150);
+    CHECK(got3.reading.xflags == SJ_X_RISE_RATE && std::memcmp(&got3.summary, &zero, sizeof(zero)) == 0);
+  }
+  // The gateway record: [reading][rxAtS, gwSession, rssi][summary] keeps its middle
+  {
+    struct GwNow {
+      SjReading reading;
+      uint32_t rxAtS;
+      uint16_t gwSession;
+      int16_t rssi;
+      SjSummary summary;
+    };
+    static_assert(sizeof(GwNow) == 104, "gateway record");
+    uint8_t old[64];
+    std::memcpy(old, v2.data(), SJ_V2_READING_SIZE);
+    uint32_t rx = 7777;
+    uint16_t gs = 12;
+    int16_t rssi = -101;
+    std::memcpy(old + 56, &rx, 4);
+    std::memcpy(old + 60, &gs, 2);
+    std::memcpy(old + 62, &rssi, 2);
+    GwNow g;
+    CHECK(sjUpgradeRecord<GwNow>(old, 64, g));
+    CHECK(std::memcmp(&g.reading, &orig, sizeof(orig)) == 0 && g.rxAtS == 7777 && g.gwSession == 12 && g.rssi == -101);
+    CHECK(g.summary.samples == 0 && g.summary.fields == 0);
+    CHECK(!sjUpgradeRecord<GwNow>(old, 60, g));  // the node record size is not the gateway one
+    // the 72-byte v3 gateway record before summaries
+    uint8_t old3[72];
+    std::memcpy(old3, &orig, sizeof(orig));
+    std::memcpy(old3 + 64, old + 56, 8);
+    CHECK(sjUpgradeRecord<GwNow>(old3, 72, g));
+    CHECK(std::memcmp(&g.reading, &orig, sizeof(orig)) == 0 && g.rxAtS == 7777 && g.gwSession == 12 && g.rssi == -101);
+    CHECK(!sjUpgradeRecord<GwNow>(old3, 68, g) && !sjUpgradeRecord<GwNow>(old3, 104, g));  // other sizes
+    old3[1] = SJ_VERSION_V2;  // 72 bytes but not a v3 reading
+    CHECK(!sjUpgradeRecord<GwNow>(old3, 72, g));
+    old[0] = 0;
+    CHECK(!sjUpgradeRecord<GwNow>(old, 64, g));  // not a reading
   }
 
   // ---- a 32-bit session is a v2 ACK's business ------------------------
@@ -264,9 +408,14 @@ static void warmUpTests() {
   CHECK(!(pm.flags & SJ_HAS_PM) && pm.pm25 == 0 && pm.pm10 == 0);
   CHECK(sjAddPmValues(pm, 400, 600, PMS5003_WARMUP_S, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));
   CHECK((pm.flags & SJ_HAS_PM) && pm.pm25 == 400 && pm.pm10 == 600);
-  CHECK(!sjAddPmValues(pm, 60, 100, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));  // band top: no alert
-  CHECK(sjAddPmValues(pm, 61, 20, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));
-  CHECK(sjAddPmValues(pm, 10, 101, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));  // dust: PM10 alone
+  // "send now" from CPCB "Very Poor" = backend HIGH (above the "Poor" tops 120 / 350); the backend's MEDIUM
+  // ("Moderately polluted" / "Poor") goes with the normal report and its summary (config.h LOCAL_PM*_LIMIT)
+  CHECK(LOCAL_PM25_LIMIT == 120.0f && LOCAL_PM10_LIMIT == 350.0f);
+  CHECK(!sjAddPmValues(pm, 120, 350, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));  // band top: no alert
+  CHECK(!sjAddPmValues(pm, 61, 101, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));  // backend MEDIUM
+  CHECK((pm.flags & SJ_HAS_PM) && pm.pm25 == 61 && pm.pm10 == 101);  // ... still in the reading
+  CHECK(sjAddPmValues(pm, 121, 20, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));
+  CHECK(sjAddPmValues(pm, 10, 351, 60, PMS5003_WARMUP_S, LOCAL_PM25_LIMIT, LOCAL_PM10_LIMIT));  // dust: PM10 alone
 
   // Self-test WAIT <=> value not sent, second by second (one shared rule)
   for (uint32_t s = 0; s <= MQ135_WARMUP_S + 5; s++) {
@@ -290,12 +439,11 @@ int main(int argc, char** argv) {
   const char* jsonOut = argc > 2 ? argv[2] : "samples.jsonl";
 
   // ---- packet layout ------------------------------------------------
-  CHECK(sizeof(SjReading) == 56);  // v2: 32-bit session
+  CHECK(sizeof(SjReading) == 64);  // v3: + xflags, rise rate, anomaly bits
+  CHECK(offsetof(SjReading, xflags) == SJ_V2_READING_SIZE);  // v2 is the first 56 bytes
   CHECK(sizeof(SjAck) == 23);
   CHECK(offsetof(SjReading, session) == SJ_V1_SESSION_OFFSET);
-  // The queue record sizes did not change (the 2 new bytes took the old
-  // padding), so queued v1 records survive an update and get converted.
-  CHECK(sizeof(Rec) == 60);
+  CHECK(sizeof(Rec) == 68);  // the node QueuedReading before summaries (100 now: converted by sjUpgradeRecord)
 
   // ---- ACK matching -------------------------------------------------
   SjReading a = makeReading("NODE-04", 7, 42);
@@ -469,8 +617,11 @@ int main(int argc, char** argv) {
     CHECK(sjCheckQueue(true, 1600, 2000, 0).status == SJ_CHECK_WARN);  // 80 % full
     CHECK(sjCheckQueue(true, 0, 2000, 3).status == SJ_CHECK_WARN);
 
-    CHECK(sjCheckEdge(false, true).status == SJ_CHECK_WARN);
-    CHECK(sjCheckEdge(true, false).status == SJ_CHECK_OK);
+    CHECK(sjCheckEdge("main", false, 0, 0).status == SJ_CHECK_WARN);  // did not load: golden check never ran
+    CHECK(sjCheckEdge("lite", true, 10, 10).status == SJ_CHECK_OK);
+    CHECK(std::strstr(sjCheckEdge("lite", true, 10, 10).detail, "lite model, 10/10"));
+    CHECK(sjCheckEdge("main", false, 7, 8).status == SJ_CHECK_FAIL);  // the device does not run the tested model
+    CHECK(sjCheckEdge("none", false, 0, 0).status == SJ_CHECK_OK);
 
     // long values never overflow the detail buffer
     SjCheckResult big = sjCheckUltrasonic(5, 5, 1e30f, 1e30f, 1e30f, 1e30f);
@@ -493,6 +644,13 @@ int main(int argc, char** argv) {
   drainBudgetTests();
   forwardPopTests();
   warmUpTests();
+  sos::runSosTests();
+  siren::runSirenTests(g_fsRoot);
+  hotspot::runHotspotTests(g_fsRoot);
+  anomaly::runAnomalyTests();
+  report::runReportTests(g_fsRoot);
+  duty::runDutyTests();
+  edge::runEdgeTests();
 
   // ---- JSON samples (validated against the backend in Python) --------
   FILE* jf = std::fopen(jsonOut, "w");
@@ -541,6 +699,70 @@ int main(int argc, char** argv) {
   String s3;
   sjAppendJson(s3, tiltOnly, 30, -80, "lora");
   std::fprintf(jf, "%s\n", s3.c_str());
+  // 4. SOS button held on a node: the normal measurements + the flag
+  SjReading sosReading = makeReading("NODE-07", 77, 12);
+  sosReading.flags = SJ_HAS_WATER | SJ_HAS_DHT | SJ_HAS_FLAME | SJ_SOS_PRESSED;
+  sosReading.water_level_mm = 2100;
+  sosReading.temp_c_x100 = 2400;
+  sosReading.humidity_x100 = 9000;
+  String s4;
+  sjAppendJson(s4, sosReading, 400, -101, "lora");
+  std::fprintf(jf, "%s\n", s4.c_str());
+  // 4b. village siren (sj_siren.h): sounding by command, sounding by the
+  //     node's offline fallback, fitted but silent
+  SjReading sirenCmd = makeReading("NODE-07", 77, 14);
+  sirenCmd.flags = SJ_HAS_WATER | SJ_SIREN_FITTED | SJ_SIREN_ON | SJ_SIREN_BY_COMMAND;
+  sirenCmd.water_level_mm = 2500;
+  SjReading sirenAuto = sirenCmd;
+  sirenAuto.seq = 15;
+  sirenAuto.flags = SJ_HAS_WATER | SJ_SIREN_FITTED | SJ_SIREN_ON;
+  SjReading sirenIdle = sirenCmd;
+  sirenIdle.seq = 16;
+  sirenIdle.flags = SJ_HAS_WATER | SJ_SIREN_FITTED;
+  for (const SjReading* sr : {&sirenCmd, &sirenAuto, &sirenIdle}) {
+    String js;
+    sjAppendJson(js, *sr, 3, -95, "lora");
+    std::fprintf(jf, "%s\n", js.c_str());
+  }
+  // 4c. the node's rise rate + anomaly checks (sj_anomaly.h, protocol v3):
+  //     a fast rise with two anomalies elsewhere; a falling river whose level
+  //     the checks doubt; a rise flag on a reading without a water level
+  //     (must not be sent) and an anomaly on tilt
+  SjReading edgeFast = makeReading("NODE-07", 77, 20);
+  edgeFast.flags = SJ_HAS_WATER | SJ_HAS_DHT | SJ_HAS_GAS;
+  edgeFast.water_level_mm = 2345;
+  edgeFast.temp_c_x100 = 2500;
+  edgeFast.humidity_x100 = 8000;
+  edgeFast.gas_ppm = 410;
+  edgeFast.xflags = SJ_X_RISE_RATE | SJ_X_FAST_RISE;
+  edgeFast.rise_cm_min_x100 = 250;
+  edgeFast.anomaly[SJ_AC_STUCK] = 1u << SJ_AF_GAS;
+  edgeFast.anomaly[SJ_AC_DROPOUT] = 1u << SJ_AF_TEMP;
+  SjReading edgeFall = makeReading("NODE-07", 77, 21);
+  edgeFall.flags = SJ_HAS_WATER;
+  edgeFall.water_level_mm = 1000;
+  edgeFall.xflags = SJ_X_RISE_RATE;
+  edgeFall.rise_cm_min_x100 = -125;
+  edgeFall.anomaly[SJ_AC_SPIKE] = 1u << SJ_AF_WATER;
+  edgeFall.anomaly[SJ_AC_RATE] = 1u << SJ_AF_WATER;
+  SjReading edgeTilt = makeReading("NODE-HILL", 2, 9);
+  edgeTilt.flags = SJ_HAS_TILT;
+  edgeTilt.tilt_deg_x100 = 150;
+  edgeTilt.xflags = SJ_X_RISE_RATE | SJ_X_FAST_RISE;  // no water level: nothing about a rise is sent
+  edgeTilt.rise_cm_min_x100 = 300;
+  edgeTilt.anomaly[SJ_AC_STUCK] = 1u << SJ_AF_TILT;
+  for (const SjReading* er : {&edgeFast, &edgeFall, &edgeTilt}) {
+    String js;
+    sjAppendJson(js, *er, 2, -88, "lora");
+    std::fprintf(jf, "%s\n", js.c_str());
+  }
+  // 5. SOS with no sensor answering: the flag alone (the backend refuses
+  //    the reading - the server raises the SOS before forwarding it)
+  SjReading sosOnly = makeReading("NODE-07", 77, 13);
+  sosOnly.flags = SJ_SOS_PRESSED;
+  String s5;
+  sjAppendJson(s5, sosOnly, -1, -101, "lora");
+  std::fprintf(jf, "%s\n", s5.c_str());
   std::fclose(jf);
 
   // ---- persistent queue ---------------------------------------------
@@ -580,6 +802,10 @@ int main(int argc, char** argv) {
   }
   qt::runQueueTests();
 
-  std::printf(failures ? "\n%d C++ check(s) FAILED\n" : "\nall C++ checks passed\n", failures);
+  if (failures) {
+    std::printf("\n%d of %d C++ check(s) FAILED\n", failures, checks);
+  } else {
+    std::printf("\nall %d C++ checks passed\n", checks);
+  }
   return failures ? 1 : 0;
 }

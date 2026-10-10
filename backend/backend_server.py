@@ -7,16 +7,23 @@ Run: uvicorn backend_server:app --host 127.0.0.1 --port 8000
 import json
 import sqlite3
 import os
+# Windows 11 Smart App Control blocks wrapt's unsigned compiled helper
+# (_wrappers.*.pyd, pulled in by TensorFlow / ChromaDB) with "Part of this
+# app has been blocked". wrapt's pure-Python fallback behaves the same.
+# Must run before those imports. To keep the compiled helper, set
+# WRAPT_DISABLE_EXTENSIONS to an EMPTY value (wrapt treats "0" as set).
+os.environ.setdefault("WRAPT_DISABLE_EXTENSIONS", "1")
 import secrets
 import joblib
 import requests
 import statistics
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import math
 import re
 import tempfile
 from collections import deque
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 from dotenv import load_dotenv
@@ -34,7 +41,7 @@ from fastapi import FastAPI, HTTPException, Response, Header, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from integration_pipeline import (
     train_flood_model,
@@ -43,16 +50,41 @@ from integration_pipeline import (
     compute_flood_risk,
     explain_flood_risk,
     implausible_fields,
+    fault_fields,
     rain_reading_plausible,
+    anomaly_baseline,
+    bench_mount_for,
+    river_spike,
+    ANOMALY_BASELINE_MAX_AGE_MIN,
+    ANOMALY_BASELINE_MIN_SAMPLES,
+    ANOMALY_BASELINE_WINDOW,
+    ANOMALY_FEATURES,
     DERIVED_FROM,
 )
+import fast_inference
 from rag_alert_pipeline import build_knowledge_base, severity_band
-from hazard_classification import LANDSLIDE_RAIN_WINDOWS_HOURS, PROXY_SATURATION_PER_MM
+from hazard_classification import (
+    LANDSLIDE_RAIN_WINDOWS_HOURS,
+    PROXY_SATURATION_PER_MM,
+    SHORT_TREND_FIELDS,
+    SHORT_TREND_WINDOW_MINUTES,
+    CM_PER_MIN_TO_M_PER_HR,
+    FLOOD_SIGNATURE_RAIN_MM_HR,
+    FLOOD_SIGNATURE_RATE_M_PER_HR,
+    short_window_trend,
+)
 from cap_alert import generate_cap_alert
 from hazard_confirmation import HazardConfirmer
+from alert_confidence import (
+    add_confidence_to_message,
+    compute_confidence,
+    load_flood_calibration,
+    stuck_hazard_fields,
+)
 import river_forecast
 from satellite_check import satellite_flood_check
 from situation_report import generate_situation_report_pdf
+import analytics
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -417,22 +449,161 @@ def fetch_terrain_derived_curve_number(
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 WEATHER_CACHE_TTL_MINUTES = 30  # forecasts don't change meaningfully faster than this
 WEATHER_FETCH_TIMEOUT_SECONDS = 5
+# Hourly variables asked for (names and units from
+# https://open-meteo.com/en/docs, read 2026-10-09): precipitation is the
+# preceding hour's sum in mm; wind_speed_10m is km/h; wind_gusts_10m is the
+# preceding hour's maximum gust in km/h. The wind feeds the high_wind
+# hazard, the 24 h rain sum the heavy_rain hazard
+# (hazard_classification.classify_heavy_rain / classify_high_wind).
+WEATHER_HOURLY_VARIABLES = "precipitation,wind_speed_10m,wind_gusts_10m"
+FLOOD_FORECAST_WINDOW_HOURS = 6     # flood model feature (forecast_rainfall_6h_mm)
+EXTREME_WEATHER_WINDOW_HOURS = 24   # IMD rainfall categories are 24 h totals
+# SANJEEVNI_WEATHER_MOCK=<path to a JSON file shaped like Open-Meteo's
+# response> makes the backend read that file instead of the internet, for
+# tests and the offline demo (example files: data/weather_mock/). Read on
+# every call (no cache), so the demo can swap the file while running.
+# Mock results carry forecast_source "mock" and every alert text built on
+# them says it is a test file. The mock is applied to SIMULATED readings
+# only: a REAL (non-simulated) reading gets no forecast at all while the
+# variable is set (no heavy_rain / high_wind input AND no 6 h rain for the
+# flood model), so a test file left configured can never change a real
+# node's risk, alert or siren. (Before 2026-10-09 the mock's 6 h rain went
+# into the flood model for real nodes too - a synthetic storm could push a
+# real river reading to CRITICAL.) hazard_confirmation additionally refuses
+# to confirm a mock-forecast alert on a real reading (defence in depth).
+# For SIMULATED nodes the mock's 6 h rain still feeds the flood model on
+# purpose: the judge demo's storm cue (tools/demo/run_demo.js cue 11) is
+# meant to raise simulated flood risk along with the forecast alerts.
+WEATHER_MOCK_ENV = "SANJEEVNI_WEATHER_MOCK"
+# Unit conversions for a payload that declares non-default units in
+# "hourly_units" (a mock file may); anything unknown is rejected.
+_WIND_TO_KMH = {"km/h": 1.0, "kmh": 1.0, "m/s": 3.6, "ms": 3.6, "kn": 1.852, "mp/h": 1.609344, "mph": 1.609344}
+_RAIN_TO_MM = {"mm": 1.0, "inch": 25.4}
 
 _weather_cache: dict[str, dict] = (
     {}
-)  # node_id -> {"value": float, "fetched_at": datetime}
+)  # node_id -> {"value": 6 h rain mm, "weather": fetch_weather_forecast() dict, "fetched_at": datetime}
+_weather_mock_rebase_logged: set = set()
+_weather_mock_missing_logged: set = set()
+_weather_mock_real_logged: set = set()
 
 
-def fetch_forecast_rainfall_mm(
-    latitude: float, longitude: float, node_id: str
-) -> Optional[float]:
+def _hourly_factor(payload: dict, variable: str, table: dict, default_unit: str) -> float:
+    unit = str((payload.get("hourly_units") or {}).get(variable) or default_unit).strip()
+    if unit not in table:
+        raise ValueError(f"unsupported unit {unit!r} for {variable}")
+    return table[unit]
+
+
+def _complete_window(values, start: int, hours: int):
+    """values[start:start+hours] when every hour is there and not null,
+    else None - a gappy window is an unknown, never "less rain / wind"."""
+    if not isinstance(values, list):
+        return None
+    window = values[start:start + hours]
+    if len(window) < hours or any(
+        isinstance(v, bool) or not isinstance(v, (int, float)) for v in window
+    ):
+        return None
+    return window
+
+
+def summarise_forecast(payload: dict, now: datetime, allow_rebase: bool = False) -> dict:
+    """Open-Meteo hourly payload -> the numbers the pipeline uses:
+      rain_6h_mm          next 6 h (flood model) - REQUIRED: an incomplete
+                          6 h window raises, as before
+      rain_24h_mm         next 24 h (heavy_rain) - None when incomplete
+      wind_speed_max_kmh  max hourly 10 m wind, next 24 h (high_wind)
+      wind_gust_max_kmh   max hourly 10 m gust, next 24 h (high_wind)
+      rebased             True when allow_rebase was used (below)
+    The window starts at the current UTC hour, which must be in the
+    payload. allow_rebase (mock files only): a fixed test file has no entry
+    for "now", so its FIRST hour is taken as the current hour."""
+    hourly = payload["hourly"]
+    times = hourly["time"]
+    current_hour_key = now.strftime("%Y-%m-%dT%H:00")
+    # The current hour must be in the response. Falling back to index 0
+    # (as before 2026-10-08) summed whatever hours the payload started
+    # with - an old or wrongly-zoned forecast - and cached it as "the next
+    # 6 h". Only a mock file may do that, on purpose.
+    rebased = False
+    if current_hour_key in times:
+        start_idx = times.index(current_hour_key)
+    elif allow_rebase and times:
+        start_idx, rebased = 0, True
+    else:
+        raise ValueError(f"forecast has no entry for {current_hour_key}")
+
+    rain_factor = _hourly_factor(payload, "precipitation", _RAIN_TO_MM, "mm")
+    precip = hourly["precipitation"]
+    window = _complete_window(precip, start_idx, FLOOD_FORECAST_WINDOW_HOURS)
+    # A short or gappy window is an incomplete forecast, not "less rain":
+    # caching a 3-hour sum as the 6-hour value would quietly lower flood
+    # risk for the next 30 min. Raising takes the failure path
+    # (last good cached value, else None = "forecast unavailable").
+    # Open-Meteo sends null for hours it has no value for.
+    if window is None:
+        raw = precip[start_idx:start_idx + FLOOD_FORECAST_WINDOW_HOURS]
+        raise ValueError(
+            f"incomplete 6 h forecast window ({len(raw)} hours, "
+            f"{sum(v is None for v in raw)} null)"
+        )
+    rain_24h = _complete_window(precip, start_idx, EXTREME_WEATHER_WINDOW_HOURS)
+
+    def wind_max(variable):
+        values = _complete_window(hourly.get(variable), start_idx, EXTREME_WEATHER_WINDOW_HOURS)
+        if values is None:
+            return None
+        return round(max(values) * _hourly_factor(payload, variable, _WIND_TO_KMH, "km/h"), 1)
+
+    return {
+        "rain_6h_mm": float(sum(window)) * rain_factor,
+        "rain_24h_mm": round(float(sum(rain_24h)) * rain_factor, 1) if rain_24h is not None else None,
+        "wind_speed_max_kmh": wind_max("wind_speed_10m"),
+        "wind_gust_max_kmh": wind_max("wind_gusts_10m"),
+        "rebased": rebased,
+    }
+
+
+def _mock_weather_forecast(mock_path: str, now: datetime) -> Optional[dict]:
+    """The mock file's forecast, or None. A MISSING file is a normal state
+    (the demo creates / deletes it to switch the storm on and off), logged
+    once instead of on every reading; it never falls back to the internet."""
+    if not os.path.exists(mock_path):
+        if mock_path not in _weather_mock_missing_logged:
+            _weather_mock_missing_logged.add(mock_path)
+            print(f"[weather] {WEATHER_MOCK_ENV} file {mock_path!r} not found - no forecast "
+                  "(the mock never falls back to the internet)")
+        return None
+    _weather_mock_missing_logged.discard(mock_path)
+    try:
+        with open(mock_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        summary = summarise_forecast(payload, now, allow_rebase=True)
+    except Exception as e:
+        print(f"[weather] {WEATHER_MOCK_ENV} file {mock_path!r} unusable: {e}")
+        return None
+    if summary.pop("rebased") and mock_path not in _weather_mock_rebase_logged:
+        _weather_mock_rebase_logged.add(mock_path)
+        print(f"[weather] {WEATHER_MOCK_ENV}: no entry for the current hour - "
+              "the file's first hour is used as 'now'")
+    return {**summary, "source": "mock"}
+
+
+def fetch_weather_forecast(latitude: float, longitude: float, node_id: str,
+                           simulated: bool = False) -> Optional[dict]:
     """
-    Returns forecasted rainfall (mm) for the next 6 hours at this node's
-    location, from Open-Meteo's free hourly precipitation forecast.
+    The next hours' weather at this node's location from Open-Meteo's free
+    hourly forecast (or, for a SIMULATED reading only, the
+    SANJEEVNI_WEATHER_MOCK file - a real reading gets None while the mock
+    is configured; see WEATHER_MOCK_ENV):
+    {"rain_6h_mm", "rain_24h_mm", "wind_speed_max_kmh",
+     "wind_gust_max_kmh", "source": "open-meteo"|"mock"}; the last three
+    numbers may be None when that part of the forecast is incomplete.
 
     Cached per node for WEATHER_CACHE_TTL_MINUTES so we don't hit the API
     on every single sensor reading - readings can arrive every few
-    seconds, but a rain forecast is meaningless to re-fetch that often.
+    seconds, but a forecast is meaningless to re-fetch that often.
 
     Returns None if the fetch fails and there's no usable cached value
     (e.g. no internet, API down, bad response). Callers should treat None
@@ -441,14 +612,38 @@ def fetch_forecast_rainfall_mm(
     reading from being processed.
     """
     now = datetime.now(timezone.utc)
+    mock_path = os.environ.get(WEATHER_MOCK_ENV)
+    if mock_path:
+        if not simulated:
+            # A test file must never reach a real node's risk (flood model
+            # input included), and the mock never falls back to the
+            # internet either: no forecast for this reading.
+            if node_id not in _weather_mock_real_logged:
+                _weather_mock_real_logged.add(node_id)
+                print(f"[weather] {WEATHER_MOCK_ENV} is set: ignored for REAL readings "
+                      f"from {node_id} (no forecast used)")
+            return None
+        return _mock_weather_forecast(mock_path, now)
+
     cached = _weather_cache.get(node_id)
+
+    def cached_value():
+        if not cached:
+            return None
+        # An entry holding only the 6 h value (older code, tests) still
+        # serves the flood model; the extreme-weather parts are unknown.
+        return cached.get("weather") or {
+            "rain_6h_mm": cached["value"], "rain_24h_mm": None,
+            "wind_speed_max_kmh": None, "wind_gust_max_kmh": None, "source": "open-meteo",
+        }
+
     if cached and (now - cached["fetched_at"]) < timedelta(
         minutes=WEATHER_CACHE_TTL_MINUTES
     ):
-        return cached["value"]
+        return cached_value()
     if _api_in_backoff("weather"):
         # Same fallback as a failed fetch, without waiting on another timeout
-        return cached["value"] if cached else None
+        return cached_value()
 
     try:
         response = requests.get(
@@ -456,47 +651,25 @@ def fetch_forecast_rainfall_mm(
             params={
                 "latitude": latitude,
                 "longitude": longitude,
-                "hourly": "precipitation",
+                "hourly": WEATHER_HOURLY_VARIABLES,
                 # 2 days, not 1: with forecast_days=1 the response stops at
                 # 23:00 UTC today, so from 18:00 UTC (23:30 IST - monsoon
                 # night rain) the "next 6 hours" window ran off the end and
                 # summed only 5..1 hours, under-reporting the flood input.
+                # 2 days also always holds the next 24 h.
                 "forecast_days": 2,
                 "timezone": "UTC",
             },
             timeout=WEATHER_FETCH_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        payload = response.json()
+        weather = summarise_forecast(response.json(), now)
+        weather.pop("rebased")
+        weather["source"] = "open-meteo"
 
-        hourly_times = payload["hourly"]["time"]
-        hourly_precip = payload["hourly"]["precipitation"]
-
-        current_hour_key = now.strftime("%Y-%m-%dT%H:00")
-        # The current hour must be in the response. Falling back to index 0
-        # (as before) summed whatever hours the payload started with - an
-        # old or wrongly-zoned forecast - and cached it as "the next 6 h".
-        if current_hour_key not in hourly_times:
-            raise ValueError(f"forecast has no entry for {current_hour_key}")
-        start_idx = hourly_times.index(current_hour_key)
-
-        window = hourly_precip[start_idx : start_idx + 6]
-        # A short or gappy window is an incomplete forecast, not "less rain":
-        # caching a 3-hour sum as the 6-hour value would quietly lower flood
-        # risk for the next 30 min. Raising takes the failure path below
-        # (last good cached value, else None = "forecast unavailable").
-        # Open-Meteo sends null for hours it has no value for; sum() would
-        # raise TypeError on those anyway, this just says why.
-        if len(window) < 6 or any(v is None for v in window):
-            raise ValueError(
-                f"incomplete 6 h forecast window ({len(window)} hours, "
-                f"{sum(v is None for v in window)} null)"
-            )
-        forecast_6h_mm = float(sum(window))
-
-        _weather_cache[node_id] = {"value": forecast_6h_mm, "fetched_at": now}
+        _weather_cache[node_id] = {"value": weather["rain_6h_mm"], "weather": weather, "fetched_at": now}
         _api_failed_at.pop("weather", None)
-        return forecast_6h_mm
+        return weather
 
     except Exception as e:
         _api_failed_at["weather"] = datetime.now(timezone.utc)
@@ -505,7 +678,17 @@ def fetch_forecast_rainfall_mm(
             f"{EXTERNAL_API_RETRY_AFTER_MINUTES} min: {e}"
         )
         # Fall back to the last good cached value rather than nothing, if we have one
-        return cached["value"] if cached else None
+        return cached_value()
+
+
+def fetch_forecast_rainfall_mm(
+    latitude: float, longitude: float, node_id: str, simulated: bool = False
+) -> Optional[float]:
+    """Forecast rainfall (mm) for the next 6 hours at this node - the flood
+    model's forecast feature. None = forecast unavailable (see
+    fetch_weather_forecast)."""
+    weather = fetch_weather_forecast(latitude, longitude, node_id, simulated=simulated)
+    return weather["rain_6h_mm"] if weather else None
 
 
 # Thresholds used to project "when will this become critical" from the
@@ -535,6 +718,10 @@ _anomaly_model = None
 _anomaly_scaler = None
 _rag_collection = None
 _rag_embedder = None
+# The model card's reliability table for the loaded flood model, used by
+# the confidence score; None when the card is missing or describes a
+# different model file (alert_confidence.load_flood_calibration).
+_flood_calibration = None
 
 
 # Columns added after the original readings schema, migrated onto existing
@@ -581,6 +768,29 @@ ADDED_READING_COLUMNS = {
     # from result["latitude"/"longitude"]; NULL on rows from before this.
     "latitude": "REAL",
     "longitude": "REAL",
+    # The node's own fast-rise check and anomaly flags (2026-10-09), kept
+    # so an officer can audit why a flash flood fired or a channel was
+    # distrusted. edge_anomaly is comma-separated like sensor_faults.
+    "fast_rise": "INTEGER",
+    "rise_rate_cm_per_min": "REAL",
+    "edge_anomaly": "TEXT",
+    # Confidence score of an alert (alert_confidence.py); NULL for logged /
+    # suppressed readings and rows from before 2026-10-09. The CAP export
+    # maps it to <certainty>. confidence_reasons is a JSON array of text.
+    "confidence": "REAL",
+    "confidence_label": "TEXT",
+    "confidence_reasons": "TEXT",
+    # Next-24 h weather forecast behind the heavy_rain / high_wind hazards
+    # (2026-10-09); forecast_source is "open-meteo" or "mock" (a test file,
+    # SANJEEVNI_WEATHER_MOCK), NULL when no forecast was available.
+    "forecast_rainfall_24h_mm": "REAL",
+    "forecast_wind_speed_max_kmh": "REAL",
+    "forecast_wind_gust_max_kmh": "REAL",
+    "forecast_source": "TEXT",
+    # The node said it has a siren output (2026-10-09). Restores the
+    # node's expected report interval after a restart (decision (1):
+    # siren nodes summarise every 60 s, the others every 300 s).
+    "siren_fitted": "INTEGER",
 }
 
 
@@ -621,13 +831,77 @@ def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_readings_node_uid "
         "ON readings(node_id, reading_uid) WHERE reading_uid IS NOT NULL"
     )
+    # Time-range scans for /api/analytics/* and the CAP feed (analytics.py):
+    # without these every trends/summary request read the whole table.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_timestamp ON readings(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_node_timestamp ON readings(node_id, timestamp)")
     conn.commit()
 
     init_node_registry_table(conn)
     conn.close()
 
 
-def save_reading(enriched: dict, result: dict, timestamp: str):
+@contextmanager
+def _ingest_db(conn: Optional[sqlite3.Connection]):
+    """The connection an ingest step writes through: the caller's (the
+    kept-open ingest connection, see ingest_connection), else a
+    short-lived one of its own, as before (direct callers, tests)."""
+    if conn is not None:
+        yield conn
+        return
+    own = sqlite3.connect(DB_PATH)
+    try:
+        yield own
+    finally:
+        own.close()
+
+
+# Step B2: ONE kept-open SQLite connection for the ingest path. Opening a
+# connection per step (duplicate check, then insert) cost ~14 ms of every
+# reading on Windows with the WAL database (open + -wal/-shm mapping +
+# schema parse on the first statement) - about half of a reading's time
+# once the models were fast (tests/ingest_bench.py: 26 ms per single
+# reading vs 12 ms in a batch sharing one connection). Only used while
+# _ingest_lock is held (one thread at a time; check_same_thread off for
+# that reason). Every reading is still committed on its own, and a failed
+# INSERT is rolled back at once (_insert_reading), so the write lock on the
+# file server.js also writes to is never kept between readings. Re-opened
+# when DB_PATH changes (tests) or after any SQLite error.
+_ingest_conn = {"path": None, "conn": None}
+
+
+def ingest_connection() -> sqlite3.Connection:
+    """The kept-open ingest connection (caller holds _ingest_lock)."""
+    if _ingest_conn["conn"] is None or _ingest_conn["path"] != DB_PATH:
+        close_ingest_connection()
+        _ingest_conn["conn"] = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _ingest_conn["path"] = DB_PATH
+    return _ingest_conn["conn"]
+
+
+def close_ingest_connection():
+    """Close the kept-open ingest connection (re-opened on next use)."""
+    conn, _ingest_conn["conn"], _ingest_conn["path"] = _ingest_conn["conn"], None, None
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def _insert_reading(conn: sqlite3.Connection, sql: str, values: tuple):
+    """INSERT + COMMIT; on a failed INSERT the implicit transaction is
+    rolled back, so a shared connection never keeps the database's write
+    lock (server.js writes to the same file) after a duplicate."""
+    try:
+        conn.execute(sql, values)
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def save_reading(enriched: dict, result: dict, timestamp: str, conn: Optional[sqlite3.Connection] = None):
     # Every model input is stored, not just the raw sensor values - without
     # them export_readings_to_csv.py could only export 3 flood columns and
     # retraining on real data failed with KeyError: 'curve_number'.
@@ -656,16 +930,16 @@ def save_reading(enriched: dict, result: dict, timestamp: str):
             row[column] = enriched[column] if column in enriched else result.get(column)
     row["simulated"] = 1 if enriched.get("simulated") else 0
     row["sensor_faults"] = ",".join(result.get("sensor_faults") or ()) or None
+    row["fast_rise"] = 1 if enriched.get("fast_rise") else 0
+    row["siren_fitted"] = 1 if enriched.get("siren_fitted") else 0
+    row["edge_anomaly"] = ",".join(enriched.get("edge_anomaly") or ()) or None
+    reasons = result.get("confidence_reasons")
+    row["confidence_reasons"] = json.dumps(reasons) if reasons else None
 
     columns = ", ".join(row)
     placeholders = ", ".join("?" for _ in row)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        f"INSERT INTO readings ({columns}) VALUES ({placeholders})",
-        tuple(row.values()),
-    )
-    conn.commit()
-    conn.close()
+    with _ingest_db(conn) as db:
+        _insert_reading(db, f"INSERT INTO readings ({columns}) VALUES ({placeholders})", tuple(row.values()))
 
 
 # --- HC-SR04 ultrasonic distance -> actual water-level conversion -------
@@ -742,16 +1016,31 @@ WATER_LEVEL_SMOOTHING_WINDOW = (
 
 RATE_WINDOW_MINUTES = 15  # rate of rise is measured against the oldest reading this recent
 MIN_RATE_SPAN_SECONDS = 30  # shorter spans turn mm of sensor jitter into huge m/hr values
+# Shortest gap a reading's own rain rate is worked out over (derive_features,
+# reading_rain_mm_hr). DEMO DEFAULT: rain reported over a shorter gap is
+# spread over this long, so a few seconds' rain cannot claim a huge rate.
+RAIN_RATE_MIN_GAP_SECONDS = 60
 # Upstream data older than RATE_WINDOW_MINUTES (or this many of the
 # upstream node's configured report intervals, if longer) is no evidence
 # about the river NOW - see upstream_history_for().
 UPSTREAM_MAX_MISSED_REPORTS = 3
-# Fastest believable river rise/fall. Steeper slopes come from a sudden
-# step (sensor knocked, glitch, re-mount) still inside the 15-minute window,
-# and were reaching +400 m/hr on a river that was actually FALLING, which
-# broke the ETA projection and the dashboard (B33 follow-up). Assumption:
-# 5 m/hr is above recorded Himalayan flash-flood rises - tune per site.
+# Clamp on the reported river rise/fall rate. Steeper slopes come from a
+# sudden step (sensor knocked, glitch, re-mount) still inside the 15-minute
+# window, and were reaching +400 m/hr on a river that was actually FALLING,
+# which broke the ETA projection and the dashboard (B33 follow-up).
+# DEMO DEFAULT - VERIFY PER SITE: 5 m/hr is not taken from a hydrological
+# source; set it from the site's own records (e.g. CWC gauge data). It only
+# clamps the rate (5 m/hr is already far above the flash-flood CRITICAL
+# rate), it never throws a level away.
 MAX_RIVER_RATE_M_PER_HR = float(os.environ.get("SANJEEVNI_MAX_RIVER_RATE_M_PER_HR", "5"))
+# How fast the level may move between two readings before the jump is held
+# as a sensor spike (integration_pipeline.river_spike) - its own setting,
+# because unlike the clamp above it decides whether a level is used at all.
+# DEMO DEFAULT - VERIFY PER SITE (no hydrological source; review 2026-10-09).
+# A real rise faster than this is still accepted within
+# RIVER_SPIKE_ACCEPT_AFTER readings (a step that stays, or a steady ramp),
+# or at once with rain / upstream / fast-rise corroboration.
+RIVER_SPIKE_MAX_RATE_M_PER_HR = float(os.environ.get("SANJEEVNI_RIVER_SPIKE_MAX_RATE_M_PER_HR", "5"))
 
 
 def clamp_river_rate(rate: float) -> float:
@@ -787,20 +1076,159 @@ def rate_per_hour(history: deque, key: str, current_value: float, now: datetime)
     sensor jitter look like a fast rise - the cause of false MEDIUM flood
     alerts on calm rivers (B33). Returns 0.0 (no evidence of change) when
     there isn't at least MIN_RATE_SPAN_SECONDS of history."""
+    fit = rate_fit(history, key, current_value, now)
+    return fit["slope"] if fit else 0.0
+
+
+def rate_window_points(history, key: str, current_value: float, now: datetime) -> list:
+    """(hours relative to now, value) for the readings in the last
+    RATE_WINDOW_MINUTES plus the current one (at 0.0), in history order."""
     window_start = now - timedelta(minutes=RATE_WINDOW_MINUTES)
     points = [((r["timestamp"] - now).total_seconds() / 3600, r[key])
               for r in history if window_start <= r["timestamp"] <= now and r.get(key) is not None]
     points.append((0.0, current_value))
-    span_seconds = -points[0][0] * 3600 if len(points) > 1 else 0.0
+    return points
+
+
+def rate_fit(history: deque, key: str, current_value: float, now: datetime):
+    """The least-squares line through the readings in the last
+    RATE_WINDOW_MINUTES plus the current one, as {"slope": per hour,
+    "sigma": residual standard deviation (None with only 2 points - no
+    degree of freedom left), "time_ss": sum of squared time offsets (h^2),
+    "n": points}; None when there is less than MIN_RATE_SPAN_SECONDS of
+    history. The slope's standard error is sigma / sqrt(time_ss).
+    history is in ARRIVAL order (a backlog can arrive after newer
+    readings), so the span is measured from the OLDEST point, not the
+    first one in the list."""
+    points = rate_window_points(history, key, current_value, now)
+    span_seconds = -min(t for t, _ in points) * 3600
     if span_seconds < MIN_RATE_SPAN_SECONDS:
-        return 0.0
+        return None
+    return line_fit(points)
+
+
+def line_fit(points):
+    """rate_fit's numbers for a list of (hours, value) points; None when
+    the times are all equal."""
     n = len(points)
     mean_t = sum(t for t, _ in points) / n
     mean_v = sum(v for _, v in points) / n
-    var_t = sum((t - mean_t) ** 2 for t, _ in points)
-    if var_t == 0:
+    time_ss = sum((t - mean_t) ** 2 for t, _ in points)
+    if time_ss == 0:
+        return None
+    slope = sum((t - mean_t) * (v - mean_v) for t, v in points) / time_ss
+    sigma = None
+    if n > 2:
+        residual_ss = sum((v - (mean_v + slope * (t - mean_t))) ** 2 for t, v in points)
+        sigma = math.sqrt(residual_ss / (n - 2))
+    return {"slope": slope, "sigma": sigma, "time_ss": time_ss, "n": n}
+
+
+# --- River rate: a rise must stand out from the sensor's noise (step B1) --
+#
+# With few points in the window the least-squares slope IS the noise: two
+# readings 60 s apart that differ by 1.5 cm of jitter "rise" at 0.9 m/h,
+# above the flash-flood MEDIUM rate (0.6 m/h). Measured 2026-10-09 on the
+# load-test stream with +-1 cm river noise (tests/false_alarm_streams.py):
+# MEDIUM flash floods on a calm river, all on a node's 2nd reading.
+# A river rate now counts only when
+#   - the window holds at least MIN_RIVER_RATE_POINTS readings, and
+#   - the slope is at least RIVER_RATE_SIGNIFICANCE_Z standard errors from
+#     0, with the noise taken as the larger of the fit's own residual
+#     spread and RIVER_NOISE_FLOOR_M (a 3-point fit's residual can be ~0
+#     by chance).
+# Otherwise the rate is 0.0, "no evidence of change" - the same answer as
+# too little history. It feeds the flash-flood check, the flood model,
+# the upstream corroboration and the ETA alike.
+# The noise is measured on the CALM part of the window when there is one:
+# with at least NOISE_FIT_MIN_POINTS points, the residual of a line through
+# all but the newest NOISE_EXCLUDE_NEWEST points. The residual of the whole
+# fit also contains the BEND between a calm stretch and a sudden rise, and
+# gated real rises to 0 for 2 readings mid-stream (review 2026-10-09:
+# 15 calm minutes then 50 cm/min read 0.0 at minute 2 where the plain slope
+# read 1.90 m/h, above flash-flood HIGH).
+# Cost, measured 2026-10-09 (river_rate_per_hour vs the plain slope,
+# 60 s cadence, noise-free): with 3 or 4 points in the window (start-up)
+# the whole-fit residual still gates, so a rise right then is seen one
+# reading later (3 calm min + 10 cm/min: 0.0 vs 1.8 m/h at minute 1).
+# After 15 calm minutes, rises of 10/20/30/50 cm/min now read the plain
+# slope from the first rising reading on (before this change: 0.0 for
+# minutes 1 and 2). Calm river, +-1 cm noise, 20 000 windows each:
+# P(rate >= 0.2 m/h) at 5 / 6 points 0.31 % / 0.43 % before, 0.26 % /
+# 0.37 % after; P(rate >= 0.6 m/h) 0 before and after; 3, 4, 8, 16 points
+# unchanged. At 5 s (elevated mode) the window holds many points. The
+# node's own fast-rise check (taken from every raw sample) is unaffected.
+# RIVER_NOISE_FLOOR_M IS A DEMO DEFAULT (river-surface ripple plus
+# ultrasonic jitter; not from a datasheet) - set it per site from a calm
+# day's readings. In bench mode it scales with the rig (a few cm tall).
+MIN_RIVER_RATE_POINTS = 3
+RIVER_RATE_SIGNIFICANCE_Z = 3.0
+NOISE_EXCLUDE_NEWEST = 2
+NOISE_FIT_MIN_POINTS = MIN_RIVER_RATE_POINTS + NOISE_EXCLUDE_NEWEST  # leaves >= 3 calm points (1 dof)
+RIVER_NOISE_FLOOR_M = float(os.environ.get("SANJEEVNI_RIVER_NOISE_FLOOR_M", "0.005"))
+BENCH_NOISE_FLOOR_FRACTION = 0.05  # of the bench rig's mount height
+# A level change far beyond any sensor noise is evidence by itself
+# (integration 2026-10-10): when the newest RIVER_RATE_CLEAR_READINGS
+# levels ALL lie at least RIVER_RATE_CLEAR_CHANGE_M on the same side of the
+# median of the older points in the window, the plain slope is used
+# without the significance gate. The "calm" fit above assumes the rise is
+# in the newest NOISE_EXCLUDE_NEWEST points only; after a step (wave front)
+# followed by a plateau, with dense readings right before the step and
+# only one or two sparse older points in the window (a node back from a
+# link outage, a 5-min node going to 5-s samples, the judge demo's 2-s
+# rounds after its 150-s history), the step itself landed in the "noise"
+# and the rate read 0.0 for the whole plateau: the judge demo's 3.8-4.1 m
+# river read 0.0 m/h for 17 readings and its flood stayed MEDIUM/HIGH.
+# 0.3 m is 60x the noise floor and 30x the +-1 cm jitter of the false-alarm
+# streams; a one-reading spike is held out of history by river_spike, so it
+# cannot make 3 newest points. Bench rigs (a few cm) never reach it.
+# DEMO DEFAULT - VERIFY PER SITE.
+RIVER_RATE_CLEAR_CHANGE_M = float(os.environ.get("SANJEEVNI_RIVER_RATE_CLEAR_CHANGE_M", "0.3"))
+RIVER_RATE_CLEAR_READINGS = 3
+
+
+def river_noise_floor_m(bench_mount_m=None) -> float:
+    return BENCH_NOISE_FLOOR_FRACTION * bench_mount_m if bench_mount_m else RIVER_NOISE_FLOOR_M
+
+
+def river_rate_per_hour(history, current_value: float, now: datetime, bench_mount_m=None) -> float:
+    """The river's rate of rise in m/h (clamped), or 0.0 when it does not
+    stand out from the sensor's noise - see the block above."""
+    points = rate_window_points(history, "river_level_m", current_value, now)
+    if -min(t for t, _ in points) * 3600 < MIN_RATE_SPAN_SECONDS:
         return 0.0
-    return sum((t - mean_t) * (v - mean_v) for t, v in points) / var_t
+    fit = line_fit(points)
+    if not fit or fit["n"] < MIN_RIVER_RATE_POINTS or fit["sigma"] is None:
+        return 0.0
+    change = clear_level_change(points)
+    if change and (change > 0) == (fit["slope"] > 0):
+        return clamp_river_rate(fit["slope"])
+    noise = fit["sigma"]
+    if fit["n"] >= NOISE_FIT_MIN_POINTS:
+        calm = line_fit(sorted(points)[:-NOISE_EXCLUDE_NEWEST])
+        if calm and calm["sigma"] is not None:
+            noise = calm["sigma"]
+    sigma = max(noise, river_noise_floor_m(bench_mount_m))
+    stderr = sigma / math.sqrt(fit["time_ss"])
+    if abs(fit["slope"]) < RIVER_RATE_SIGNIFICANCE_Z * stderr:
+        return 0.0
+    return clamp_river_rate(fit["slope"])
+
+
+def clear_level_change(points) -> float:
+    """+1 / -1 when the newest RIVER_RATE_CLEAR_READINGS levels all lie at
+    least RIVER_RATE_CLEAR_CHANGE_M above / below the median of the older
+    points in the window (needs >= 2 older points), else 0."""
+    ordered = sorted(points)  # by time (history can arrive out of order)
+    if len(ordered) < RIVER_RATE_CLEAR_READINGS + 2:
+        return 0
+    base = statistics.median(v for _, v in ordered[:-RIVER_RATE_CLEAR_READINGS])
+    newest = [v for _, v in ordered[-RIVER_RATE_CLEAR_READINGS:]]
+    if all(v - base >= RIVER_RATE_CLEAR_CHANGE_M for v in newest):
+        return 1
+    if all(base - v >= RIVER_RATE_CLEAR_CHANGE_M for v in newest):
+        return -1
+    return 0
 
 
 def smooth_water_level(history: deque, current_value: float) -> float:
@@ -836,6 +1264,79 @@ def last_entry_with(history, key: str):
 def last_value(history, key: str):
     entry = last_entry_with(history, key)
     return entry[key] if entry else None
+
+
+# --- Optional reading fields added 2026-10-09 (siren, fast rise, edge
+# anomaly checks, NORMAL-mode summaries) ----------------------------------
+# A malformed value in one of these fields is DROPPED (the field falls back
+# to its default) instead of rejecting the reading: pydantic rejects a
+# whole /api/ingest/batch when one item fails, and the gateway would then
+# retry that batch forever (review R7). A field the backend cannot read is
+# simply not used.
+EDGE_RISK_LEVELS = ("NORMAL", "WATCH", "URGENT")
+SIREN_REASONS = ("auto_offline", "command")
+# "<check>:<field>", e.g. "spike:gas_ppm". The check names are open-ended
+# (stuck / spike / rate / dropout today) so newer firmware is not rejected.
+EDGE_ANOMALY_PATTERN = re.compile(r"^[a-z_]{1,16}:[a-z0-9_]{1,32}$")
+MAX_EDGE_ANOMALY_ITEMS = 16
+
+
+def _drop_if_invalid(cls, value, handler, info):
+    """Wrap-validator body: validate normally; on failure use the field's
+    default (see the comment above)."""
+    try:
+        return handler(value)
+    except ValidationError:
+        return cls.model_fields[info.field_name].get_default(call_default_factory=True)
+
+
+class SummaryStats(BaseModel):
+    """min / max / mean of one sensor over a summary window."""
+    min: float
+    max: float
+    mean: float
+
+    @model_validator(mode="after")
+    def _consistent(self):
+        values = (self.min, self.max, self.mean)
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError("summary statistics must be finite")
+        # Small tolerance: the firmware rounds each number separately.
+        if self.min > self.max or not self.min - 1e-6 <= self.mean <= self.max + 1e-6:
+            raise ValueError("summary statistics must satisfy min <= mean <= max")
+        return self
+
+
+class ReadingSummary(BaseModel):
+    """What a node in NORMAL mode sends instead of every raw sample: the
+    reading's top-level sensor values are the LATEST sample (so the
+    pipeline needs no change), and this block describes the samples since
+    the previous report. Only the smoke check uses it so far (the min and
+    mean let it see a rise that happened between two reports)."""
+    samples: Optional[int] = Field(default=None, ge=1, le=100_000)
+    window_s: Optional[int] = Field(default=None, ge=0, le=30 * 24 * 3600)
+    max_edge_risk_level: Optional[str] = None
+    river_level_m: Optional[SummaryStats] = None
+    temp_c: Optional[SummaryStats] = None
+    humidity_pct: Optional[SummaryStats] = None
+    gas_ppm: Optional[SummaryStats] = None
+    pm25_ugm3: Optional[SummaryStats] = None
+    tilt_angle_deg: Optional[SummaryStats] = None
+
+    @field_validator("*", mode="wrap")
+    @classmethod
+    def _drop_bad_fields(cls, value, handler, info):
+        return _drop_if_invalid(cls, value, handler, info)
+
+    @field_validator("max_edge_risk_level")
+    @classmethod
+    def _known_level(cls, value):
+        return value if value in EDGE_RISK_LEVELS else None
+
+    def stats(self, field: str) -> Optional[dict]:
+        """{"min", "max", "mean"} for one sensor, or None."""
+        s = getattr(self, field, None)
+        return s.model_dump() if isinstance(s, SummaryStats) else None
 
 
 class RawReading(BaseModel):
@@ -896,6 +1397,60 @@ class RawReading(BaseModel):
     # gateway - signal_strength_dbm is then the LoRa RSSI) or "nbiot".
     # Decides what counts as a weak signal in node health.
     link: Optional[str] = None
+    # Someone held the SOS button on a LoRa node (firmware SJ_SOS_PRESSED;
+    # omitted when not pressed). The web server raises the SOS from it
+    # before forwarding the reading here; the AI pipeline ignores it - the
+    # reading's sensor values are processed like any other.
+    sos_button: bool = False
+    # --- 2026-10-09 contract (see SummaryStats above). Omitted when false
+    # or absent; a malformed value is dropped, never a rejected reading.
+    # Siren state: the web server reconciles it against the officer's /
+    # auto siren decision; the AI pipeline does not use it.
+    siren_fitted: bool = False
+    siren_on: bool = False
+    siren_reason: Optional[str] = None  # "auto_offline" | "command", only with siren_on
+    # The node's own river rate-of-rise check (positive = rising). A fast
+    # rise is sent at once instead of waiting for the next report; the
+    # flash-flood classifier uses the rate as a second measurement next to
+    # the backend's own (hazard_classification.classify_flash_flood).
+    fast_rise: bool = False
+    rise_rate_cm_per_min: Optional[float] = None
+    # On-device anomaly checks, "<check>:<field>" (EDGE_ANOMALY_PATTERN).
+    edge_anomaly: Optional[list] = None  # items checked in _clean_anomaly_list
+    summary: Optional[ReadingSummary] = None
+
+    @field_validator(
+        "siren_fitted", "siren_on", "siren_reason", "fast_rise", "rise_rate_cm_per_min",
+        "edge_anomaly", "summary", mode="wrap",
+    )
+    @classmethod
+    def _drop_bad_contract_fields(cls, value, handler, info):
+        return _drop_if_invalid(cls, value, handler, info)
+
+    @field_validator("rise_rate_cm_per_min")
+    @classmethod
+    def _finite_rate(cls, value):
+        return value if value is None or math.isfinite(value) else None
+
+    @field_validator("edge_anomaly")
+    @classmethod
+    def _clean_anomaly_list(cls, value):
+        # Unknown-format entries are dropped one by one; duplicates and an
+        # oversized list are trimmed, so a corrupted packet cannot flood
+        # the stored column.
+        if value is None:
+            return None
+        kept = []
+        for item in value:
+            if isinstance(item, str) and EDGE_ANOMALY_PATTERN.match(item) and item not in kept:
+                kept.append(item)
+        return kept[:MAX_EDGE_ANOMALY_ITEMS] or None
+
+    @model_validator(mode="after")
+    def _siren_reason_only_while_sounding(self):
+        if self.siren_reason not in SIREN_REASONS or not self.siren_on:
+            self.siren_reason = None
+        return self
 
     @model_validator(mode="after")
     def _has_a_measurement(self):
@@ -914,10 +1469,11 @@ SENSOR_FIELDS = (
 
 def startup():
     global _flood_model, _flood_feature_cols, _anomaly_model, _anomaly_scaler
-    global _rag_collection, _rag_embedder
+    global _rag_collection, _rag_embedder, _flood_calibration
     init_db()
     reload_node_registry()
     seed_node_health_from_db()
+    seed_node_history_from_db()
     print(
         f"[nodes] Loaded {len(NODE_REGISTRY)} nodes from the database: {list(NODE_REGISTRY.keys())}"
     )
@@ -932,6 +1488,9 @@ def startup():
         print(f"Loading trained flood model from {models_dir} ...")
         _flood_model = joblib.load(flood_path)
         _flood_feature_cols = joblib.load(flood_cols_path)
+        # Only for a model loaded from disk: the card names that file's
+        # sha256. A freshly trained fallback model was never evaluated.
+        _flood_calibration = load_flood_calibration(MODEL_CARD_PATH, flood_path)
     else:
         print(
             "No saved flood model found - training on synthetic data (run train_models.py to use real data)..."
@@ -947,6 +1506,16 @@ def startup():
             "No saved anomaly model found - training on synthetic data (run train_models.py to use real data)..."
         )
         _anomaly_model, _anomaly_scaler = train_anomaly_detector()
+
+    # Step B2: build the fast evaluators of both models now (each is checked
+    # against scikit-learn on probe rows - fast_inference.py), not on the
+    # first reading. None = scikit-learn is used, with the same results.
+    fast = (
+        fast_inference.fast_isolation_forest(_anomaly_model, _anomaly_scaler, ANOMALY_FEATURES),
+        fast_inference.fast_flood_model(_flood_model, _flood_feature_cols),
+    )
+    print(f"[fast-inference] anomaly model: {'fast' if fast[0] else 'scikit-learn'}, "
+          f"flood model: {'fast' if fast[1] else 'scikit-learn'}")
 
     print("Building RAG knowledge base...")
     try:
@@ -1008,8 +1577,11 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     # plain difference from the previous reading (3-5s earlier), which
     # made ETA projections ~700x too slow and fed the flood model a
     # feature on a different scale than it was trained on.
+    # Only a rise that stands out from the sensor's noise counts - see
+    # river_rate_per_hour (step B1).
+    bench_mount_m = bench_mount_for({"simulated": raw.simulated})
     river_level_rate_m_per_hr = (
-        clamp_river_rate(rate_per_hour(history, "river_level_m", water_level_m, now))
+        river_rate_per_hour(history, water_level_m, now, bench_mount_m)
         if has_water else None
     )
     gas_ppm_rate_per_hr = (
@@ -1040,6 +1612,22 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     rainfall_intensity_mm_hr = sum(
         mm for t, mm in rain_log if t >= now - timedelta(hours=1)
     )
+    # THIS reading's own rain rate. The hourly total above lags at the
+    # start of a storm (60 mm/h that began 2 min ago has put ~2 mm in the
+    # hour), so on its own it cannot tell the river-spike check that heavy
+    # rain is falling NOW (review 2026-10-09). The gap is floored at
+    # RAIN_RATE_MIN_GAP_SECONDS so one rain report over a few seconds (an
+    # elevated burst, a backlog) cannot claim a huge rate. Used only as
+    # corroboration for river_spike below. Trade-off: one tipping-bucket
+    # tip can count as "heavy rain" for that one reading (the node
+    # firmware's default 0.2794 mm bucket, RAIN_MM_PER_TIP in config.h, in
+    # a gap of 60 s or less reads 16.8 mm/h; over a 5-min summary 3.4 mm/h,
+    # under FLOOD_SIGNATURE_RAIN_MM_HR) - a spike in that same reading is
+    # then classified, and HazardConfirmer still needs a repeat.
+    reading_rain_mm_hr = (
+        rain_mm / (max(rain_hours_since_prev * 3600, RAIN_RATE_MIN_GAP_SECONDS) / 3600)
+        if rain_hours_since_prev is not None and rain_mm > 0 else 0.0
+    )
     # mm per trailing window, for the landslide rainfall threshold, which
     # needs more durations than 1 h and 24 h (see
     # LANDSLIDE_RAIN_WINDOWS_HOURS). Same ">=" edge as the intensity above.
@@ -1061,7 +1649,8 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     # it in minutes at a 5s interval).
     if raw.soil_moisture_pct is not None:
         prev_saturation = None
-    elif history:
+    elif history and history[-1].get("soil_saturation") is not None:
+        # (an entry restored from an old database row may have no proxy)
         hours_since_prev = max(
             0.0, (now - history[-1]["timestamp"]).total_seconds() / 3600
         )
@@ -1088,22 +1677,73 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         # UPGRADE: cross-node spatial correlation needs the upstream
         # node's OWN rate of rise, not just its current level - see
         # integration_pipeline.py's apply_spatial_correlation_boost().
-        upstream_rate_m_per_hr = clamp_river_rate(rate_per_hour(
-            upstream_hist,
-            "river_level_m",
+        # Noise-gated like this node's own rate: a jittery upstream sensor
+        # must not count as "rising upstream" corroboration.
+        # (upstream_last is the current point - not counted twice.)
+        upstream_rate_m_per_hr = river_rate_per_hour(
+            [e for e in upstream_hist if e is not upstream_last],
             upstream_level_m,
             upstream_last["timestamp"],
-        ))
+            bench_mount_for({"simulated": raw.simulated}),
+        )
     else:
         upstream_level_m = water_level_m
         upstream_rate_m_per_hr = 0.0
 
+    # The node's own recent values (step B1): an Isolation Forest flag only
+    # suppresses a reading that is ALSO out of line with them
+    # (integration_pipeline.anomaly_flag_stands), and a river level further
+    # from the last good one than the river could have moved is a spike
+    # (integration_pipeline.river_spike). From history BEFORE this entry;
+    # faulty fields are None there and skipped.
+    # The window is at least ANOMALY_BASELINE_MAX_AGE_MIN, longer for a
+    # node that reports less often (baseline_max_age), so a slow node still
+    # collects ANOMALY_BASELINE_MIN_SAMPLES readings in it.
+    baseline_start = now - baseline_max_age(raw.node_id)
+    baseline_entries = [e for e in history if baseline_start <= e["timestamp"] < now][-ANOMALY_BASELINE_WINDOW:]
+    anomaly_ref = anomaly_baseline(baseline_entries)
+    good_levels = sorted((e for e in baseline_entries if e.get("raw_water_level_m") is not None),
+                         key=lambda e: e["timestamp"])
+    last_good = good_levels[-1] if good_levels else None
+
+    def hours_before_now(e):
+        return (now - e["timestamp"]).total_seconds() / 3600
+
+    held_before = []
+    for e in reversed(history):  # the run of held spikes just before this reading
+        if e.get("river_spike_m") is None:
+            break
+        held_before.insert(0, (hours_before_now(e), e["river_spike_m"]))
+    is_river_spike = has_water and converted_value is not None and river_spike(
+        converted_value,
+        last_good["raw_water_level_m"] if last_good else None,
+        hours_before_now(last_good) if last_good else 0.0,
+        len(good_levels) >= ANOMALY_BASELINE_MIN_SAMPLES,
+        RIVER_SPIKE_MAX_RATE_M_PER_HR,
+        corroborated=(
+            max(rainfall_intensity_mm_hr, reading_rain_mm_hr) >= FLOOD_SIGNATURE_RAIN_MM_HR
+            or upstream_rate_m_per_hr >= FLOOD_SIGNATURE_RATE_M_PER_HR
+            or bool(raw.fast_rise)
+        ),
+        held_before=held_before,
+        prev_good=(
+            (hours_before_now(good_levels[-2]), good_levels[-2]["raw_water_level_m"])
+            if len(good_levels) >= 2 else None
+        ),
+    )
+
     # Cloud-side weather enrichment - forecasted rain not yet reflected in
     # any sensor reading. None if the weather API is unreachable; the
     # pipeline must not depend on this to function.
-    forecast_rainfall_6h_mm = fetch_forecast_rainfall_mm(
-        config["latitude"], config["longitude"], raw.node_id
-    )
+    # The same fetch gives the next 24 h of rain and wind for the
+    # extreme-weather hazards (heavy_rain / high_wind).
+    # simulated: the SANJEEVNI_WEATHER_MOCK test file applies to simulated
+    # readings only - a real reading never sees it (WEATHER_MOCK_ENV).
+    weather = fetch_weather_forecast(
+        config["latitude"], config["longitude"], raw.node_id,
+        simulated=bool(raw.simulated),
+    ) or {}
+    forecast_rainfall_6h_mm = weather.get("rain_6h_mm")
 
     # UPGRADE: auto-derived curve_number from real terrain slope, falling
     # back to the hand-typed NODE_REGISTRY value if the terrain API is
@@ -1129,6 +1769,15 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         "rainfall_windows_mm": rainfall_windows_mm,
         "rainfall_windows_count": rainfall_windows_count,
         "forecast_rainfall_6h_mm": forecast_rainfall_6h_mm,
+        "forecast_rainfall_24h_mm": weather.get("rain_24h_mm"),
+        "forecast_wind_speed_max_kmh": weather.get("wind_speed_max_kmh"),
+        "forecast_wind_gust_max_kmh": weather.get("wind_gust_max_kmh"),
+        "forecast_source": weather.get("source"),
+        # IMD heat-wave criteria per region (hazard_classification.
+        # classify_extreme_heat). Not registry columns yet: None = the
+        # SANJEEVNI_HEAT_REGION default ("plains") and no departure check.
+        "heat_region": config.get("heat_region"),
+        "normal_max_temp_c": config.get("normal_max_temp_c"),
         "river_level_m": water_level_m,
         "simulated": raw.simulated,
         "river_level_rate_m_per_hr": river_level_rate_m_per_hr,
@@ -1160,13 +1809,26 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         "rainfall_mm_since_last": raw.rainfall_mm_since_last,
         "soil_saturation_source": soil_saturation_source,
         "link": raw.link,
+        # The node's own fast-rise check (flash flood). Its rate is clamped
+        # like the backend's, so one corrupted number cannot claim a rise
+        # faster than any river (see MAX_RIVER_RATE_M_PER_HR).
+        "fast_rise": raw.fast_rise if has_water else False,
+        "rise_rate_cm_per_min": raw.rise_rate_cm_per_min,
+        "node_rise_rate_m_per_hr": (
+            clamp_river_rate(raw.rise_rate_cm_per_min * CM_PER_MIN_TO_M_PER_HR)
+            if has_water and raw.rise_rate_cm_per_min is not None else None
+        ),
+        "edge_anomaly": raw.edge_anomaly,
+        # Sets the node's expected report interval (node health).
+        "siren_fitted": raw.siren_fitted,
     }
 
     # A value no working sensor can produce (see PHYSICAL_LIMITS) is kept
     # out of history as None - the same gap a missing sensor leaves - so
     # one 14 m spike can't skew the next 15 minutes of rise rates, the
     # median smoothing, an upstream neighbour's features or drift checks.
-    faulty = set(implausible_fields(enriched))
+    # fault_fields = out of range, or part of a dropout frame (step B1).
+    faulty = set(fault_fields(enriched))
     if converted_value is not None and implausible_fields({"river_level_m": converted_value}):
         faulty.add("raw_water_level_m")
     if rain_fault:
@@ -1177,6 +1839,14 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         # other faulty fields do, to help label anomalies.
         faulty.add("rainfall_mm_since_last")
         enriched["sensor_faults"] = ["rainfall_mm_since_last"]
+    if is_river_spike:
+        # Same treatment: None in history (so it skews no rate, median or
+        # neighbour), listed for process_reading (which drops the level and
+        # everything derived from it). river_spike_m keeps the value, so a
+        # level that STAYS there is accepted (RIVER_SPIKE_ACCEPT_AFTER).
+        faulty.update(("river_level_m", "raw_water_level_m"))
+        enriched["sensor_faults"] = [*(enriched.get("sensor_faults") or ()), "river_level_m"]
+        enriched["river_spike"] = True
     entry = {
         "timestamp": now,
         "river_level_m": water_level_m,
@@ -1186,6 +1856,7 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
         "gas_ppm": raw.gas_ppm,
         "temp_c": raw.temp_c,
         "humidity_pct": raw.humidity_pct,
+        "pm25_ugm3": raw.pm25_ugm3,  # for the smoke trend
         # Lets a neighbour tell simulator data from real data - see
         # upstream_history_for().
         "simulated": raw.simulated,
@@ -1193,6 +1864,41 @@ def derive_features(raw: RawReading, timestamp: str) -> dict:
     for field in faulty:
         if field in entry:
             entry[field] = None
+    if is_river_spike:
+        entry["river_spike_m"] = converted_value
+
+    # Short-window trends for the smoke check (hazard_classification.
+    # short_window_trend), from history BEFORE this entry is added. A
+    # field that is faulty now has no trend; its past None gaps are skipped.
+    # history is in ARRIVAL order, and a node sends elevated / fast-rise
+    # readings before its older backlog (round item E), so it is sorted by
+    # time here: short_window_trend takes the last values as "recent" and
+    # the rest as the baseline.
+    trend_start = now - timedelta(minutes=SHORT_TREND_WINDOW_MINUTES)
+    in_window = sorted(
+        (e for e in history if trend_start <= e["timestamp"] <= now), key=lambda e: e["timestamp"]
+    )
+    # The summary's min / mean describe the node's report window. Only one
+    # that fits inside the short window is evidence of a FAST rise: a
+    # summary over an hour (a long report interval, or the first report
+    # after an outage) would turn a slow build-up into "smoke".
+    window_s = raw.summary.window_s if raw.summary else None
+    use_summary = window_s is not None and 0 < window_s <= SHORT_TREND_WINDOW_MINUTES * 60
+    short_trends = {}
+    for field in SHORT_TREND_FIELDS:
+        if field in faulty:
+            continue
+        trend = short_window_trend(
+            [e.get(field) for e in in_window],
+            getattr(raw, field),
+            raw.summary.stats(field) if use_summary else None,
+        )
+        if trend is not None:
+            short_trends[field] = trend
+    enriched["short_trends"] = short_trends
+
+    enriched["anomaly_baseline"] = anomaly_ref  # see river_spike above
+
     history.append(entry)
 
     return enriched
@@ -1248,14 +1954,14 @@ def resolve_reading_time(raw: RawReading, received_at: datetime) -> datetime:
     return taken_at.astimezone(timezone.utc)
 
 
-def is_duplicate_reading(node_id: str, reading_uid: Optional[str]) -> bool:
+def is_duplicate_reading(node_id: str, reading_uid: Optional[str],
+                         conn: Optional[sqlite3.Connection] = None) -> bool:
     if not reading_uid:
         return False
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT 1 FROM readings WHERE node_id=? AND reading_uid=?", (node_id, reading_uid)
-    ).fetchone()
-    conn.close()
+    with _ingest_db(conn) as db:
+        row = db.execute(
+            "SELECT 1 FROM readings WHERE node_id=? AND reading_uid=?", (node_id, reading_uid)
+        ).fetchone()
     return row is not None
 
 
@@ -1272,6 +1978,7 @@ def update_node_health(raw: RawReading, received_at: datetime, taken_at: datetim
         health["signal_strength_dbm"] = raw.signal_strength_dbm
         health["link"] = raw.link
         health["sensor_drift"] = drift
+        health["siren_fitted"] = raw.siren_fitted
     remember_report_interval(health, node_history.get(raw.node_id, ()), received_at)
 
 
@@ -1317,12 +2024,20 @@ _ingest_lock = threading.Lock()
 
 def process_raw_reading(raw: RawReading, received_at: datetime, time_known: bool = True) -> dict:
     with _ingest_lock:
-        if not time_known:
-            return store_untimed_reading(raw, received_at)
-        return _process_raw_reading(raw, received_at)
+        try:
+            db = ingest_connection()
+            if not time_known:
+                return store_untimed_reading(raw, received_at, db)
+            return _process_raw_reading(raw, received_at, db)
+        except sqlite3.Error:
+            # (a duplicate's IntegrityError never gets here) - a fresh
+            # connection for the next reading, whatever state this one is in
+            close_ingest_connection()
+            raise
 
 
-def store_untimed_reading(raw: RawReading, received_at: datetime) -> dict:
+def store_untimed_reading(raw: RawReading, received_at: datetime,
+                          conn: Optional[sqlite3.Connection] = None) -> dict:
     """A queued reading whose age is unknown (its node or gateway rebooted
     while it waited). Stamping it "now" would pile hours of backlog rain
     into the same instant - inflating rainfall intensity and possibly
@@ -1330,30 +2045,30 @@ def store_untimed_reading(raw: RawReading, received_at: datetime) -> dict:
     record but kept out of rates, rainfall totals, alerts and confirmation."""
     if raw.node_id not in NODE_REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown node_id '{raw.node_id}'")
-    if is_duplicate_reading(raw.node_id, raw.reading_uid):
+    if is_duplicate_reading(raw.node_id, raw.reading_uid, conn):
         return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
     node_health.setdefault(raw.node_id, {})["last_seen"] = received_at.isoformat()  # we did hear from it
-    conn = sqlite3.connect(DB_PATH)
     try:
-        conn.execute(
-            """INSERT INTO readings (node_id, location, river_level_m, temp_c, humidity_pct, gas_ppm,
-                   flame_reading, status, timestamp, reading_uid, simulated, link, battery_pct, signal_strength_dbm)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (raw.node_id, NODE_REGISTRY[raw.node_id]["location"], raw.river_level_m, raw.temp_c,
-             raw.humidity_pct, raw.gas_ppm, raw.flame_reading, "untimed", received_at.isoformat(),
-             raw.reading_uid, 1 if raw.simulated else 0, raw.link, raw.battery_pct, raw.signal_strength_dbm),
-        )
-        conn.commit()
+        with _ingest_db(conn) as db:
+            _insert_reading(
+                db,
+                """INSERT INTO readings (node_id, location, river_level_m, temp_c, humidity_pct, gas_ppm,
+                       flame_reading, status, timestamp, reading_uid, simulated, link, battery_pct,
+                       signal_strength_dbm)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (raw.node_id, NODE_REGISTRY[raw.node_id]["location"], raw.river_level_m, raw.temp_c,
+                 raw.humidity_pct, raw.gas_ppm, raw.flame_reading, "untimed", received_at.isoformat(),
+                 raw.reading_uid, 1 if raw.simulated else 0, raw.link, raw.battery_pct, raw.signal_strength_dbm),
+            )
     except sqlite3.IntegrityError:
         return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
-    finally:
-        conn.close()
     return {"status": "untimed", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
 
 
-def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
+def _process_raw_reading(raw: RawReading, received_at: datetime,
+                         conn: Optional[sqlite3.Connection] = None) -> dict:
     """Shared by /api/ingest and /api/ingest/batch."""
-    if is_duplicate_reading(raw.node_id, raw.reading_uid):
+    if is_duplicate_reading(raw.node_id, raw.reading_uid, conn):
         return {"status": "duplicate", "node_id": raw.node_id, "reading_uid": raw.reading_uid}
 
     taken_at = resolve_reading_time(raw, received_at)
@@ -1410,13 +2125,41 @@ def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
     if result["status"] == "alert_dispatched":
         # simulated: simulator traffic must never corroborate a real alert
         # (it would go public and reach real WhatsApp subscribers).
+        # sensor_stuck: a sensor this hazard reads that the node calls
+        # frozen repeats by definition, so only a neighbour may confirm it
+        # (a stuck gas sensor would otherwise "confirm" its own CRITICAL
+        # and auto-sound the siren).
         confirmed, basis = _confirmer.assess(
             raw.node_id, result["hazard_type"], result["severity"], taken_at, NODE_REGISTRY,
             simulated=raw.simulated,
+            sensor_stuck=bool(stuck_hazard_fields(result["hazard_type"], raw.edge_anomaly)),
+            # Forecast-only heavy rain / high wind: confirmed by its
+            # external source, never by node repeats (hazard_confirmation).
+            forecast_only=bool(result.get("forecast_based")),
+            forecast_source=result.get("forecast_source"),
         )
         result["confirmation"] = basis or "unconfirmed"
         if not confirmed:
             result["status"] = "pending_confirmation"
+
+    # Confidence score (alert_confidence.py) - after the cross-check, since
+    # confirmation is its biggest part. The three keys are always present
+    # (None for a non-alert), so every result has the same shape.
+    # A NORMAL-mode summary report's latest-sample verdict is
+    # edge_risk_level; the window's worst is only weaker support for
+    # firmware that sends just the summary block (alert_confidence.
+    # EDGE_WINDOW_SUPPORT_SCORE) - never full agreement.
+    confidence = compute_confidence(
+        result,
+        {"edge_risk_level": raw.edge_risk_level,
+         "edge_risk_level_window_max": raw.summary.max_edge_risk_level if raw.summary else None,
+         "edge_anomaly": raw.edge_anomaly,
+         "delay_seconds": enriched["delay_seconds"]},
+        _flood_calibration,
+    )
+    result.update(confidence)
+    if result.get("message"):
+        result["message"] = add_confidence_to_message(result["message"], confidence)
     result["delay_seconds"] = enriched["delay_seconds"]
     result["reading_uid"] = raw.reading_uid
 
@@ -1425,6 +2168,14 @@ def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
         eta_minutes = estimate_eta_minutes(
             enriched["river_level_m"],
             enriched["river_level_rate_m_per_hr"],
+            FLOOD_CRITICAL_LEVEL_M,
+        )
+    elif result.get("hazard_type") == "flash_flood":
+        # The flash-flood rate is the faster of the backend's and the
+        # node's own measurement (classify_flash_flood).
+        eta_minutes = estimate_eta_minutes(
+            enriched["river_level_m"],
+            result["hazard_scores"]["flash_flood"]["rise_rate_m_per_hr"],
             FLOOD_CRITICAL_LEVEL_M,
         )
     elif result.get("hazard_type") == "gas leak":
@@ -1442,7 +2193,7 @@ def _process_raw_reading(raw: RawReading, received_at: datetime) -> dict:
     )
 
     try:
-        save_reading(enriched, result, timestamp)
+        save_reading(enriched, result, timestamp, conn)
     except sqlite3.IntegrityError:
         # Same reading_uid saved by a concurrent request between the
         # duplicate check and here - the other request already handled it.
@@ -1570,6 +2321,10 @@ def get_alert_as_cap(alert_id: int):
         node_id=row["node_id"],
         risk_score=row.get("risk_score") or 0.0,
         severity_source=row.get("severity_source") or "ml_model",
+        # <certainty> from the stored confidence score; rows from before
+        # it existed (NULL) keep the old per-source mapping.
+        confidence=row.get("confidence"),
+        confirmation=row.get("confirmation"),
         # Same reading -> same identifier and <sent> on every download, so
         # a polling CAP consumer does not re-publish it as a new alert.
         reading_id=row["id"],
@@ -1685,6 +2440,58 @@ def get_flood_frequency_heatmap():
     return {"count": len(result), "heatmap_data": result}
 
 
+def _analytics_conn():
+    """Read-only connection for the analytics endpoints, so a slow 30-day
+    query can never hold a write lock against /api/ingest."""
+    # as_uri(): a Windows path ("D:\...") is not a valid SQLite URI as-is.
+    return sqlite3.connect(Path(os.path.abspath(DB_PATH)).as_uri() + "?mode=ro", uri=True)
+
+
+@app.get("/api/analytics/trends")
+def get_analytics_trends(node_id: str, range: str = "24h", exclude_simulated: bool = False):
+    """Long-term trend series for one node (analytics.compute_trends):
+    24h in 15-min buckets, 7d in 2-h, 30d in 6-h; min/max/mean per sensor
+    field plus the worst risk score and severity per bucket. Every response
+    carries data_note - the data is simulated/synthetic in this prototype."""
+    if range not in analytics.TREND_RANGES:
+        raise HTTPException(status_code=400, detail=f"range must be one of {', '.join(analytics.TREND_RANGES)}")
+    conn = _analytics_conn()
+    try:
+        if not analytics.node_known(conn, node_id, NODE_REGISTRY):
+            raise HTTPException(status_code=404, detail=f"Unknown node_id '{node_id}'")
+        return analytics.compute_trends(conn, node_id, range, datetime.now(timezone.utc), exclude_simulated)
+    finally:
+        conn.close()
+
+
+@app.get("/api/analytics/summary")
+def get_analytics_summary(range: str = "7d", exclude_simulated: bool = False):
+    """Network summary (analytics.compute_summary): alerts per hazard and
+    node, CPCB / IMD exceedance hours, top hotspots and per-node uptime."""
+    if range not in analytics.SUMMARY_RANGES:
+        raise HTTPException(status_code=400, detail=f"range must be one of {', '.join(analytics.SUMMARY_RANGES)}")
+    conn = _analytics_conn()
+    try:
+        return analytics.compute_summary(conn, range, dict(NODE_REGISTRY), datetime.now(timezone.utc), exclude_simulated)
+    finally:
+        conn.close()
+
+
+@app.get("/api/cap/feed.atom")
+def get_cap_atom_feed():
+    """Atom 1.0 feed of the currently active CONFIRMED alerts, one entry
+    per alert linking to its CAP 1.2 XML at /cap/alerts/{id}.xml (the
+    public path server.js serves). Links are relative unless
+    SANJEEVNI_PUBLIC_BASE_URL is set."""
+    now = datetime.now(timezone.utc)
+    conn = _analytics_conn()
+    try:
+        alerts = analytics.active_confirmed_alerts(conn, dict(NODE_REGISTRY), now)
+    finally:
+        conn.close()
+    return Response(content=analytics.build_atom_feed(alerts, now), media_type=analytics.ATOM_MEDIA_TYPE)
+
+
 @app.get("/api/nodes")
 def get_nodes():
     out = []
@@ -1713,7 +2520,24 @@ def get_nodes():
 
 
 # --- Node health / missing-node alerts ----------------------------------
-DEFAULT_REPORT_INTERVAL_SECONDS = 5  # always-on firmware sends every 5s
+# The node's NORMAL-time report interval, before anything has been learned
+# from its own readings. User decision (1), 2026-10-09: a node WITHOUT a
+# siren sends its normal-time summary every 5 min, a node with a siren
+# (it says siren_fitted: true in every reading) every 1 min; WATCH /
+# URGENT, a fast rise, a new anomaly and SOS are sent at once on top.
+# It used to be 5 s for every node, so a new 5-min node was shown
+# "offline" 60 s after its first report until 3 report gaps had been seen.
+SIREN_NODE_REPORT_INTERVAL_SECONDS = 60
+NODE_REPORT_INTERVAL_SECONDS = 300
+DEFAULT_REPORT_INTERVAL_SECONDS = NODE_REPORT_INTERVAL_SECONDS  # a node not heard from yet
+
+
+def nominal_report_interval(health: dict) -> int:
+    """Decision (1): 60 s for a node that reports siren_fitted, else 300 s."""
+    if health.get("siren_fitted"):
+        return SIREN_NODE_REPORT_INTERVAL_SECONDS
+    return NODE_REPORT_INTERVAL_SECONDS
+
 MISSED_REPORTS_BEFORE_OFFLINE = 6
 MIN_OFFLINE_AFTER_SECONDS = 60  # never flag faster than this (network hiccups)
 LOW_BATTERY_PCT = 20
@@ -1752,6 +2576,42 @@ def expected_gap_seconds(timestamps: list) -> Optional[float]:
     return gaps[int(REPORT_GAP_PERCENTILE * (len(gaps) - 1))]
 
 
+def expected_report_interval_seconds(node_id: str, cfg: Optional[dict] = None,
+                                     health: Optional[dict] = None) -> float:
+    """How often the node is expected to report: the configured value, else
+    the slower of what it has actually been doing and its nominal interval.
+    Shared by node health (offline detection) and the anomaly baseline
+    window (baseline_max_age)."""
+    cfg = NODE_REGISTRY.get(node_id, {}) if cfg is None else cfg
+    health = node_health.get(node_id, {}) if health is None else health
+    # Expected cadence: the configured value, else what the node has
+    # actually been doing. A LoRa node that heartbeats every 60 s used to
+    # be judged against the 5 s default and flagged "missing" all the
+    # time unless someone configured it by hand (review R19).
+    # The slower of the live estimate and the remembered normal interval
+    # (remember_report_interval), so an elevated burst can't shrink it.
+    recent = [r["timestamp"] for r in list(node_history.get(node_id, ()))[-REPORT_GAP_SAMPLE:]]
+    estimates = [v for v in (expected_gap_seconds(recent), health.get("observed_interval_seconds")) if v]
+    observed = max(estimates) if estimates else None
+    # Never shorter than the node's nominal interval (decision (1)): a
+    # node that sent a burst of urgent readings, or old always-on
+    # firmware, must not make a 5-min node look "offline" between its
+    # summaries. A slower observed cadence (deep sleep) still wins.
+    return cfg.get("report_interval_seconds") or max(nominal_report_interval(health), observed or 0)
+
+
+def baseline_max_age(node_id: str) -> timedelta:
+    """How far back the anomaly baseline / river-spike window reaches for
+    this node: ANOMALY_BASELINE_MAX_AGE_MIN, or long enough for
+    ANOMALY_BASELINE_MIN_SAMPLES + 1 of the node's expected reports if that
+    is longer. A node reporting every 20 min or more never had 3 readings in
+    60 min, so its anomaly flags were never checked against its own
+    readings (review 2026-10-09)."""
+    interval = expected_report_interval_seconds(node_id)
+    return max(timedelta(minutes=ANOMALY_BASELINE_MAX_AGE_MIN),
+               timedelta(seconds=(ANOMALY_BASELINE_MIN_SAMPLES + 1) * interval))
+
+
 def observed_interval_from_db(conn, node_id: str) -> Optional[float]:
     # 'untimed' backlog rows carry their ARRIVAL time, not when they were
     # taken, so they say nothing about the node's reporting cadence. A
@@ -1772,7 +2632,7 @@ def seed_node_health_from_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
-        SELECT r.node_id, r.timestamp, r.battery_pct, r.signal_strength_dbm, r.link
+        SELECT r.node_id, r.timestamp, r.battery_pct, r.signal_strength_dbm, r.link, r.siren_fitted
         FROM readings r
         JOIN (SELECT node_id, MAX(id) AS max_id FROM readings GROUP BY node_id) latest
           ON r.id = latest.max_id
@@ -1788,11 +2648,75 @@ def seed_node_health_from_db():
                     # restored too, so LoRa nodes aren't judged by the WiFi
                     # signal threshold after a restart (review R20)
                     "link": row["link"],
+                    "siren_fitted": bool(row["siren_fitted"]),
                     "observed_interval_seconds": observed_interval_from_db(conn, row["node_id"]),
                     "observed_interval_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
     conn.close()
+
+
+def seed_node_history_from_db(now: Optional[datetime] = None):
+    """node_history is in-memory, so after a restart every node's first
+    ANOMALY_BASELINE_MIN_SAMPLES readings had no baseline: at a site the
+    Isolation Forest does not know (a hot dry summer) they were suppressed
+    as sensor faults, and the river-spike guard was off (review 2026-10-09).
+    Restores each node's stored readings from its baseline window
+    (baseline_max_age, before `now`), at most HISTORY_WINDOW, in arrival
+    order, the way derive_features would have kept them: every field the
+    row lists in sensor_faults is None (a suppressed row keeps its raw
+    values in the table), and a reading suppressed only by the forest's
+    flag keeps its values, as it does in live history. Skipped: untimed
+    rows (their time is the arrival time) and a node that already has live
+    history.
+    Approximations: the database keeps the corrected, SMOOTHED level, not
+    the raw one, so it stands in for raw_water_level_m (a simulated
+    reading is never smoothed, so there they are equal); a river level
+    held as a spike is restored as a gap, not as part of a held run. The
+    24 h rain log is not restored (rain totals still restart from 0)."""
+    now = now or datetime.now(timezone.utc)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        for node_id in list(NODE_REGISTRY):
+            if node_history.get(node_id):
+                continue
+            since = now - baseline_max_age(node_id)
+            rows = conn.execute(
+                "SELECT timestamp, river_level_m, rainfall_mm_since_last, soil_saturation, gas_ppm, "
+                "temp_c, humidity_pct, pm25_ugm3, simulated, sensor_faults FROM readings "
+                "WHERE node_id=? AND timestamp IS NOT NULL AND status IS NOT 'untimed' "
+                "ORDER BY id DESC LIMIT ?",
+                (node_id, HISTORY_WINDOW),
+            ).fetchall()
+            entries = []
+            for row in reversed(rows):
+                at = parse_timestamp(row["timestamp"])
+                if not since <= at <= now:
+                    continue
+                faults = set(filter(None, (row["sensor_faults"] or "").split(",")))
+                entry = {
+                    "timestamp": at,
+                    "river_level_m": row["river_level_m"],
+                    "raw_water_level_m": row["river_level_m"],
+                    "rainfall_mm_since_last": row["rainfall_mm_since_last"],
+                    "soil_saturation": row["soil_saturation"],
+                    "gas_ppm": row["gas_ppm"],
+                    "temp_c": row["temp_c"],
+                    "humidity_pct": row["humidity_pct"],
+                    "pm25_ugm3": row["pm25_ugm3"],
+                    "simulated": bool(row["simulated"]),
+                }
+                if "river_level_m" in faults:
+                    faults.add("raw_water_level_m")
+                for field in faults:
+                    if field in entry:
+                        entry[field] = None
+                entries.append(entry)
+            history = node_history.setdefault(node_id, deque(maxlen=HISTORY_WINDOW))
+            history.extend(entries)
+    finally:
+        conn.close()
 
 
 def compute_node_health(now: Optional[datetime] = None) -> list[dict]:
@@ -1804,16 +2728,7 @@ def compute_node_health(now: Optional[datetime] = None) -> list[dict]:
     out = []
     for node_id, cfg in list(NODE_REGISTRY.items()):  # snapshot - see reload_node_registry()
         health = node_health.get(node_id, {})
-        # Expected cadence: the configured value, else what the node has
-        # actually been doing. A LoRa node that heartbeats every 60 s used to
-        # be judged against the 5 s default and flagged "missing" all the
-        # time unless someone configured it by hand (review R19).
-        # The slower of the live estimate and the remembered normal interval
-        # (remember_report_interval), so an elevated burst can't shrink it.
-        recent = [r["timestamp"] for r in list(node_history.get(node_id, ()))[-REPORT_GAP_SAMPLE:]]
-        estimates = [v for v in (expected_gap_seconds(recent), health.get("observed_interval_seconds")) if v]
-        observed = max(estimates) if estimates else None
-        interval = cfg.get("report_interval_seconds") or max(DEFAULT_REPORT_INTERVAL_SECONDS, observed or 0)
+        interval = expected_report_interval_seconds(node_id, cfg, health)  # (decision (1))
         offline_after = max(MIN_OFFLINE_AFTER_SECONDS, interval * MISSED_REPORTS_BEFORE_OFFLINE)
         issues = []
 
@@ -1918,7 +2833,8 @@ def get_satellite_check(node_id: str):
     conn = sqlite3.connect(DB_PATH)
     last = conn.execute(
         """SELECT severity, timestamp FROM readings
-           WHERE node_id=? AND hazard_type='flood' AND status IN ('alert_dispatched','pending_confirmation')
+           WHERE node_id=? AND hazard_type IN ('flood','flash_flood')
+             AND status IN ('alert_dispatched','pending_confirmation')
            ORDER BY id DESC LIMIT 1""",
         (node_id,),
     ).fetchone()
@@ -1962,8 +2878,10 @@ class NodeConfig(BaseModel):
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
     upstream_node: Optional[str] = None
-    # Expected seconds between reports; None = DEFAULT_REPORT_INTERVAL_SECONDS.
-    # Set e.g. 300 for a deep-sleep node so it isn't flagged missing.
+    # Expected seconds between reports; None = 60 s for a node that reports
+    # siren_fitted, 300 s otherwise, or the slower cadence the node is
+    # observed to keep (nominal_report_interval). Set it for a deep-sleep
+    # node with a longer wake interval so it isn't flagged missing.
     report_interval_seconds: Optional[float] = Field(default=None, gt=0, le=24 * 3600)
     # Landslide rainfall threshold I = alpha * D^-beta (mm/h, hours) from a
     # regional study, in place of the global Caine (1980) 14.82 / 0.39.

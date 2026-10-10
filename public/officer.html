@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,"><!-- no favicon request: /favicon.ico is a 404 in classic mode -->
 <title>SANJEEVNI - Officer Map</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
 <style>
@@ -74,6 +75,16 @@
     cursor: pointer; font-size: 13px;
   }
   .resolve-all-btn:hover { background: #b8021f; }
+  /* SOS location notes in the popup: approximate (no GPS) and node button */
+  .sos-approx { display: block; margin: 3px 0; padding: 4px 6px; border-radius: 4px; background: #fff4e0; color: #7a4a00; font-weight: bold; }
+  .sos-node { display: block; margin: 3px 0; padding: 4px 6px; border-radius: 4px; background: #e8f1fd; color: #1a4f8b; font-weight: bold; }
+  .sos-people { color: #b91c1c; }
+  /* Node-button SOS from a node with no registered position: no pin possible */
+  .unlocated-banner {
+    margin-top: 8px; border: 2px solid #c62828; background: #fdecea; color: #b8021f;
+    padding: 8px 10px; border-radius: 6px; font-size: 13px;
+  }
+  .unlocated-banner button { margin-top: 4px; }
 
   /* Node health / missing-node alerts */
   .node-health { margin-top: 10px; border-top: 1px solid #eee; padding-top: 8px; font-size: 13px; }
@@ -84,6 +95,12 @@
   .node-issue { font-size: 12px; margin-left: 16px; color: #444; }
   .node-issue.critical { color: #b8021f; font-weight: bold; }
   .node-issue.warning { color: #8a5a00; }
+  .node-values { margin-top: 6px; font-size: 12.5px; }
+  .node-values table { border-collapse: collapse; width: 100%; margin-top: 3px; }
+  .node-values th, .node-values td { text-align: left; padding: 1px 4px; border-bottom: 1px solid #e3e3e3; vertical-align: top; }
+  .node-values th { font-weight: 600; white-space: nowrap; }
+  .node-values .no-sensor { margin-top: 3px; color: #555; }
+  .node-values .sim-badge { background: #5b2c83; color: #fff; border-radius: 8px; padding: 0 5px; font-size: 11px; }
   .resolve-all-btn:disabled { background: #9aa1ab; cursor: not-allowed; }
   /* UPGRADE: responsiveness. #panel previously had a fixed 260px width
      with NO handling for narrow screens at all - on a ~375px phone,
@@ -98,6 +115,9 @@
     }
     #panel h2 { font-size: 15px; }
     .legend { font-size: 11.5px; }
+    /* the zoom buttons sat on top of the panel's title and user chip
+       (W2 browser check, 360 px): move them to the bottom-left corner */
+    .leaflet-top.leaflet-left { top: auto; bottom: 24px; }
   }
 </style>
 </head>
@@ -107,6 +127,7 @@
   <h2>🚨 SANJEEVNI - Officer View</h2>
   <div id="sjUserChip" data-theme="light" class="user-slot"></div>
   <div id="sosCountRow">Open SOS requests: <span class="count" id="sosCount">0</span></div>
+  <div id="unlocatedBanner" class="unlocated-banner" role="alert" style="display:none"></div>
   <div id="allClearBanner" class="all-clear-banner" style="display:none">✅ All SOS requests resolved</div>
   <button id="resolveAllBtn" class="resolve-all-btn" style="display:none">Resolve All</button>
   <div class="node-health">
@@ -120,7 +141,7 @@
     <div><span style="background:#d90429"></span>Person needing help (SOS)</div>
     <div><span style="background:none; border:2px dashed orange; width:8px; height:8px"></span>Awaiting confirmation (officers only)</div>
     <div style="font-weight:bold; margin-top:8px; margin-bottom:4px">Hazard type (icon):</div>
-    <div style="line-height:1.5">🌊 Flood &nbsp; 🔥 Fire &nbsp; ☣️ Gas leak<br>🌡️ Heat &nbsp; ⛰️ Landslide<br>😷 Air pollution &nbsp; 💧 Water quality</div>
+    <div style="line-height:1.5">🌊 Flood &nbsp; ⏫ Flash flood &nbsp; 🔥 Fire &nbsp; 💨 Smoke<br>☣️ Gas leak &nbsp; 🌡️ Heat &nbsp; ⛰️ Landslide<br>😷 Air pollution &nbsp; 💧 Water quality<br>🌧️ Heavy rain &nbsp; 🌬️ High wind (forecast)</div>
   </div>
 </div>
 
@@ -149,6 +170,16 @@
   // Escapes text before it goes into popup HTML. SOS notes come from
   // anonymous citizens, so inserting them raw let a note run script in
   // the officer's browser (and act with the officer's session).
+  // CAP XML / PDF situation report for a CONFIRMED zone's alert (step W2;
+  // alert_id comes from server.js). Plain links: this classic page is the
+  // fallback; the React officer map fetches the PDF first to show errors.
+  function alertLinks(z) {
+    const id = Number(z.alert_id);
+    if (!z.confirmed || !Number.isInteger(id) || id <= 0) return "";
+    return `<br><a href="/api/officer/alerts/${id}/cap" target="_blank" rel="noopener">CAP XML</a>` +
+      ` | <a href="/api/officer/alerts/${id}/report.pdf">PDF report</a>`;
+  }
+
   function escapeHtml(value) {
     return String(value ?? "")
       .replace(/&/g, "&amp;")
@@ -187,22 +218,43 @@
   // TYPE, background color = severity (both dimensions visible at once).
   const HAZARD_ICONS = {
     "flood": "🌊",
+    "flash_flood": "⏫",
     "gas leak": "☣️",
     "fire": "🔥",
+    "smoke": "💨",
     "extreme heat": "🌡️",
     "landslide": "⛰️",
     "air pollution": "😷",
     "water quality degradation": "💧",
+    // extreme weather (backend 2026-10-09): from the weather forecast (never
+    // above HIGH) or, for rain, the node's own gauge
+    "heavy_rain": "🌧️",
+    "high_wind": "🌬️",
   };
 
   function hazardIcon(severity, hazardType) {
-    const emoji = HAZARD_ICONS[hazardType] || "⚠️";
+    const emoji = (Object.prototype.hasOwnProperty.call(HAZARD_ICONS, hazardType) && HAZARD_ICONS[hazardType]) || "⚠️";
     return L.divIcon({
       className: "hazard-marker",
       html: `<div class="hazard-icon-wrap" style="background:${severityColor(severity)}">${emoji}</div>`,
       iconSize: [30, 30],
       iconAnchor: [15, 15],
     });
+  }
+
+  // "Confidence: High (82%)" + the reasons behind it (server.js /
+  // confidence.js), or "" for a zone without a score (stored before the
+  // score existed) - never a made-up value. Same wording as the React page.
+  function confidenceLine(z) {
+    const label = ["High", "Medium", "Low"].includes(z.confidence_label) ? z.confidence_label : null;
+    const pct = typeof z.confidence === "number" && z.confidence >= 0 && z.confidence <= 1
+      ? Math.round(z.confidence * 100) + "%" : null;
+    if (!label && !pct) return "";
+    const text = label && pct ? `${label} (${pct})` : (label || pct);
+    const reasons = Array.isArray(z.confidence_reasons)
+      ? z.confidence_reasons.filter((r) => typeof r === "string" && r.trim()) : [];
+    return `<br><strong>Confidence: ${escapeHtml(text)}</strong>` +
+      (reasons.length ? `<br><small>${escapeHtml(reasons.join("; "))}</small>` : "");
   }
 
   async function loadHazardZones() {
@@ -228,7 +280,7 @@
         const confirmationLine = z.confirmed
           ? ""
           : "<br><em>Awaiting confirmation - not yet public</em>";
-        const popupHtml = `<strong>${escapeHtml(z.node_id)}</strong><br>${escapeHtml(z.hazard_type)} - ${escapeHtml(z.severity)}<br>Risk score: ${Number(z.risk_score).toFixed(2)}${confirmationLine}`;
+        const popupHtml = `<strong>${escapeHtml(z.node_id)}</strong><br>${escapeHtml(String(z.hazard_type).replace(/_/g, " "))} - ${escapeHtml(z.severity)}<br>Risk score: ${Number(z.risk_score).toFixed(2)}${confidenceLine(z)}${confirmationLine}${alertLinks(z)}`;
         circle.bindPopup(popupHtml);
 
         // A marker at the zone center makes it easy to click even before
@@ -237,7 +289,7 @@
         const marker = L.marker([z.latitude, z.longitude], { icon: hazardIcon(z.severity, z.hazard_type) })
           .bindPopup(popupHtml)
           .addTo(hazardLayer);
-        if (z.hazard_type === "flood") {
+        if (z.hazard_type === "flood" || z.hazard_type === "flash_flood") {
           // Fetched only when an officer opens the popup - the forecast is
           // an aid for judgement, not part of the alert decision.
           marker.on("popupopen", () => showFloodForecast(marker, popupHtml, z.node_id));
@@ -330,6 +382,45 @@
   resolveAllBtn.addEventListener("click", resolveAllSos);
   const sosCountRowEl = document.getElementById("sosCountRow");
   const allClearBannerEl = document.getElementById("allClearBanner");
+  const unlocatedBannerEl = document.getElementById("unlocatedBanner");
+
+  // Same value as APPROX_LOCATION_M in server.js: a device fix less exact
+  // than this (a phone/laptop without GPS - Wi-Fi / cell / IP position) is
+  // shown as approximate.
+  const APPROX_LOCATION_M = 500;
+  const formatAccuracy = (m) =>
+    m < 1000 ? `±${Math.round(m)} m` : `±${m < 10000 ? (m / 1000).toFixed(1) : Math.round(m / 1000)} km`;
+  // Location line for one SOS popup (fixed text + numbers only, no server strings unescaped)
+  function sosLocationHtml(s) {
+    if (s.location_source === "manual") {
+      return "<em>Location set by hand on a map - approximate, confirm it with the caller.</em><br>";
+    }
+    if (s.location_source === "node") {
+      return `<span class="sos-node">SOS button on node ${escapeHtml(s.node_id || "?")} - location is the node's position</span>`;
+    }
+    if (s.location_source === "hotspot") return hotspotHtml(s);
+    const acc = typeof s.location_accuracy_m === "number" ? s.location_accuracy_m : null;
+    if (acc === null) return "";
+    if (acc > APPROX_LOCATION_M) {
+      return `<span class="sos-approx">Approximate location (${formatAccuracy(acc)}) - confirm with the caller</span>`;
+    }
+    return `Location ${formatAccuracy(acc)}<br>`;
+  }
+
+  // Offline "SANJEEVNI-SOS" Wi-Fi page on a gateway/node (server.js
+  // createHotspotSos): the pin is the node's position (person within Wi-Fi
+  // range) or coordinates the person typed; plus people count and needs.
+  function hotspotHtml(s) {
+    const at = `via offline SOS Wi-Fi at ${escapeHtml(s.node_id || "?")}`;
+    const where = s.latitude == null ? "the hotspot has no registered position"
+      : typeof s.location_accuracy_m === "number" ? `within ~${Math.round(s.location_accuracy_m)} m`
+      : "location typed by the person (unverified)";
+    const parts = [];
+    if (Number.isInteger(s.people)) parts.push(s.people === 1 ? "1 person" : `${Number(s.people)} people`);
+    if (Array.isArray(s.needs) && s.needs.length) parts.push(`needs: ${s.needs.map(escapeHtml).join(", ")}`);
+    return `<span class="sos-node">${at} - ${where}</span>` +
+      (parts.length ? `<strong class="sos-people">${parts.join(" · ")}</strong><br>` : "");
+  }
 
   async function loadSos() {
     try {
@@ -341,9 +432,22 @@
       // When everything is resolved, show a clear positive confirmation
       // instead of leaving the officer looking at a bare "0" - and hide
       // "Resolve All" since there's nothing left to resolve.
+      // Node-button SOS without a map position (server.js createNodeButtonSos)
+      const unlocated = Array.isArray(data.unlocated_node_sos) ? data.unlocated_node_sos : [];
+      unlocatedBannerEl.style.display = unlocated.length ? "block" : "none";
+      unlocatedBannerEl.innerHTML = unlocated.length
+        ? "<strong>SOS from a node (button or offline SOS Wi-Fi) with no registered position - find where it is installed:</strong>" +
+          unlocated.map((u) => `
+            <div>SOS #${Number(u.id)} - ${escapeHtml(u.node_id)} - ${Number(u.minutes_open)} min waiting
+              ${u.location_source === "hotspot" ? "<br>" + hotspotHtml(u) : ""}
+              ${u.note ? "<br>" + escapeHtml(u.note) : ""}
+              <br><button onclick="resolveSos(${Number(u.id)})">Mark Resolved</button></div>`).join("") +
+          "<small>Register the node's position on the admin page so the next press shows on the map.</small>"
+        : "";
+
       if (data.count === 0) {
         sosCountRowEl.style.display = "none";
-        allClearBannerEl.style.display = "block";
+        allClearBannerEl.style.display = unlocated.length ? "none" : "block";
         resolveAllBtn.style.display = "none";
       } else {
         sosCountRowEl.style.display = "block";
@@ -355,6 +459,13 @@
       shownSosIds = data.data.map((s) => Number(s.id)).filter((id) => Number.isSafeInteger(id) && id > 0);
       data.data.forEach((s) => {
         const marker = L.marker([s.latitude, s.longitude], { icon: sosIcon() });
+        // An approximate device fix: the person is somewhere in this circle
+        if (s.location_source !== "manual" && s.location_source !== "node" && s.location_source !== "hotspot" &&
+            typeof s.location_accuracy_m === "number" && s.location_accuracy_m > APPROX_LOCATION_M) {
+          L.circle([s.latitude, s.longitude], {
+            radius: s.location_accuracy_m, color: "#7a4a00", weight: 1.5, dashArray: "6 6", fillOpacity: 0.06, interactive: false,
+          }).addTo(sosLayer);
+        }
 
         const time = new Date(s.timestamp).toLocaleTimeString();
         // UPGRADE: SLA/escalation timers - flag SOS waiting too long
@@ -366,7 +477,7 @@
           <div class="sos-popup">
             ${escalationBanner}
             <strong>SOS #${sosId}</strong> - ${escapeHtml(time)}<br>
-            ${s.location_source === "manual" ? "<em>Location set by hand on a map - approximate, confirm it with the caller.</em><br>" : ""}
+            ${sosLocationHtml(s)}
             ${s.note ? escapeHtml(s.note) + "<br>" : ""}
             Nearest hospital: <strong>${escapeHtml(s.nearest_hospital)}</strong> (${Number(s.hospital_distance_km)} km)
             <a href="${escapeHtml(s.responder_route_url)}" target="_blank" rel="noopener">Route to this person</a>
@@ -409,26 +520,82 @@
       data.nodes.forEach((n) => {
         if (n.latitude == null || n.longitude == null) return;
         const offline = n.status !== "online";
-        L.circleMarker([n.latitude, n.longitude], {
+        const baseHtml = `
+            <strong>${escapeHtml(n.node_id)}</strong> (${escapeHtml(n.status)})<br>
+            ${escapeHtml(n.location)}<br>
+            Last seen: ${n.seconds_since_seen == null ? "never" : Number(n.seconds_since_seen) + "s ago"}
+            ${n.issues.map((i) => `<div class="node-issue ${escapeHtml(i.level)}">${escapeHtml(i.message)}</div>`).join("")}`;
+        const marker = L.circleMarker([n.latitude, n.longitude], {
           radius: 7,
           color: "#333",
           weight: 1,
           fillColor: offline ? "#9aa1ab" : NODE_LEVEL_COLOR[n.level],
           fillOpacity: 0.9,
         })
-          .bindPopup(`
-            <strong>${escapeHtml(n.node_id)}</strong> (${escapeHtml(n.status)})<br>
-            ${escapeHtml(n.location)}<br>
-            Last seen: ${n.seconds_since_seen == null ? "never" : Number(n.seconds_since_seen) + "s ago"}<br>
-            Battery: ${n.battery_pct == null ? "-" : Number(n.battery_pct).toFixed(0) + "%"} &nbsp;
-            Signal: ${n.signal_strength_dbm == null ? "-" : Number(n.signal_strength_dbm) + " dBm"}
-            ${n.issues.map((i) => `<div class="node-issue ${escapeHtml(i.level)}">${escapeHtml(i.message)}</div>`).join("")}
-          `)
+          .bindPopup(baseHtml, { minWidth: 240 })
           .addTo(nodeLayer);
+        // Every fitted sensor's latest value, fetched when the popup opens
+        marker.on("popupopen", (ev) => showNodeValues(ev.popup, baseHtml, n.node_id));
       });
     } catch (e) {
       console.log("node-health error", e);
     }
+  }
+
+  // Same rows, units and CPCB NAQI bands as the React page (frontend/src/lib/sensors.ts).
+  // NAQI: CPCB "About National Air Quality Index", 24-hour averages (ug/m3),
+  // https://cpcb.gov.in/displaypdf.php?id=bmF0aW9uYWwtYWlyLXF1YWxpdHktaW5kZXgvQWJvdXRfQVFJLnBkZg== (read 2026-10-09)
+  const NAQI_NAMES = ["Good", "Satisfactory", "Moderately polluted", "Poor", "Very Poor", "Severe"];
+  const NAQI_TOPS = { pm25_ugm3: [30, 60, 90, 120, 250], pm10_ugm3: [50, 100, 250, 350, 430] };
+  const SENSOR_ROWS = [
+    ["river_level_m", "River level", "m", 2], ["river_level_rate_m_per_hr", "River rise rate", "m/h", 2],
+    ["pm25_ugm3", "PM2.5", "µg/m³", 0], ["pm10_ugm3", "PM10", "µg/m³", 0], ["gas_ppm", "Gas", "ppm", 0],
+    ["flame_reading", "Flame sensor", "", 2], ["temp_c", "Temperature", "°C", 1], ["humidity_pct", "Humidity", "%", 0],
+    ["tilt_angle_deg", "Tilt", "°", 1], ["vibration_magnitude", "Vibration", "", 2],
+    ["soil_moisture_pct", "Soil moisture", "%", 0], ["water_ph", "Water pH", "", 1], ["turbidity_ntu", "Turbidity", "NTU", 0],
+    ["rainfall_24h_mm", "Rain, last 24 h (0 also without a gauge)", "mm", 1], ["battery_pct", "Battery", "%", 0],
+    ["signal_strength_dbm", "Signal", "dBm", 0],
+  ];
+  const fmt = (v, unit, digits) => `${Number(v).toFixed(digits)}${unit ? " " + unit : ""}`;
+  function naqiBand(field, v) {
+    const tops = NAQI_TOPS[field];
+    if (!tops || typeof v !== "number" || v < 0) return "";
+    const i = tops.findIndex((top) => v <= top);
+    return ` · NAQI ${NAQI_NAMES[i === -1 ? tops.length : i]}`;
+  }
+  function sensorValuesHtml(data) {
+    const s = data.siren;
+    const sirenRow = `<tr><th>Village siren</th><td>${!s ? "no siren" : s.sounding ? "SOUNDING" : "silent"}</td></tr>`;
+    if (!data.latest) return `<div class="node-values">No reading stored for this node yet<table>${sirenRow}</table></div>`;
+    const rows = [];
+    const noSensor = [];
+    for (const [field, label, unit, digits] of SENSOR_ROWS) {
+      const v = data.latest.values[field];
+      if (!v || v.state === "no_sensor") { noSensor.push(label); continue; }
+      const last = typeof v.last_value === "number" ? ` (last ${fmt(v.last_value, unit, digits)})` : "";
+      const text = v.state === "ok" && typeof v.value === "number"
+        ? (field === "flame_reading" ? `${v.value >= 0.3 ? "flame detected" : "no flame"} (${v.value.toFixed(2)})`
+          : fmt(v.value, unit, digits) + naqiBand(field, v.value))
+        : v.state === "fault" ? `sensor fault - value dropped${last}` : `not in the latest reading${last}`;
+      rows.push(`<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(text)}</td></tr>`);
+    }
+    const when = data.latest.reading_at ? new Date(data.latest.reading_at).toLocaleTimeString() : "?";
+    return `<div class="node-values">Latest reading at ${escapeHtml(when)}` +
+      (data.latest.simulated ? ' <strong class="sim-badge">SIMULATED</strong>' : "") +
+      `<table>${rows.join("")}${sirenRow}</table>` +
+      (noSensor.length ? `<div class="no-sensor">No sensor: ${escapeHtml(noSensor.join(", "))}</div>` : "") + "</div>";
+  }
+  async function showNodeValues(popup, baseHtml, nodeId) {
+    popup.setContent(baseHtml + '<div class="node-values">Loading sensor values...</div>');
+    let html;
+    try {
+      const res = await fetch(`/api/officer/nodes/${encodeURIComponent(nodeId)}/latest`, { headers: officerAuthHeaders() });
+      const data = await res.json();
+      html = res.ok ? sensorValuesHtml(data) : `<div class="node-values">Sensor values unavailable: ${escapeHtml(data.error || res.status)}</div>`;
+    } catch (e) {
+      html = '<div class="node-values">Sensor values unavailable (server unreachable)</div>';
+    }
+    if (popup.isOpen()) popup.setContent(baseHtml + html);
   }
 
   loadHazardZones();

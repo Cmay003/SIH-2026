@@ -203,6 +203,23 @@
     color: #93c5fd;
   }
 }
+/* Device fix less exact than APPROX_LOCATION_M (no GPS): a warning, not an
+   error - the SOS button stays usable. */
+.approxNotice {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.approxNotice p {
+  margin: 0;
+}
+.approxNotice .btnSecondary {
+  margin-top: 8px;
+}
 .manualBox {
   margin-top: 16px;
   border-top: 1px solid var(--ring);

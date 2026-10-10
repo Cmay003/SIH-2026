@@ -1,5 +1,4 @@
-# Extra packages for training scripts only (not needed to run the backend):
-#   train_river_forecast.py, train_edge_model.py, quantize/verify edge model
+# TensorFlow is now part of requirements.txt, so this file is no longer
+# needed. Kept so older instructions still work:
 #   .\venv\Scripts\python.exe -m pip install -r requirements-training.txt
 -r requirements.txt
-tensorflow==2.21.0

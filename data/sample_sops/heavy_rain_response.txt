@@ -1,0 +1,23 @@
+HEAVY RAIN RESPONSE SOP (sample - generic guidance written for this
+project, not taken from a district SOP; needs review by a disaster
+management expert before field use)
+
+A heavy rain alert means 24-hour rainfall at or near the node is in, or is
+forecast to reach, the India Meteorological Department's heavy rain range
+(64.5 mm or more in 24 hours). A forecast-based alert has not been
+measured by SANJEEVNI sensors.
+
+LOW severity: Continue routine monitoring of rainfall, river level and
+slopes. No public alert required.
+
+MEDIUM severity: Notify the local disaster management authority. Advise
+people to avoid unnecessary travel, keep away from rivers, streams and
+steep slopes, keep drains clear, and keep a torch, phone charger,
+drinking water and medicines ready. Check official IMD warnings.
+
+HIGH severity: Issue an advisory for low-lying, riverside and hill-slope
+areas. People should stay indoors in a safe building, avoid crossing
+flooded roads, streams or causeways, and move away from slopes showing
+cracks, falling stones or muddy water. Authorities should watch for flash
+floods and landslides, keep SDRF/NDRF teams informed and be ready to open
+relief shelters. Emergency number: 112.

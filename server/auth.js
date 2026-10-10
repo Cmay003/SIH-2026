@@ -95,6 +95,39 @@ function initAuthTables(db) {
       expires_at TEXT NOT NULL
     )
   `);
+  // Optional mobile number for officer WhatsApp alerts (officer_alerts.js),
+  // E.164 ("+919876543210"). Set with create_user.js add ... --phone /
+  // set-phone. Only officer/admin accounts are ever messaged.
+  if (!db.prepare("PRAGMA table_info(users)").all().some((c) => c.name === "phone")) {
+    db.exec("ALTER TABLE users ADD COLUMN phone TEXT");
+  }
+}
+
+// ---- phone numbers (officer WhatsApp alerts) ------------------------------
+// E.164 = ITU-T Recommendation E.164, "The international public
+// telecommunication numbering plan" (https://www.itu.int/rec/T-REC-E.164,
+// page read 2026-10-09; in-force edition 02/2026). The 15-digit maximum
+// (country code included) is the commonly cited E.164 limit; I could not
+// open the full ITU text, so it is checked here only as a sanity bound.
+// Stored and sent WITH the leading "+": Meta's Cloud API prepends the
+// BUSINESS number's country code to a number without it, which can reach
+// the wrong person (developers.facebook.com/docs/whatsapp/cloud-api/
+// reference/phone-numbers, read 2026-10-09).
+// Spaces, hyphens, dots and brackets are accepted on input and removed.
+// Minimum 8 digits is my own sanity bound, not from the standard.
+const E164 = /^\+[1-9]\d{7,14}$/;
+
+/** "+91 98765-43210" -> "+919876543210", or null when it is not an E.164 number. */
+function normalizePhone(input) {
+  if (typeof input !== "string") return null;
+  const compact = input.trim().replace(/[\s().-]/g, "");
+  return E164.test(compact) ? compact : null;
+}
+
+/** "+919876543210" -> "+91******3210" for logs and lists (never the full number). */
+function maskPhone(phone) {
+  if (typeof phone !== "string" || phone.length < 7) return phone ? "***" : "";
+  return phone.slice(0, 3) + "*".repeat(phone.length - 7) + phone.slice(-4);
 }
 
 // A redirect target on THIS site only - otherwise ?next= could bounce a
@@ -356,5 +389,5 @@ function setupAuth(app, db, { officerApiKey }) {
 
 module.exports = {
   setupAuth, hashPassword, verifyPassword, passwordProblem, initAuthTables,
-  ROLES, MIN_PASSWORD_LENGTH,
+  ROLES, MIN_PASSWORD_LENGTH, normalizePhone, maskPhone, PHONE_ROLES: OFFICER_ROLES,
 };
